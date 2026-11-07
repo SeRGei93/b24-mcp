@@ -102,7 +102,7 @@ export function createMcpServer(container: AppContainer, authorizedConnectionId?
 
   server.registerTool("bitrix_search_items", {
     title: "Search CRM items",
-    description: "Search leads, deals, contacts, companies, or SPA items with Bitrix filters and pagination.",
+    description: "Search leads, deals, contacts, companies, or SPA items with Bitrix filters and batch pagination. Set includeProductRows=true to fetch product rows for all matched items in one batch request.",
     inputSchema: {
       connectionId,
       entityTypeId,
@@ -110,6 +110,7 @@ export function createMcpServer(container: AppContainer, authorizedConnectionId?
       select: z.array(z.string().min(1)).max(100).optional(),
       order: z.record(z.string(), z.enum(["ASC", "DESC"])).optional(),
       limit: z.number().int().min(1).max(1_000).default(100),
+      includeProductRows: z.boolean().default(false).describe("Automatically batch-fetch product rows (crm.item.productrow.list) for all returned items in one request"),
     },
     annotations: { readOnlyHint: true, destructiveHint: false },
   }, (input) => execute(() => container.crm.searchItems({
@@ -118,20 +119,35 @@ export function createMcpServer(container: AppContainer, authorizedConnectionId?
   })));
 
   server.registerTool("bitrix_get_item", {
-    title: "Get CRM item",
-    description: "Get one CRM or SPA item by entity type and ID.",
-    inputSchema: { connectionId, entityTypeId, id: itemId },
-    annotations: { readOnlyHint: true, destructiveHint: false },
-  }, ({ connectionId: id, entityTypeId: typeId, id: crmId }) =>
-    execute(() => container.crm.getItem(connectionFor(id)!, typeId, crmId)));
-
-  server.registerTool("bitrix_list_product_rows", {
-    title: "List CRM item product rows",
-    description: "List product rows (line items) for a deal, lead, quote, smart invoice, or SPA item via crm.item.productrow.list. Defaults to Deal (entityTypeId=2, ownerType='D').",
+    title: "Get CRM item(s)",
+    description: "Get one CRM/SPA item by id, or multiple items in a single batch call by supplying ids.",
     inputSchema: {
       connectionId,
-      ownerId: itemId.optional().describe("ID of the deal or CRM item (alias: dealId)"),
-      dealId: itemId.optional().describe("Deal ID (alias for ownerId with entityTypeId=2)"),
+      entityTypeId,
+      id: itemId.optional().describe("Single CRM item ID"),
+      ids: z.array(itemId).min(1).max(250).optional().describe("Multiple CRM item IDs to fetch in one Bitrix24 batch request"),
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false },
+  }, ({ connectionId: connId, entityTypeId: typeId, id: crmId, ids }) => execute(async () => {
+    const resolvedConn = connectionFor(connId)!;
+    if (ids && ids.length > 0) {
+      return container.crm.getItems(resolvedConn, typeId, ids);
+    }
+    if (crmId !== undefined) {
+      return container.crm.getItem(resolvedConn, typeId, crmId);
+    }
+    throw new AppError("Supply id or ids", "MISSING_ITEM_ID");
+  }));
+
+  server.registerTool("bitrix_list_product_rows", {
+    title: "List CRM item product rows (batch)",
+    description: "Batch-fetch product rows (line items) for one or multiple deals/CRM items at once via Bitrix24 batch + crm.item.productrow.list. Pass dealIds/ownerIds array to fetch product rows for up to 250 deals in a single call instead of looping.",
+    inputSchema: {
+      connectionId,
+      dealIds: z.array(itemId).min(1).max(250).optional().describe("Array of Deal IDs to fetch product rows for in one batch request (preferred over calling one by one)"),
+      ownerIds: z.array(itemId).min(1).max(250).optional().describe("Array of CRM item IDs to fetch product rows for in one batch request"),
+      ownerId: itemId.optional().describe("Single CRM item ID (alias: dealId)"),
+      dealId: itemId.optional().describe("Single Deal ID (prefer dealIds array when checking multiple deals)"),
       entityTypeId: entityTypeId.default(2),
       ownerType: z.string().min(1).optional().describe("Optional short ownerType code ('D', 'L', 'Q', 'SI', 'T...'). Auto-derived from entityTypeId if omitted."),
       filter: jsonObject.optional(),
@@ -139,14 +155,16 @@ export function createMcpServer(container: AppContainer, authorizedConnectionId?
       limit: z.number().int().min(1).max(1_000).default(100),
     },
     annotations: { readOnlyHint: true, destructiveHint: false },
-  }, ({ connectionId: id, ownerId, dealId, entityTypeId: typeId, ownerType, filter, order, limit }) => execute(async () => {
-    const resolvedOwnerId = ownerId ?? dealId;
-    if (resolvedOwnerId === undefined) {
-      throw new AppError("Supply ownerId or dealId", "MISSING_OWNER_ID");
+  }, ({ connectionId: id, dealIds, ownerIds, ownerId, dealId, entityTypeId: typeId, ownerType, filter, order, limit }) => execute(async () => {
+    const resolvedIds = dealIds ?? ownerIds;
+    const resolvedSingleId = ownerId ?? dealId;
+    if (!resolvedIds?.length && resolvedSingleId === undefined) {
+      throw new AppError("Supply dealIds, ownerIds, dealId, or ownerId", "MISSING_OWNER_ID");
     }
     return container.crm.listProductRows({
       connectionId: connectionFor(id)!,
-      ownerId: resolvedOwnerId,
+      ownerIds: resolvedIds,
+      ownerId: resolvedSingleId,
       entityTypeId: typeId,
       ownerType,
       filter,

@@ -96,18 +96,27 @@ describe("BitrixRestClient", () => {
     expect(searchResult.total).toBe(120);
   });
 
-  it("fetches deal product rows via crm.item.productrow.list with =ownerType and =ownerId", async () => {
+  it("fetches deal product rows via batch (crm.item.productrow.list) for single and multiple deals", async () => {
     const get = vi.fn().mockResolvedValue({
       connection: { clientEndpoint: "https://example.bitrix24.com/rest/" },
       accessToken: "token",
     });
     const fetchMock = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({
       result: {
-        productRows: [
-          { id: 17640, ownerId: 13142, ownerType: "D", productName: "Товар", price: 100.5, quantity: 2 },
-        ],
+        result: {
+          "13142": {
+            productRows: [
+              { id: 17640, ownerId: 13142, ownerType: "D", productName: "Товар 1", price: 100.5, quantity: 2 },
+            ],
+          },
+          "13143": {
+            productRows: [
+              { id: 17641, ownerId: 13143, ownerType: "D", productName: "Товар 2", price: 50, quantity: 1 },
+            ],
+          },
+        },
+        result_error: [],
       },
-      total: 1,
     }), { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);
 
@@ -115,14 +124,15 @@ describe("BitrixRestClient", () => {
     const crm = new CrmService(config, client);
     const rows = await crm.listProductRows({
       connectionId: "connection",
-      ownerId: 13142,
+      ownerIds: [13142, 13143],
     });
 
     expect(fetchMock).toHaveBeenCalledOnce();
-    expect(fetchMock.mock.calls[0]![0]).toBe("https://example.bitrix24.com/rest/crm.item.productrow.list.json");
+    expect(fetchMock.mock.calls[0]![0]).toBe("https://example.bitrix24.com/rest/batch.json");
     const body = JSON.parse(fetchMock.mock.calls[0]![1]!.body as string);
-    expect(body.filter).toEqual({ "=ownerType": "D", "=ownerId": 13142 });
-    expect(body.order).toEqual({ sort: "asc" });
-    expect(rows.productRows).toHaveLength(1);
+    expect(decodeURIComponent(body.cmd["13142"])).toContain("crm.item.productrow.list?filter[=ownerType]=D&filter[=ownerId]=13142");
+    expect(decodeURIComponent(body.cmd["13143"])).toContain("crm.item.productrow.list?filter[=ownerType]=D&filter[=ownerId]=13143");
+    expect(rows.productRows).toHaveLength(2);
+    expect("byOwnerId" in rows && rows.byOwnerId["13142"]).toHaveLength(1);
   });
 });

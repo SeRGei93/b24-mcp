@@ -32,6 +32,7 @@ export class CrmService {
     select?: string[];
     order?: Record<string, "ASC" | "DESC">;
     limit: number;
+    includeProductRows?: boolean;
   }): Promise<{ items: unknown[]; total?: number; truncated: boolean }> {
     const baseParams = {
       entityTypeId: input.entityTypeId,
@@ -84,7 +85,35 @@ export class CrmService {
       }
     }
 
-    const sliced = items.slice(0, input.limit);
+    let sliced = items.slice(0, input.limit);
+    if (input.includeProductRows && sliced.length > 0) {
+      const ownerIds = sliced
+        .map((item) => {
+          if (item && typeof item === "object") {
+            const rawId = (item as Record<string, unknown>).id ?? (item as Record<string, unknown>).ID;
+            return Number(rawId);
+          }
+          return Number.NaN;
+        })
+        .filter((id) => Number.isInteger(id) && id > 0);
+
+      if (ownerIds.length > 0) {
+        const batchRows = await this.listProductRowsForOwners({
+          connectionId: input.connectionId,
+          ownerIds,
+          entityTypeId: input.entityTypeId,
+        });
+        sliced = sliced.map((item) => {
+          if (item && typeof item === "object") {
+            const obj = item as Record<string, unknown>;
+            const id = String(obj.id ?? obj.ID ?? "");
+            return { ...obj, productRows: batchRows.byOwnerId[id] ?? [] };
+          }
+          return item;
+        });
+      }
+    }
+
     return {
       items: sliced,
       ...(total === undefined ? {} : { total }),
@@ -97,77 +126,131 @@ export class CrmService {
     return response.result.item ?? response.result;
   }
 
+  async getItems(connectionId: string, entityTypeId: number, ids: number[]): Promise<Record<string, unknown>> {
+    const uniqueIds = [...new Set(ids)];
+    const commands: Record<string, BitrixBatchCommand> = {};
+    for (const id of uniqueIds) {
+      commands[String(id)] = {
+        method: "crm.item.get",
+        params: { entityTypeId, id },
+      };
+    }
+    const batchResult = await this.bitrix.callBatch<{ item?: unknown }>(connectionId, commands);
+    const itemsById: Record<string, unknown> = {};
+    for (const id of uniqueIds) {
+      const key = String(id);
+      const entry = batchResult[key];
+      if (entry !== undefined) {
+        itemsById[key] = entry && typeof entry === "object" && "item" in entry ? entry.item : entry;
+      }
+    }
+    return itemsById;
+  }
+
+  async listProductRowsForOwners(input: {
+    connectionId: string;
+    ownerIds: number[];
+    entityTypeId?: number;
+    ownerType?: string;
+    filter?: Record<string, unknown>;
+    order?: Record<string, "asc" | "desc" | "ASC" | "DESC">;
+  }): Promise<{ byOwnerId: Record<string, unknown[]>; productRows: unknown[]; ownersCount: number }> {
+    const uniqueOwnerIds = [...new Set(input.ownerIds)];
+    const ownerType = input.ownerType ?? toOwnerTypeCode(input.entityTypeId ?? 2);
+    const order: Record<string, "asc" | "desc"> = input.order
+      ? Object.fromEntries(Object.entries(input.order).map(([k, v]) => [k, v.toLowerCase() as "asc" | "desc"]))
+      : { sort: "asc" };
+
+    const commands: Record<string, BitrixBatchCommand> = {};
+    for (const ownerId of uniqueOwnerIds) {
+      commands[String(ownerId)] = {
+        method: "crm.item.productrow.list",
+        params: {
+          filter: {
+            ...(input.filter ?? {}),
+            "=ownerType": ownerType,
+            "=ownerId": ownerId,
+          },
+          order,
+          start: 0,
+        },
+      };
+    }
+
+    const batchResult = await this.bitrix.callBatch<{ productRows?: unknown[] }>(input.connectionId, commands);
+    const byOwnerId: Record<string, unknown[]> = {};
+    const productRows: unknown[] = [];
+
+    for (const ownerId of uniqueOwnerIds) {
+      const key = String(ownerId);
+      const rows = batchResult[key]?.productRows ?? [];
+      byOwnerId[key] = rows;
+      productRows.push(...rows);
+    }
+
+    return {
+      byOwnerId,
+      productRows,
+      ownersCount: uniqueOwnerIds.length,
+    };
+  }
+
   async listProductRows(input: {
     connectionId: string;
-    ownerId: number;
+    ownerId?: number;
+    ownerIds?: number[];
     entityTypeId?: number;
     ownerType?: string;
     filter?: Record<string, unknown>;
     order?: Record<string, "asc" | "desc" | "ASC" | "DESC">;
     limit?: number;
-  }): Promise<{ productRows: unknown[]; total?: number; truncated: boolean }> {
+  }): Promise<
+    | { productRows: unknown[]; total?: number; truncated: boolean }
+    | { byOwnerId: Record<string, unknown[]>; productRows: unknown[]; ownersCount: number }
+  > {
+    const ids = input.ownerIds?.length
+      ? input.ownerIds
+      : input.ownerId !== undefined
+        ? [input.ownerId]
+        : [];
+
+    if (ids.length > 1 || (input.ownerIds && input.ownerIds.length > 0)) {
+      return this.listProductRowsForOwners({
+        connectionId: input.connectionId,
+        ownerIds: ids,
+        entityTypeId: input.entityTypeId,
+        ownerType: input.ownerType,
+        filter: input.filter,
+        order: input.order,
+      });
+    }
+
+    const singleOwnerId = ids[0]!;
     const limit = input.limit ?? 100;
     const ownerType = input.ownerType ?? toOwnerTypeCode(input.entityTypeId ?? 2);
     const filter: Record<string, unknown> = {
       ...(input.filter ?? {}),
       "=ownerType": ownerType,
-      "=ownerId": input.ownerId,
+      "=ownerId": singleOwnerId,
     };
     const order: Record<string, "asc" | "desc"> = input.order
       ? Object.fromEntries(Object.entries(input.order).map(([k, v]) => [k, v.toLowerCase() as "asc" | "desc"]))
       : { sort: "asc" };
 
-    const firstResponse = await this.bitrix.call<{ productRows?: unknown[] }>(
-      input.connectionId,
-      "crm.item.productrow.list",
-      { filter, order, start: 0 },
-    );
-    const productRows: unknown[] = [...(firstResponse.result.productRows ?? [])];
-    const total = firstResponse.total;
-
-    if (firstResponse.next !== undefined && productRows.length < limit && this.config.bitrixMaxPages > 1) {
-      if (total !== undefined && total > productRows.length) {
-        const targetCount = Math.min(total, limit, this.config.bitrixMaxPages * BITRIX_PAGE_SIZE);
-        const commands: Record<string, BitrixBatchCommand> = {};
-        const keys: string[] = [];
-        for (
-          let start = firstResponse.next, page = 1;
-          start < targetCount && page < this.config.bitrixMaxPages;
-          start += BITRIX_PAGE_SIZE, page += 1
-        ) {
-          const key = `pr_${start}`;
-          keys.push(key);
-          commands[key] = {
-            method: "crm.item.productrow.list",
-            params: { filter, order, start },
-          };
-        }
-        if (keys.length > 0) {
-          const batchResult = await this.bitrix.callBatch<{ productRows?: unknown[] }>(input.connectionId, commands);
-          for (const key of keys) {
-            productRows.push(...(batchResult[key]?.productRows ?? []));
-          }
-        }
-      } else {
-        let start = firstResponse.next;
-        for (let page = 1; page < this.config.bitrixMaxPages && productRows.length < limit; page += 1) {
-          const pageResponse = await this.bitrix.call<{ productRows?: unknown[] }>(
-            input.connectionId,
-            "crm.item.productrow.list",
-            { filter, order, start },
-          );
-          productRows.push(...(pageResponse.result.productRows ?? []));
-          if (pageResponse.next === undefined) break;
-          start = pageResponse.next;
-        }
-      }
-    }
-
-    const sliced = productRows.slice(0, limit);
+    // Execute via batch by default even for a single ownerId when requested, or standard call with batch follow-up
+    const batchSingle = await this.listProductRowsForOwners({
+      connectionId: input.connectionId,
+      ownerIds: [singleOwnerId],
+      entityTypeId: input.entityTypeId,
+      ownerType,
+      filter: input.filter,
+      order,
+    });
+    const productRows = batchSingle.productRows.slice(0, limit);
     return {
-      productRows: sliced,
-      ...(total === undefined ? {} : { total }),
-      truncated: productRows.length > sliced.length || (total !== undefined && total > sliced.length),
+      productRows,
+      total: batchSingle.productRows.length,
+      truncated: batchSingle.productRows.length > productRows.length,
     };
   }
 

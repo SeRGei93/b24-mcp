@@ -1,6 +1,6 @@
 # bitrix24-mcp-server
 
-Self-hosted [Model Context Protocol](https://modelcontextprotocol.io/) server for Bitrix24 CRM and smart-process automations (SPAs). Uses built-in Node.js SQLite (`node:sqlite`) for zero external database setup.
+Self-hosted [Model Context Protocol](https://modelcontextprotocol.io/) server for Bitrix24 CRM and smart-process automations (SPAs). Written in pure Go (`CGO_ENABLED=0`) using `modernc.org/sqlite` for zero external database setup.
 
 ## Features
 
@@ -11,13 +11,12 @@ Self-hosted [Model Context Protocol](https://modelcontextprotocol.io/) server fo
 
 ## Quick Start
 
-Requirements: **Node.js 22.5+** and a Bitrix24 OAuth local/public application with `crm` scope.
+Requirements: **Go 1.24+** and a Bitrix24 OAuth local/public application with `crm` scope.
 
 ```bash
 cp .env.example .env
-npm ci
-npm run build
-npm start
+CGO_ENABLED=0 go build -o b24 ./cmd/b24
+./b24
 ```
 
 Configure your Bitrix24 local application paths:
@@ -54,7 +53,7 @@ https://your-server.example.com/mcp
     }
   }
   ```
-- **Stdio**: Set `MCP_TRANSPORT=stdio` and run `node dist/index.js`.
+- **Stdio**: Set `MCP_TRANSPORT=stdio` and run `./b24`.
 
 ## Available Tools
 

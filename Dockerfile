@@ -1,26 +1,23 @@
 # syntax=docker/dockerfile:1.7
-FROM node:22-alpine AS build
-WORKDIR /app
-COPY package.json package-lock.json ./
-RUN npm ci --include=dev --ignore-scripts
-COPY tsconfig.json tsconfig.build.json ./
-COPY src ./src
-RUN npm run build
+FROM golang:1.26-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd ./cmd
+COPY internal ./internal
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/b24 ./cmd/b24
 
-FROM node:22-alpine AS production-dependencies
+FROM alpine:3.21 AS runtime
+RUN apk add --no-cache ca-certificates tzdata \
+  && addgroup -g 1000 -S app \
+  && adduser -u 1000 -S -G app app \
+  && mkdir -p /app/data \
+  && chown -R app:app /app
 WORKDIR /app
-COPY package.json package-lock.json ./
-RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
-
-FROM node:22-alpine AS runtime
-ENV NODE_ENV=production
-WORKDIR /app
-RUN mkdir -p /app/data && chown -R node:node /app/data
-COPY --from=production-dependencies /app/node_modules ./node_modules
-COPY --from=build /app/dist ./dist
-COPY package.json LICENSE README.md ./
-USER node
+COPY --from=build /out/b24 /app/b24
+COPY LICENSE README.md ./
+USER app
 EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
-CMD ["node", "dist/index.js"]
+  CMD wget -qO- "http://127.0.0.1:${PORT:-3000}/health" >/dev/null || exit 1
+CMD ["/app/b24"]

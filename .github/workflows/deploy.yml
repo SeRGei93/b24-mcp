@@ -10,11 +10,10 @@ on:
   push:
     branches: [master, main]
     paths:
-      - "src/**"
-      - "package.json"
-      - "package-lock.json"
-      - "tsconfig.json"
-      - "tsconfig.build.json"
+      - "cmd/**"
+      - "internal/**"
+      - "go.mod"
+      - "go.sum"
       - "Dockerfile"
       - "docker-compose.dokploy.yml"
       - ".github/workflows/deploy.yml"
@@ -67,7 +66,7 @@ jobs:
             exit 0
           fi
 
-          commits=$(jq -c '[.commits[]? | {added: (.added // []), modified: (.modified // []), removed: (.removed // [])}] + [{"added":[],"modified":["src/index.ts","docker-compose.dokploy.yml","package.json","package-lock.json"],"removed":[]}]' "$GITHUB_EVENT_PATH")
+          commits=$(jq -c '[.commits[]? | {added: (.added // []), modified: (.modified // []), removed: (.removed // [])}] + [{"added":[],"modified":["cmd/b24/main.go","docker-compose.dokploy.yml","go.mod","go.sum"],"removed":[]}]' "$GITHUB_EVENT_PATH")
 
           payload=$(mktemp)
           jq -n \

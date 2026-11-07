@@ -140,9 +140,18 @@ export function buildHttpApp(container: AppContainer) {
     const query = typeof request.query === "object" && request.query !== null
       ? (request.query as Record<string, unknown>)
       : {};
-    const payload = body.auth !== undefined && Object.keys(query).length === 0
+    const referer = request.headers.origin ?? request.headers.referer;
+    let refererDomain: string | undefined;
+    if (typeof referer === "string") {
+      try {
+        refererDomain = new URL(referer).hostname;
+      } catch {
+        // Ignore malformed referer
+      }
+    }
+    const payload = body.auth !== undefined && Object.keys(query).length === 0 && !refererDomain
       ? body.auth
-      : { ...query, ...body };
+      : { ...(refererDomain ? { domain: refererDomain } : {}), ...query, ...body };
     const connection = await container.oauth.handleInstallation(payload);
     reply.header("cache-control", "no-store");
     if (request.headers.accept?.includes("text/html")) {

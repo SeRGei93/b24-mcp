@@ -226,14 +226,18 @@ describe("BitrixOAuthService", () => {
       AUTH_ID: "placement-access",
       AUTH_EXPIRES: "3600",
       REFRESH_ID: "placement-refresh",
-      member_id: "member-by",
+      SERVER_ENDPOINT: "https://oauth.bitrix24.tech/rest/",
+      APPLICATION_TOKEN: "166d18133d9411a1e83a24bdf4ef4684",
+      APPLICATION_SCOPE: "crm,user",
+      member_id: "80bcec0a985d0c2ae3a436711bc473f0",
       status: "L",
       PLACEMENT: "DEFAULT",
     });
 
     expect(upsert).toHaveBeenCalledOnce();
     expect(upsert.mock.calls[0]![0].domain).toBe("example.bitrix24.by");
-    expect(upsert.mock.calls[0]![0].memberId).toBe("member-by");
+    expect(upsert.mock.calls[0]![0].memberId).toBe("80bcec0a985d0c2ae3a436711bc473f0");
+    expect(upsert.mock.calls[0]![0].scope).toBe("crm,user");
     expect(upsert.mock.calls[0]![0].clientEndpoint).toBe("https://example.bitrix24.by/rest/");
   });
 

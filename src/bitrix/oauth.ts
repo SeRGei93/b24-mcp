@@ -277,7 +277,7 @@ export class BitrixOAuthService {
       access_token: pick("access_token", "AUTH_ID"),
       refresh_token: pick("refresh_token", "REFRESH_ID"),
       expires_in: pick("expires_in", "AUTH_EXPIRES", "expires") ?? 3_600,
-      scope: pick("scope", "SCOPE") ?? "",
+      scope: pick("scope", "SCOPE", "APPLICATION_SCOPE", "application_scope") ?? "",
       domain: normalizedDomain,
       member_id: pick("member_id", "MEMBER_ID") ?? normalizedDomain,
       user_id: pick("user_id", "USER_ID"),

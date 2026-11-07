@@ -125,6 +125,36 @@ export function createMcpServer(container: AppContainer, authorizedConnectionId?
   }, ({ connectionId: id, entityTypeId: typeId, id: crmId }) =>
     execute(() => container.crm.getItem(connectionFor(id)!, typeId, crmId)));
 
+  server.registerTool("bitrix_list_product_rows", {
+    title: "List CRM item product rows",
+    description: "List product rows (line items) for a deal, lead, quote, smart invoice, or SPA item via crm.item.productrow.list. Defaults to Deal (entityTypeId=2, ownerType='D').",
+    inputSchema: {
+      connectionId,
+      ownerId: itemId.optional().describe("ID of the deal or CRM item (alias: dealId)"),
+      dealId: itemId.optional().describe("Deal ID (alias for ownerId with entityTypeId=2)"),
+      entityTypeId: entityTypeId.default(2),
+      ownerType: z.string().min(1).optional().describe("Optional short ownerType code ('D', 'L', 'Q', 'SI', 'T...'). Auto-derived from entityTypeId if omitted."),
+      filter: jsonObject.optional(),
+      order: z.record(z.string(), z.enum(["asc", "desc", "ASC", "DESC"])).optional(),
+      limit: z.number().int().min(1).max(1_000).default(100),
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false },
+  }, ({ connectionId: id, ownerId, dealId, entityTypeId: typeId, ownerType, filter, order, limit }) => execute(async () => {
+    const resolvedOwnerId = ownerId ?? dealId;
+    if (resolvedOwnerId === undefined) {
+      throw new AppError("Supply ownerId or dealId", "MISSING_OWNER_ID");
+    }
+    return container.crm.listProductRows({
+      connectionId: connectionFor(id)!,
+      ownerId: resolvedOwnerId,
+      entityTypeId: typeId,
+      ownerType,
+      filter,
+      order,
+      limit,
+    });
+  }));
+
   server.registerTool("bitrix_list_users", {
     title: "List Bitrix24 users",
     description: "List portal users visible to the OAuth user.",

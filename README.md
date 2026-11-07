@@ -61,7 +61,7 @@ https://your-server.example.com/mcp
 **Read-only:**
 - `bitrix_list_connections`, `bitrix_discover_portal`, `bitrix_list_crm_entities`, `bitrix_describe_entity`
 - `bitrix_list_fields`, `bitrix_list_categories`, `bitrix_list_stages`, `bitrix_refresh_schema_cache`
-- `bitrix_search_items`, `bitrix_get_item`, `bitrix_list_users`
+- `bitrix_search_items`, `bitrix_get_item`, `bitrix_list_product_rows`, `bitrix_list_users`
 
 **Write (requires `write_with_confirmation` mode):**
 - `bitrix_prepare_create_item`, `bitrix_prepare_update_item`, `bitrix_prepare_move_item_stage`

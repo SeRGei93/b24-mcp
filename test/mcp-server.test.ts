@@ -31,8 +31,9 @@ describe("MCP server", () => {
     await client.connect(clientTransport);
     try {
       const tools = await client.listTools();
-      expect(tools.tools).toHaveLength(17);
+      expect(tools.tools).toHaveLength(18);
       expect(tools.tools.map((tool) => tool.name)).toContain("bitrix_confirm_operation");
+      expect(tools.tools.map((tool) => tool.name)).toContain("bitrix_list_product_rows");
       expect(tools.tools.map((tool) => tool.name)).not.toContain("bitrix_call_raw_method");
 
       const response = await client.callTool({ name: "bitrix_list_connections", arguments: {} });

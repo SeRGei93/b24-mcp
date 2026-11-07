@@ -95,4 +95,34 @@ describe("BitrixRestClient", () => {
     expect(searchResult.items).toEqual([{ id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }, { id: 5 }]);
     expect(searchResult.total).toBe(120);
   });
+
+  it("fetches deal product rows via crm.item.productrow.list with =ownerType and =ownerId", async () => {
+    const get = vi.fn().mockResolvedValue({
+      connection: { clientEndpoint: "https://example.bitrix24.com/rest/" },
+      accessToken: "token",
+    });
+    const fetchMock = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({
+      result: {
+        productRows: [
+          { id: 17640, ownerId: 13142, ownerType: "D", productName: "Товар", price: 100.5, quantity: 2 },
+        ],
+      },
+      total: 1,
+    }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new BitrixRestClient(config, { get } as unknown as TokenManager, logger);
+    const crm = new CrmService(config, client);
+    const rows = await crm.listProductRows({
+      connectionId: "connection",
+      ownerId: 13142,
+    });
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock.mock.calls[0]![0]).toBe("https://example.bitrix24.com/rest/crm.item.productrow.list.json");
+    const body = JSON.parse(fetchMock.mock.calls[0]![1]!.body as string);
+    expect(body.filter).toEqual({ "=ownerType": "D", "=ownerId": 13142 });
+    expect(body.order).toEqual({ sort: "asc" });
+    expect(rows.productRows).toHaveLength(1);
+  });
 });

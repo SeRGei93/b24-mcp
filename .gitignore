@@ -1,5 +1,9 @@
 node_modules/
 dist/
+old/node_modules/
+old/dist/
+/b24
+/bin/
 .env
 .env.*
 !.env.example

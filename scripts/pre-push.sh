@@ -21,5 +21,7 @@ if [ "$pushes_to_main" -eq 0 ]; then
   exit 0
 fi
 
-echo "pre-push: пуш в main — прогоняем проверки локально (npm run check)"
-npm run check
+echo "pre-push: пуш в main — прогоняем проверки локально (go vet, go test, go build)"
+go vet ./...
+go test ./...
+CGO_ENABLED=0 go build -o /dev/null ./cmd/b24

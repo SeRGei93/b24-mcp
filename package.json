@@ -1,0 +1,48 @@
+{
+  "name": "bitrix24-mcp-server",
+  "version": "0.3.1",
+  "description": "Secure, self-hosted MCP server for Bitrix24 CRM and smart-process automation.",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "bitrix24-mcp-server": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check": "npm run typecheck && npm test && npm run build"
+  },
+  "engines": {
+    "node": ">=20.11"
+  },
+  "keywords": [
+    "bitrix24",
+    "mcp",
+    "model-context-protocol",
+    "crm"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "dotenv": "^17.2.1",
+    "fastify": "^5.11.2",
+    "pg": "^8.22.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/pg": "^8.15.6",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.10"
+  }
+}

@@ -7,6 +7,16 @@ const booleanFromEnv = z
   .default("false")
   .transform((value) => value === "true" || value === "1" || value === "yes");
 
+const trustProxyFromEnv = z
+  .string()
+  .optional()
+  .transform((value): boolean | number | string[] => {
+    if (!value || value === "false" || value === "0" || value === "no") return false;
+    if (value === "true" || value === "yes") return 1;
+    if (/^[1-9]\d*$/.test(value)) return Number(value);
+    return value.split(",").map((entry) => entry.trim()).filter(Boolean);
+  });
+
 const positiveInteger = (fallback: number) =>
   z.coerce.number().int().positive().default(fallback);
 
@@ -66,6 +76,7 @@ const envSchema = z.object({
   MCP_AUTH_TOKEN: z.string().min(32, "MCP_AUTH_TOKEN must contain at least 32 characters"),
   TOKEN_ENCRYPTION_KEY: z.string().min(1),
   MCP_TRANSPORT: z.enum(["http", "stdio"]).default("http"),
+  TRUST_PROXY: trustProxyFromEnv,
   LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"]).default("info"),
   OAUTH_STATE_TTL_SECONDS: positiveInteger(600),
   MCP_OAUTH_REQUEST_TTL_SECONDS: positiveInteger(600),
@@ -93,6 +104,7 @@ export interface AppConfig {
   mcpAuthToken: string;
   tokenEncryptionKey: string;
   transport: "http" | "stdio";
+  trustProxy?: boolean | number | string[];
   logLevel: string;
   oauthStateTtlSeconds: number;
   mcpOAuthRequestTtlSeconds: number;
@@ -129,6 +141,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
     mcpAuthToken: env.MCP_AUTH_TOKEN,
     tokenEncryptionKey: env.TOKEN_ENCRYPTION_KEY,
     transport: env.MCP_TRANSPORT,
+    trustProxy: env.TRUST_PROXY,
     logLevel: env.LOG_LEVEL,
     oauthStateTtlSeconds: env.OAUTH_STATE_TTL_SECONDS,
     mcpOAuthRequestTtlSeconds: env.MCP_OAUTH_REQUEST_TTL_SECONDS,

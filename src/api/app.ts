@@ -38,9 +38,10 @@ export function buildHttpApp(container: AppContainer) {
   const app = Fastify({
     logger,
     bodyLimit: 1_048_576,
-    trustProxy: true,
+    trustProxy: container.config.trustProxy ?? false,
     logController: new LogController({ disableRequestLogging: true }),
   });
+  const unsafeKeys = new Set(["__proto__", "constructor", "prototype"]);
   app.addContentTypeParser(
     "application/x-www-form-urlencoded",
     { parseAs: "string" },
@@ -49,9 +50,13 @@ export function buildHttpApp(container: AppContainer) {
         const parsed: Record<string, unknown> = {};
         const auth: Record<string, string> = {};
         for (const [key, value] of new URLSearchParams(body.toString())) {
+          if (unsafeKeys.has(key)) continue;
           const match = /^auth\[([^\]]+)\]$/.exec(key);
-          if (match?.[1]) auth[match[1]] = value;
-          else parsed[key] = value;
+          if (match?.[1]) {
+            if (!unsafeKeys.has(match[1])) auth[match[1]] = value;
+          } else {
+            parsed[key] = value;
+          }
         }
         if (Object.keys(auth).length) parsed.auth = auth;
         done(null, parsed);
@@ -96,6 +101,9 @@ export function buildHttpApp(container: AppContainer) {
   });
 
   app.get("/oauth/bitrix/start", { preHandler: authenticate }, async (request, reply) => {
+    if (accessByRequest.get(request)?.connectionId) {
+      throw new AppError("This MCP token cannot initiate standalone Bitrix24 OAuth flows", "CONNECTION_ACCESS_DENIED", 403);
+    }
     const query = z.object({
       domain: z.string().min(1),
       mode: z.enum(["read_only", "write_with_confirmation"]).optional(),
@@ -170,6 +178,10 @@ export function buildHttpApp(container: AppContainer) {
 
   app.post("/oauth/bitrix/refresh", { preHandler: authenticate }, async (request) => {
     const body = z.object({ connection_id: z.uuid() }).parse(request.body);
+    const authorizedConnectionId = accessByRequest.get(request)?.connectionId;
+    if (authorizedConnectionId && authorizedConnectionId !== body.connection_id) {
+      throw new AppError("This MCP token is not authorized for that Bitrix24 connection", "CONNECTION_ACCESS_DENIED", 403);
+    }
     const refreshed = await container.tokens.get(body.connection_id, true);
     return { refreshed: true, connection: toPublicConnection(refreshed.connection) };
   });

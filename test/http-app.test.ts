@@ -98,4 +98,43 @@ describe("HTTP app security", () => {
       await app.close();
     }
   });
+
+  it("prevents a connection-scoped OAuth token from refreshing another connection or starting standalone OAuth", async () => {
+    const current = container();
+    const scopedToken = "b".repeat(32);
+    const getTokens = vi.fn();
+    current.tokens = { get: getTokens } as unknown as AppContainer["tokens"];
+    current.mcpOAuth.verifyAuthorizationHeader = vi.fn(async (authorization?: string) =>
+      authorization === `Bearer ${scopedToken}`
+        ? {
+            clientId: "scoped-client",
+            connectionId: "00000000-0000-4000-8000-000000000001",
+            scopes: ["mcp:tools"],
+            resource: "https://mcp.example.com/mcp",
+          }
+        : null);
+
+    const app = buildHttpApp(current);
+    try {
+      const refreshOther = await app.inject({
+        method: "POST",
+        url: "/oauth/bitrix/refresh",
+        headers: { authorization: `Bearer ${scopedToken}` },
+        payload: { connection_id: "00000000-0000-4000-8000-000000000002" },
+      });
+      expect(refreshOther.statusCode).toBe(403);
+      expect(refreshOther.json().error).toBe("CONNECTION_ACCESS_DENIED");
+      expect(getTokens).not.toHaveBeenCalled();
+
+      const startStandalone = await app.inject({
+        method: "GET",
+        url: "/oauth/bitrix/start?domain=example.bitrix24.com&mode=write_with_confirmation",
+        headers: { authorization: `Bearer ${scopedToken}` },
+      });
+      expect(startStandalone.statusCode).toBe(403);
+      expect(startStandalone.json().error).toBe("CONNECTION_ACCESS_DENIED");
+    } finally {
+      await app.close();
+    }
+  });
 });

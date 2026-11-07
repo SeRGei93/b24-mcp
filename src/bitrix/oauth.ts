@@ -22,7 +22,7 @@ const installationAuthSchema = z.object({
   access_token: z.string().min(1),
   refresh_token: z.string().min(1),
   expires_in: z.coerce.number().int().positive().default(3_600),
-  scope: z.string().default(""),
+  scope: z.union([z.string(), z.array(z.string())]).default("").transform((val) => Array.isArray(val) ? val.join(",") : val),
   domain: z.string().min(1),
   member_id: z.string().min(1),
   user_id: z.union([z.string(), z.number()]).transform(String).optional(),
@@ -30,7 +30,7 @@ const installationAuthSchema = z.object({
 });
 
 const appInfoSchema = z.object({
-  result: z.object({ CODE: z.string().min(1), INSTALLED: z.boolean().optional() }),
+  result: z.object({ CODE: z.string().min(1) }),
 });
 
 const profileSchema = z.object({
@@ -204,7 +204,8 @@ export class BitrixOAuthService {
   }
 
   async handleInstallation(input: unknown): Promise<ConnectionRecord> {
-    const auth = installationAuthSchema.parse(input);
+    const normalizedInput = this.normalizeInstallationPayload(input);
+    const auth = installationAuthSchema.parse(normalizedInput);
     const expectedDomain = normalizePortalDomain(auth.domain, this.allowedPortalDomains);
     const portal = validateClientEndpoint(auth.client_endpoint, expectedDomain, this.allowedPortalDomains);
     const appInfoUrl = new URL("app.info.json", portal.endpoint);
@@ -244,6 +245,44 @@ export class BitrixOAuthService {
       mode: this.config.defaultMode,
       adminToolsEnabled: this.config.adminToolsEnabled,
     });
+  }
+
+  private normalizeInstallationPayload(input: unknown): Record<string, unknown> {
+    const root = typeof input === "object" && input !== null ? (input as Record<string, unknown>) : {};
+    const nestedAuth = typeof root.auth === "object" && root.auth !== null ? (root.auth as Record<string, unknown>) : {};
+    const query = typeof root.query === "object" && root.query !== null ? (root.query as Record<string, unknown>) : {};
+
+    const pick = (...keys: string[]): unknown => {
+      for (const key of keys) {
+        if (nestedAuth[key] !== undefined && nestedAuth[key] !== "") return nestedAuth[key];
+        if (root[key] !== undefined && root[key] !== "") return root[key];
+        if (query[key] !== undefined && query[key] !== "") return query[key];
+      }
+      return undefined;
+    };
+
+    const rawDomain = pick("domain", "DOMAIN") ?? this.config.bitrixPortalDomain;
+    let normalizedDomain: string | undefined;
+    if (typeof rawDomain === "string" && rawDomain.trim()) {
+      try {
+        normalizedDomain = parsePortalHost(rawDomain);
+      } catch {
+        normalizedDomain = rawDomain;
+      }
+    }
+    const clientEndpoint = pick("client_endpoint", "CLIENT_ENDPOINT")
+      ?? (normalizedDomain ? `https://${normalizedDomain}/rest/` : undefined);
+
+    return {
+      access_token: pick("access_token", "AUTH_ID"),
+      refresh_token: pick("refresh_token", "REFRESH_ID"),
+      expires_in: pick("expires_in", "AUTH_EXPIRES", "expires") ?? 3_600,
+      scope: pick("scope", "SCOPE") ?? "",
+      domain: normalizedDomain,
+      member_id: pick("member_id", "MEMBER_ID") ?? normalizedDomain,
+      user_id: pick("user_id", "USER_ID"),
+      client_endpoint: clientEndpoint,
+    };
   }
 
   private async resolveAuthorizationDomain(): Promise<string> {

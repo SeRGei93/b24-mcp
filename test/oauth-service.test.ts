@@ -201,6 +201,42 @@ describe("BitrixOAuthService", () => {
     expect(upsert.mock.calls[0]![0].accessTokenEncrypted).not.toContain("install-access");
   });
 
+  it("validates and stores a Bitrix24 placement installation payload (AUTH_ID / REFRESH_ID + DOMAIN)", async () => {
+    const pendingConfig = { ...config, bitrixClientId: "pending-bitrix-app" };
+    const upsert = vi.fn(async (input: Record<string, unknown>) => ({ ...input, id: "connection" }) as unknown as ConnectionRecord);
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      return new Response(JSON.stringify(url.endsWith("app.info.json")
+        ? { result: { CODE: "local.abc123", INSTALLED: false } }
+        : { result: { ID: "7" } }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const oauth = new BitrixOAuthService(
+      pendingConfig,
+      {} as OAuthStateRepository,
+      { upsert } as unknown as ConnectionRepository,
+      new TokenCipher(randomBytes(32)),
+    );
+
+    await oauth.handleInstallation({
+      DOMAIN: "example.bitrix24.by",
+      PROTOCOL: "1",
+      LANG: "ru",
+      APP_SID: "sid123",
+      AUTH_ID: "placement-access",
+      AUTH_EXPIRES: "3600",
+      REFRESH_ID: "placement-refresh",
+      member_id: "member-by",
+      status: "L",
+      PLACEMENT: "DEFAULT",
+    });
+
+    expect(upsert).toHaveBeenCalledOnce();
+    expect(upsert.mock.calls[0]![0].domain).toBe("example.bitrix24.by");
+    expect(upsert.mock.calls[0]![0].memberId).toBe("member-by");
+    expect(upsert.mock.calls[0]![0].clientEndpoint).toBe("https://example.bitrix24.by/rest/");
+  });
+
   it("rejects installation tokens issued to another configured app", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
       result: { CODE: "local.other", INSTALLED: true },

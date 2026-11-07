@@ -133,12 +133,31 @@ export function buildHttpApp(container: AppContainer) {
     }
   });
 
-  app.post("/oauth/bitrix/install", async (request, reply) => {
-    const body = z.object({ auth: z.unknown() }).parse(request.body);
-    const connection = await container.oauth.handleInstallation(body.auth);
+  const handleInstallRequest = async (request: FastifyRequest, reply: FastifyReply) => {
+    const body = typeof request.body === "object" && request.body !== null
+      ? (request.body as Record<string, unknown>)
+      : {};
+    const query = typeof request.query === "object" && request.query !== null
+      ? (request.query as Record<string, unknown>)
+      : {};
+    const payload = body.auth !== undefined && Object.keys(query).length === 0
+      ? body.auth
+      : { ...query, ...body };
+    const connection = await container.oauth.handleInstallation(payload);
     reply.header("cache-control", "no-store");
+    if (request.headers.accept?.includes("text/html")) {
+      reply.type("text/html; charset=utf-8");
+      return `<!doctype html><html><head><meta charset="utf-8"><script src="https://api.bitrix24.com/api/v1/"></script></head><body><p>Bitrix24 connected (${connection.domain}).</p><script>if(window.BX24){BX24.init(function(){BX24.installFinish();});}</script></body></html>`;
+    }
     return { status: "success", connected: true, connection: toPublicConnection(connection) };
-  });
+  };
+
+  app.post("/oauth/bitrix/install", handleInstallRequest);
+  app.post("/oauth/bitrix/callback", handleInstallRequest);
+  app.get("/oauth/bitrix/install", async () => ({
+    status: "ok",
+    message: "Bitrix24 installation endpoint is ready (expects POST from Bitrix24).",
+  }));
 
   app.post("/oauth/bitrix/refresh", { preHandler: authenticate }, async (request) => {
     const body = z.object({ connection_id: z.uuid() }).parse(request.body);
@@ -170,7 +189,10 @@ export function buildHttpApp(container: AppContainer) {
     const code = error instanceof AppError ? error.code : error instanceof z.ZodError ? "INVALID_REQUEST" : "INTERNAL_ERROR";
     request.log.error({ err: error, code }, "Request failed");
     if (statusCode === 401) reply.header("www-authenticate", container.mcpOAuth.challenge("invalid_token"));
-    reply.code(statusCode).send({ error: code, message: error instanceof z.ZodError ? "Request validation failed" : safeErrorMessage(error) });
+    const details = error instanceof z.ZodError
+      ? `Request validation failed: ${error.issues.map((issue) => `${issue.path.join(".") || "input"} (${issue.message})`).join(", ")}`
+      : safeErrorMessage(error);
+    reply.code(statusCode).send({ error: code, message: details });
   });
 
   return app;

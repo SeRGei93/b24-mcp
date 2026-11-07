@@ -84,11 +84,19 @@ function parsePortalHost(input: string): string {
   return host;
 }
 
+const HOSTED_BITRIX24_PATTERN =
+  /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+bitrix24\.(?:com|ru|de|eu|ua|by|kz|pl|fr|es|it|br|in|cn|vn|tr|jp|uk|mx|co|id|uz|az|am|ge|kg|lv|lt|ee|com\.br|co\.uk|com\.tr|com\.mx|com\.ua)$/i;
+
 export function normalizePortalDomain(input: string, allowedPortalDomains: readonly string[] = []): string {
   const host = parsePortalHost(input);
-  const isHostedBitrix24 = /(^|\.)bitrix24\.[a-z]{2,}(?:\.[a-z]{2,})?$/i.test(host);
   const isExplicitlyAllowed = allowedPortalDomains.some((allowed) => parsePortalHost(allowed) === host);
-  if (!isHostedBitrix24 && !isExplicitlyAllowed) {
+  if (allowedPortalDomains.length > 0) {
+    if (!isExplicitlyAllowed) {
+      throw new AppError("Only hosted or explicitly configured Bitrix24 portal domains are allowed", "INVALID_PORTAL_DOMAIN");
+    }
+    return host;
+  }
+  if (!HOSTED_BITRIX24_PATTERN.test(host)) {
     throw new AppError("Only hosted or explicitly configured Bitrix24 portal domains are allowed", "INVALID_PORTAL_DOMAIN");
   }
   return host;
@@ -206,8 +214,9 @@ export class BitrixOAuthService {
   async handleInstallation(input: unknown): Promise<ConnectionRecord> {
     const normalizedInput = this.normalizeInstallationPayload(input);
     const auth = installationAuthSchema.parse(normalizedInput);
-    const expectedDomain = normalizePortalDomain(auth.domain, this.allowedPortalDomains);
-    const portal = validateClientEndpoint(auth.client_endpoint, expectedDomain, this.allowedPortalDomains);
+    const installAllowedDomains = await this.resolveInstallationAllowedDomains();
+    const expectedDomain = normalizePortalDomain(auth.domain, installAllowedDomains);
+    const portal = validateClientEndpoint(auth.client_endpoint, expectedDomain, installAllowedDomains);
     const appInfoUrl = new URL("app.info.json", portal.endpoint);
     let response: Response;
     try {
@@ -304,6 +313,17 @@ export class BitrixOAuthService {
 
   private get allowedPortalDomains(): readonly string[] {
     return this.config.bitrixPortalDomain ? [this.config.bitrixPortalDomain] : [];
+  }
+
+  private async resolveInstallationAllowedDomains(): Promise<readonly string[]> {
+    if (this.allowedPortalDomains.length > 0) return this.allowedPortalDomains;
+    if (typeof this.connections.list !== "function") return [];
+    const activeDomains = [...new Set(
+      (await this.connections.list())
+        .filter((connection) => connection.status === "active")
+        .map((connection) => connection.domain),
+    )];
+    return activeDomains;
   }
 
   private async getProfileUserId(accessToken: string, clientEndpoint: string): Promise<string> {

@@ -70,6 +70,19 @@ describe("SQLite repositories and migrations", () => {
     expect(updated.mode).toBe("write_with_confirmation");
     expect(updated.adminToolsEnabled).toBe(true);
 
+    await expect(connections.upsert({
+      domain: "other.bitrix24.com",
+      memberId: "member-1",
+      bitrixUserId: "42",
+      clientEndpoint: "https://other.bitrix24.com/rest/",
+      accessTokenEncrypted: "enc-access-3",
+      refreshTokenEncrypted: "enc-refresh-3",
+      scope: "crm",
+      expiresAt: new Date(Date.now() + 3_600_000),
+      mode: "read_only",
+      adminToolsEnabled: false,
+    })).rejects.toThrow(/different portal domain/i);
+
     await states.create("raw-state-1", "example.bitrix24.com", "read_only", new Date(Date.now() + 60_000));
     const consumedState = await states.consume("raw-state-1");
     expect(consumedState).toEqual({ domain: "example.bitrix24.com", mode: "read_only", mcpRequestHash: undefined });

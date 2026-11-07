@@ -11,6 +11,8 @@ describe("normalizePortalDomain", () => {
   it("accepts only an exact operator-allowlisted custom domain", () => {
     expect(normalizePortalDomain("https://crm.hub-bnk.com/", ["crm.hub-bnk.com"])).toBe("crm.hub-bnk.com");
     expect(() => normalizePortalDomain("other.hub-bnk.com", ["crm.hub-bnk.com"])).toThrow();
+    expect(() => normalizePortalDomain("other.bitrix24.com", ["example.bitrix24.com"])).toThrow();
+    expect(() => normalizePortalDomain("other.bitrix24.com", ["crm.hub-bnk.com"])).toThrow();
     expect(() => normalizePortalDomain("crm.hub-bnk.com")).toThrow();
   });
 
@@ -18,6 +20,9 @@ describe("normalizePortalDomain", () => {
     "localhost",
     "127.0.0.1",
     "https://example.com",
+    "bitrix24.com",
+    "bitrix24.attacker.com",
+    "sub.bitrix24.attacker.com",
     "http://example.bitrix24.com",
     "https://example.bitrix24.com:8443",
     "https://example.bitrix24.com/rest/",

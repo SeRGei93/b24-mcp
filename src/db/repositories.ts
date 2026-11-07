@@ -7,7 +7,7 @@ import type {
   OperationType,
   PendingOperationRecord,
 } from "../types.js";
-import { NotFoundError } from "../errors.js";
+import { NotFoundError, PolicyError } from "../errors.js";
 
 interface ConnectionRow {
   id: string;
@@ -133,6 +133,7 @@ export class ConnectionRepository {
         admin_tools_enabled = excluded.admin_tools_enabled,
         status = 'active',
         updated_at = excluded.updated_at
+      WHERE bitrix_connections.domain = excluded.domain
       RETURNING *
     `, [
       randomUUID(),
@@ -148,7 +149,11 @@ export class ConnectionRepository {
       input.adminToolsEnabled ? 1 : 0,
       now,
     ]);
-    return mapConnection(result.rows[0]!);
+    const row = result.rows[0];
+    if (!row) {
+      throw new PolicyError("Bitrix24 member_id is already bound to a different portal domain");
+    }
+    return mapConnection(row);
   }
 
   async withRefreshLock<T>(id: string, callback: (connection: ConnectionRecord, client: DbClient) => Promise<T>): Promise<T> {

@@ -109,6 +109,33 @@ func HashSecret(value string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+type ConnectionStatus string
+
+const (
+	StatusActive   ConnectionStatus = "active"
+	StatusDisabled ConnectionStatus = "disabled"
+	StatusRevoked  ConnectionStatus = "revoked"
+)
+
+type OperationType string
+
+const (
+	OpCreateItem    OperationType = "create_item"
+	OpUpdateItem    OperationType = "update_item"
+	OpMoveItemStage OperationType = "move_item_stage"
+)
+
+type OperationStatus string
+
+const (
+	OpStatusPending   OperationStatus = "pending"
+	OpStatusExecuting OperationStatus = "executing"
+	OpStatusCompleted OperationStatus = "completed"
+	OpStatusCancelled OperationStatus = "cancelled"
+	OpStatusExpired   OperationStatus = "expired"
+	OpStatusFailed    OperationStatus = "failed"
+)
+
 type Connection struct {
 	ID                string
 	Domain            string
@@ -253,10 +280,12 @@ type PendingOperation struct {
 	ConnectionID  string         `json:"connectionId"`
 	OperationType string         `json:"operationType"`
 	Method        string         `json:"method"`
-	ParamsJSON    string         `json:"paramsJson"`
+	ParamsJSON    string         `json:"-"`
+	Params        map[string]any `json:"params"`
 	HumanSummary  string         `json:"humanSummary"`
 	Status        string         `json:"status"`
-	ResultJSON    string         `json:"resultJson,omitempty"`
+	ResultJSON    string         `json:"-"`
+	Result        any            `json:"result"`
 	ErrorMessage  string         `json:"errorMessage,omitempty"`
 	CreatedAt     time.Time      `json:"createdAt"`
 	ExpiresAt     time.Time      `json:"expiresAt"`
@@ -870,6 +899,18 @@ func scanPendingOperation(scanner rowScanner) (*PendingOperation, error) {
 		return nil, err
 	}
 	op.ResultJSON = resultJSON.String
+	if op.ParamsJSON != "" {
+		_ = json.Unmarshal([]byte(op.ParamsJSON), &op.Params)
+	}
+	if op.Params == nil {
+		op.Params = map[string]any{}
+	}
+	if resultJSON.Valid && resultJSON.String != "" {
+		var parsedResult any
+		if err := json.Unmarshal([]byte(resultJSON.String), &parsedResult); err == nil {
+			op.Result = parsedResult
+		}
+	}
 	op.ErrorMessage = errorMsg.String
 	op.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdStr)
 	op.ExpiresAt, _ = time.Parse(time.RFC3339Nano, expiresStr)
@@ -1008,21 +1049,6 @@ func (s *Store) GetAuthorizationRequest(ctx context.Context, requestHash string)
 		return nil, nil
 	}
 	return req, err
-}
-
-func (s *Store) IncrementAuthorizationAttempts(ctx context.Context, requestHash string) (int, error) {
-	now := time.Now().UTC().Format(isoTimeFormat)
-	var attempts int
-	err := s.db.QueryRowContext(ctx, `
-		UPDATE mcp_oauth_authorization_requests
-		SET attempts = MIN(attempts + 1, 5)
-		WHERE request_hash = ?1 AND expires_at > ?2
-		RETURNING attempts
-	`, requestHash, now).Scan(&attempts)
-	if errors.Is(err, sql.ErrNoRows) {
-		return 5, nil
-	}
-	return attempts, err
 }
 
 func (s *Store) ConsumeAuthorizationRequestAndCreateCode(

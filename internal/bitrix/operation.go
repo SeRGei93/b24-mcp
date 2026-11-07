@@ -48,7 +48,7 @@ func (s *OperationService) PrepareCreate(
 		"fields":       fields,
 	}
 	summary := fmt.Sprintf("Create an item in CRM entity type %d.", entityTypeID)
-	return s.createPending(ctx, connectionID, "create_item", "crm.item.add", params, summary)
+	return s.createPending(ctx, connectionID, string(store.OpCreateItem), "crm.item.add", params, summary)
 }
 
 func (s *OperationService) PrepareUpdate(
@@ -70,7 +70,7 @@ func (s *OperationService) PrepareUpdate(
 		"fields":       fields,
 	}
 	summary := fmt.Sprintf("Update item #%d in CRM entity type %d.", id, entityTypeID)
-	return s.createPending(ctx, connectionID, "update_item", "crm.item.update", params, summary)
+	return s.createPending(ctx, connectionID, string(store.OpUpdateItem), "crm.item.update", params, summary)
 }
 
 func (s *OperationService) PrepareMove(
@@ -89,7 +89,7 @@ func (s *OperationService) PrepareMove(
 		"fields":       map[string]any{"stageId": stageID},
 	}
 	summary := fmt.Sprintf("Move item #%d in CRM entity type %d to stage '%s'.", id, entityTypeID, stageID)
-	return s.createPending(ctx, connectionID, "move_item_stage", "crm.item.update", params, summary)
+	return s.createPending(ctx, connectionID, string(store.OpMoveItemStage), "crm.item.update", params, summary)
 }
 
 func (s *OperationService) Confirm(
@@ -120,10 +120,7 @@ func (s *OperationService) Confirm(
 		return nil, config.NewAppError("Operation is not pending or has expired", "OPERATION_NOT_CONFIRMABLE", 409)
 	}
 
-	var params map[string]any
-	_ = json.Unmarshal([]byte(claimed.ParamsJSON), &params)
-
-	resp, err := s.client.Call(ctx, claimed.ConnectionID, claimed.Method, params)
+	resp, err := s.client.Call(ctx, claimed.ConnectionID, claimed.Method, claimed.Params)
 	if err != nil {
 		msg := config.SafeErrorMessage(err)
 		_ = s.store.FailPendingOperation(ctx, claimed.ID, msg)
@@ -131,7 +128,7 @@ func (s *OperationService) Confirm(
 			ConnectionID: claimed.ConnectionID,
 			OperationID:  claimed.ID,
 			Action:       claimed.OperationType,
-			Outcome:      "failed",
+			Outcome:      string(store.OpStatusFailed),
 			Details:      map[string]any{"method": claimed.Method, "error": msg},
 		})
 		return nil, err
@@ -147,13 +144,13 @@ func (s *OperationService) Confirm(
 		ConnectionID: claimed.ConnectionID,
 		OperationID:  claimed.ID,
 		Action:       claimed.OperationType,
-		Outcome:      "completed",
+		Outcome:      string(store.OpStatusCompleted),
 		Details:      map[string]any{"method": claimed.Method, "summary": claimed.HumanSummary},
 	})
 
 	return map[string]any{
 		"operationId": claimed.ID,
-		"status":      "completed",
+		"status":      string(store.OpStatusCompleted),
 		"summary":     claimed.HumanSummary,
 		"result":      resVal,
 	}, nil
@@ -191,10 +188,6 @@ func (s *OperationService) Cancel(
 		"status":      cancelled.Status,
 		"summary":     cancelled.HumanSummary,
 	}, nil
-}
-
-func (s *OperationService) List(ctx context.Context, connectionID *string) ([]store.PendingOperation, error) {
-	return s.store.ListPendingOperations(ctx, connectionID)
 }
 
 func (s *OperationService) assertPrepare(ctx context.Context, connectionID string) error {

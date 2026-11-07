@@ -99,95 +99,17 @@ func (s *CrmService) SearchItems(ctx context.Context, input SearchItemsInput) (*
 		"filter":       filter,
 		"select":       baseSelect,
 		"order":        baseOrder,
-		"start":        0,
 	}
 
-	firstResp, err := s.client.Call(ctx, input.ConnectionID, "crm.item.list", baseParams)
+	items, total, err := s.client.CollectPages(ctx, input.ConnectionID, "crm.item.list", baseParams, input.Limit, func(raw json.RawMessage) []map[string]any {
+		var pageObj struct {
+			Items []map[string]any `json:"items"`
+		}
+		_ = json.Unmarshal(raw, &pageObj)
+		return pageObj.Items
+	})
 	if err != nil {
 		return nil, err
-	}
-
-	var firstObj struct {
-		Items []map[string]any `json:"items"`
-	}
-	_ = json.Unmarshal(firstResp.Result, &firstObj)
-	items := firstObj.Items
-	if items == nil {
-		items = []map[string]any{}
-	}
-
-	total := firstResp.Total
-
-	if firstResp.Next != nil && len(items) < input.Limit && s.cfg.BitrixMaxPages > 1 {
-		if total != nil && *total > len(items) {
-			targetCount := *total
-			if input.Limit < targetCount {
-				targetCount = input.Limit
-			}
-			maxCount := s.cfg.BitrixMaxPages * BitrixBatchLimit
-			if targetCount > maxCount {
-				targetCount = maxCount
-			}
-
-			var commands []NamedBatchCommand
-			var keys []string
-			page := 1
-			for start := *firstResp.Next; start < targetCount && page < s.cfg.BitrixMaxPages; start += BitrixBatchLimit {
-				key := fmt.Sprintf("p_%d", start)
-				keys = append(keys, key)
-				pageParams := map[string]any{
-					"entityTypeId": input.EntityTypeID,
-					"filter":       filter,
-					"select":       baseSelect,
-					"order":        baseOrder,
-					"start":        start,
-				}
-				commands = append(commands, NamedBatchCommand{
-					Key:    key,
-					Method: "crm.item.list",
-					Params: pageParams,
-				})
-				page++
-			}
-			if len(commands) > 0 {
-				batchResult, bErr := s.client.CallBatch(ctx, input.ConnectionID, commands, false)
-				if bErr == nil {
-					for _, k := range keys {
-						if raw, ok := batchResult[k]; ok {
-							var pageObj struct {
-								Items []map[string]any `json:"items"`
-							}
-							_ = json.Unmarshal(raw, &pageObj)
-							items = append(items, pageObj.Items...)
-						}
-					}
-				}
-			}
-		} else {
-			start := *firstResp.Next
-			for page := 1; page < s.cfg.BitrixMaxPages && len(items) < input.Limit; page++ {
-				pageParams := map[string]any{
-					"entityTypeId": input.EntityTypeID,
-					"filter":       filter,
-					"select":       baseSelect,
-					"order":        baseOrder,
-					"start":        start,
-				}
-				pageResp, pErr := s.client.Call(ctx, input.ConnectionID, "crm.item.list", pageParams)
-				if pErr != nil {
-					break
-				}
-				var pageObj struct {
-					Items []map[string]any `json:"items"`
-				}
-				_ = json.Unmarshal(pageResp.Result, &pageObj)
-				items = append(items, pageObj.Items...)
-				if pageResp.Next == nil {
-					break
-				}
-				start = *pageResp.Next
-			}
-		}
 	}
 
 	sliced := items
@@ -198,9 +120,9 @@ func (s *CrmService) SearchItems(ctx context.Context, input SearchItemsInput) (*
 	if input.IncludeProductRows && len(sliced) > 0 {
 		var ownerIDs []int
 		for _, item := range sliced {
-			id := toInt(item["id"])
+			id := ToInt(item["id"])
 			if id == 0 {
-				id = toInt(item["ID"])
+				id = ToInt(item["ID"])
 			}
 			if id > 0 {
 				ownerIDs = append(ownerIDs, id)
@@ -424,77 +346,12 @@ func (s *CrmService) ListUsers(ctx context.Context, connectionID string, filter 
 	if filter == nil {
 		filter = make(map[string]any)
 	}
-	firstResp, err := s.client.Call(ctx, connectionID, "user.get", map[string]any{
+	users, _, err := s.client.CollectPages(ctx, connectionID, "user.get", map[string]any{
 		"filter": filter,
-		"start":  0,
+	}, 0, func(raw json.RawMessage) []map[string]any {
+		var pageUsers []map[string]any
+		_ = json.Unmarshal(raw, &pageUsers)
+		return pageUsers
 	})
-	if err != nil {
-		return nil, err
-	}
-
-	var users []map[string]any
-	_ = json.Unmarshal(firstResp.Result, &users)
-	if users == nil {
-		users = []map[string]any{}
-	}
-
-	total := firstResp.Total
-
-	if firstResp.Next != nil && s.cfg.BitrixMaxPages > 1 {
-		if total != nil && *total > len(users) {
-			targetCount := *total
-			maxCount := s.cfg.BitrixMaxPages * BitrixBatchLimit
-			if targetCount > maxCount {
-				targetCount = maxCount
-			}
-			var commands []NamedBatchCommand
-			var keys []string
-			page := 1
-			for start := *firstResp.Next; start < targetCount && page < s.cfg.BitrixMaxPages; start += BitrixBatchLimit {
-				key := fmt.Sprintf("u_%d", start)
-				keys = append(keys, key)
-				commands = append(commands, NamedBatchCommand{
-					Key:    key,
-					Method: "user.get",
-					Params: map[string]any{
-						"filter": filter,
-						"start":  start,
-					},
-				})
-				page++
-			}
-			if len(commands) > 0 {
-				batchResult, bErr := s.client.CallBatch(ctx, connectionID, commands, false)
-				if bErr == nil {
-					for _, k := range keys {
-						if raw, ok := batchResult[k]; ok {
-							var pageUsers []map[string]any
-							_ = json.Unmarshal(raw, &pageUsers)
-							users = append(users, pageUsers...)
-						}
-					}
-				}
-			}
-		} else {
-			start := *firstResp.Next
-			for page := 1; page < s.cfg.BitrixMaxPages; page++ {
-				resp, rErr := s.client.Call(ctx, connectionID, "user.get", map[string]any{
-					"filter": filter,
-					"start":  start,
-				})
-				if rErr != nil {
-					break
-				}
-				var pageUsers []map[string]any
-				_ = json.Unmarshal(resp.Result, &pageUsers)
-				users = append(users, pageUsers...)
-				if resp.Next == nil {
-					break
-				}
-				start = *resp.Next
-			}
-		}
-	}
-
-	return users, nil
+	return users, err
 }

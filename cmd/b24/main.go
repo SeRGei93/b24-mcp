@@ -59,7 +59,8 @@ func run() error {
 		return mcpserver.ServeStdio(mcpSrv)
 	}
 
-	handler := server.NewHandler(cfg, st, oauth, tokens, logger)
+	mcpOAuth := mcp.NewOAuthService(cfg, st)
+	handler := server.NewHandlerWithServices(cfg, st, oauth, tokens, mcpOAuth, schema, crm, ops, logger)
 
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 	httpServer := &http.Server{

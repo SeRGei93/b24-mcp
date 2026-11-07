@@ -113,3 +113,26 @@ func (m *FlexMap[T]) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// ToInt converts a loosely-typed numeric or string value to int, returning 0 on failure.
+func ToInt(v any) int {
+	switch val := v.(type) {
+	case int:
+		return val
+	case int64:
+		return int(val)
+	case float64:
+		return int(val)
+	case FlexInt:
+		return int(val)
+	case json.Number:
+		n, _ := val.Int64()
+		return int(n)
+	case string:
+		n, _ := strconv.Atoi(strings.TrimSpace(val))
+		return n
+	default:
+		return 0
+	}
+}
+
+

@@ -23,7 +23,7 @@ func NewPolicyGuard() *PolicyGuard {
 }
 
 func (g *PolicyGuard) Assert(conn *store.Connection, capability Capability, confirmed bool) error {
-	if conn.Status != "active" {
+	if conn.Status != string(store.StatusActive) {
 		return config.NewPolicyError(fmt.Sprintf("Connection '%s' is %s", conn.ID, conn.Status))
 	}
 	if capability == CapabilityRead {
@@ -45,7 +45,7 @@ func (g *PolicyGuard) Assert(conn *store.Connection, capability Capability, conf
 }
 
 func (g *PolicyGuard) AssertCanPrepareWrite(conn *store.Connection) error {
-	if conn.Status != "active" {
+	if conn.Status != string(store.StatusActive) {
 		return config.NewPolicyError(fmt.Sprintf("Connection '%s' is %s", conn.ID, conn.Status))
 	}
 	if conn.Mode != config.ModeWriteWithConfirmation {

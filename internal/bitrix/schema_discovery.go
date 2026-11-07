@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strconv"
 	"strings"
 	"unicode"
 
@@ -18,48 +17,9 @@ import (
 const PageSize = 50
 
 type EntityType struct {
-	EntityTypeID int            `json:"entityTypeId"`
-	Title        string         `json:"title"`
-	IsDynamic    bool           `json:"isDynamic"`
-	Extra        map[string]any `json:"-"`
-}
-
-func (e EntityType) MarshalJSON() ([]byte, error) {
-	m := make(map[string]any)
-	for k, v := range e.Extra {
-		m[k] = v
-	}
-	m["entityTypeId"] = e.EntityTypeID
-	m["title"] = e.Title
-	m["isDynamic"] = e.IsDynamic
-	return json.Marshal(m)
-}
-
-func (e *EntityType) UnmarshalJSON(data []byte) error {
-	var m map[string]any
-	if err := json.Unmarshal(data, &m); err != nil {
-		return err
-	}
-	e.Extra = m
-	if idVal, ok := m["entityTypeId"]; ok {
-		switch v := idVal.(type) {
-		case float64:
-			e.EntityTypeID = int(v)
-		case string:
-			e.EntityTypeID, _ = strconv.Atoi(v)
-		}
-	}
-	if titleVal, ok := m["title"]; ok {
-		e.Title = fmt.Sprintf("%v", titleVal)
-	} else if nameVal, ok := m["name"]; ok {
-		e.Title = fmt.Sprintf("%v", nameVal)
-	}
-	if dynVal, ok := m["isDynamic"]; ok {
-		if b, ok := dynVal.(bool); ok {
-			e.IsDynamic = b
-		}
-	}
-	return nil
+	EntityTypeID int    `json:"entityTypeId"`
+	Title        string `json:"title"`
+	IsDynamic    bool   `json:"isDynamic"`
 }
 
 var BuiltInTypes = []EntityType{
@@ -91,7 +51,7 @@ func (s *SchemaDiscovery) ListEntityTypes(ctx context.Context, connectionID stri
 		if err == nil && found {
 			for _, item := range cached {
 				if id, ok := item["entityTypeId"]; ok {
-					item["entityTypeId"] = toInt(id)
+					item["entityTypeId"] = ToInt(id)
 				}
 			}
 			return cached, nil
@@ -106,15 +66,7 @@ func (s *SchemaDiscovery) ListEntityTypes(ctx context.Context, connectionID stri
 	var dynamic []map[string]any
 	existingIDs := make(map[int]bool)
 	for _, item := range dynamicRaw {
-		id := 0
-		if idVal, ok := item["entityTypeId"]; ok {
-			switch v := idVal.(type) {
-			case float64:
-				id = int(v)
-			case string:
-				id, _ = strconv.Atoi(v)
-			}
-		}
+		id := ToInt(item["entityTypeId"])
 		if id <= 0 {
 			continue
 		}
@@ -260,7 +212,7 @@ func (s *SchemaDiscovery) Describe(
 	var selectedCategories []map[string]any
 	if categoryID != nil {
 		for _, cat := range cats {
-			id := toInt(cat["id"])
+			id := ToInt(cat["id"])
 			if id == *categoryID {
 				selectedCategories = append(selectedCategories, cat)
 			}
@@ -272,7 +224,7 @@ func (s *SchemaDiscovery) Describe(
 	var catIDs []int
 	if len(selectedCategories) > 0 {
 		for _, cat := range selectedCategories {
-			catIDs = append(catIDs, toInt(cat["id"]))
+			catIDs = append(catIDs, ToInt(cat["id"]))
 		}
 	} else {
 		cid := 0
@@ -394,17 +346,6 @@ func (s *SchemaDiscovery) collect(
 	params map[string]any,
 	nestedKey string,
 ) ([]map[string]any, error) {
-	p := make(map[string]any, len(params)+1)
-	for k, v := range params {
-		p[k] = v
-	}
-	p["start"] = 0
-
-	firstResp, err := s.client.Call(ctx, connectionID, method, p)
-	if err != nil {
-		return nil, err
-	}
-
 	extract := func(raw json.RawMessage) []map[string]any {
 		if len(raw) == 0 {
 			return nil
@@ -426,74 +367,8 @@ func (s *SchemaDiscovery) collect(
 		}
 		return nil
 	}
-
-	values := extract(firstResp.Result)
-	if values == nil {
-		values = []map[string]any{}
-	}
-
-	total := 0
-	if firstResp.Total != nil {
-		total = *firstResp.Total
-	}
-
-	if firstResp.Next != nil && s.cfg.BitrixMaxPages > 1 {
-		if total > len(values) {
-			targetCount := total
-			maxCount := s.cfg.BitrixMaxPages * PageSize
-			if targetCount > maxCount {
-				targetCount = maxCount
-			}
-			var commands []NamedBatchCommand
-			var keys []string
-			page := 1
-			for start := *firstResp.Next; start < targetCount && page < s.cfg.BitrixMaxPages; start += PageSize {
-				key := fmt.Sprintf("p_%d", start)
-				keys = append(keys, key)
-				pageParams := make(map[string]any, len(params)+1)
-				for k, v := range params {
-					pageParams[k] = v
-				}
-				pageParams["start"] = start
-				commands = append(commands, NamedBatchCommand{
-					Key:    key,
-					Method: method,
-					Params: pageParams,
-				})
-				page++
-			}
-			if len(commands) > 0 {
-				batchResult, bErr := s.client.CallBatch(ctx, connectionID, commands, false)
-				if bErr == nil {
-					for _, k := range keys {
-						if raw, ok := batchResult[k]; ok {
-							values = append(values, extract(raw)...)
-						}
-					}
-				}
-			}
-		} else {
-			start := *firstResp.Next
-			for page := 1; page < s.cfg.BitrixMaxPages; page++ {
-				pageParams := make(map[string]any, len(params)+1)
-				for k, v := range params {
-					pageParams[k] = v
-				}
-				pageParams["start"] = start
-				resp, rErr := s.client.Call(ctx, connectionID, method, pageParams)
-				if rErr != nil {
-					break
-				}
-				values = append(values, extract(resp.Result)...)
-				if resp.Next == nil {
-					break
-				}
-				start = *resp.Next
-			}
-		}
-	}
-
-	return values, nil
+	values, _, err := s.client.CollectPages(ctx, connectionID, method, params, 0, extract)
+	return values, err
 }
 
 func stageEntityID(entityTypeID, categoryID int) string {
@@ -513,18 +388,4 @@ func normalizeName(value string) string {
 	t := transform.Chain(norm.NFD, runes.Remove(runes.In(unicode.Mn)), norm.NFC)
 	result, _, _ := transform.String(t, value)
 	return strings.ToLower(strings.TrimSpace(result))
-}
-
-func toInt(v any) int {
-	switch val := v.(type) {
-	case int:
-		return val
-	case float64:
-		return int(val)
-	case string:
-		n, _ := strconv.Atoi(val)
-		return n
-	default:
-		return 0
-	}
 }

@@ -864,7 +864,7 @@ func TestOperationService_TwoStepLifecycleAndPolicyGuard(t *testing.T) {
 	}
 
 	// Check listing pending
-	list, err := opSvc.List(ctx, &conn.ID)
+	list, err := st.ListPendingOperations(ctx, &conn.ID)
 	if err != nil || len(list) != 1 {
 		t.Fatalf("expected 1 pending operation in list, got %d, err=%v", len(list), err)
 	}

@@ -54,7 +54,6 @@ type Config struct {
 	AdminToolsEnabled              bool
 	McpAuthToken                   string
 	TokenEncryptionKey             string
-	EncryptionKey                  []byte
 	Transport                      string
 	TrustProxy                     TrustProxyConfig
 	LogLevel                       string
@@ -193,8 +192,7 @@ func Load(env map[string]string) (*Config, error) {
 	}
 
 	tokenEncryptionKey := strings.TrimSpace(env["TOKEN_ENCRYPTION_KEY"])
-	encryptionKey, err := ParseEncryptionKey(tokenEncryptionKey)
-	if err != nil {
+	if _, err := ParseEncryptionKey(tokenEncryptionKey); err != nil {
 		issues = append(issues, fmt.Sprintf("TOKEN_ENCRYPTION_KEY: %s", err.Error()))
 	}
 
@@ -238,7 +236,6 @@ func Load(env map[string]string) (*Config, error) {
 		AdminToolsEnabled:              adminToolsEnabled,
 		McpAuthToken:                   mcpAuthToken,
 		TokenEncryptionKey:             tokenEncryptionKey,
-		EncryptionKey:                  encryptionKey,
 		Transport:                      transport,
 		TrustProxy:                     trustProxy,
 		LogLevel:                       logLevel,

@@ -44,7 +44,6 @@ type Server struct {
 	oauth         *bitrix.OAuthService
 	tokens        *bitrix.TokenManager
 	mcpOAuth      *mcp.OAuthService
-	restClient    *bitrix.RestClient
 	schema        *bitrix.SchemaDiscovery
 	crm           *bitrix.CrmService
 	ops           *bitrix.OperationService
@@ -61,12 +60,6 @@ func NewHandler(
 	tokens *bitrix.TokenManager,
 	logger *config.Logger,
 ) http.Handler {
-	parsedOrigin, _ := url.Parse(cfg.AppURL)
-	allowedOrigin := ""
-	if parsedOrigin != nil && parsedOrigin.Scheme != "" && parsedOrigin.Host != "" {
-		allowedOrigin = parsedOrigin.Scheme + "://" + parsedOrigin.Host
-	}
-
 	var httpClient *http.Client
 	if oauth != nil {
 		httpClient = oauth.HTTPClient()
@@ -76,14 +69,37 @@ func NewHandler(
 	crm := bitrix.NewCrmService(cfg, rc)
 	guard := bitrix.NewPolicyGuard()
 	ops := bitrix.NewOperationService(cfg, st, guard, rc)
+	mcpOAuth := mcp.NewOAuthService(cfg, st)
+
+	return NewHandlerWithServices(cfg, st, oauth, tokens, mcpOAuth, schema, crm, ops, logger)
+}
+
+func NewHandlerWithServices(
+	cfg *config.Config,
+	st *store.Store,
+	oauth *bitrix.OAuthService,
+	tokens *bitrix.TokenManager,
+	mcpOAuth *mcp.OAuthService,
+	schema *bitrix.SchemaDiscovery,
+	crm *bitrix.CrmService,
+	ops *bitrix.OperationService,
+	logger *config.Logger,
+) http.Handler {
+	parsedOrigin, _ := url.Parse(cfg.AppURL)
+	allowedOrigin := ""
+	if parsedOrigin != nil && parsedOrigin.Scheme != "" && parsedOrigin.Host != "" {
+		allowedOrigin = parsedOrigin.Scheme + "://" + parsedOrigin.Host
+	}
+	if mcpOAuth == nil {
+		mcpOAuth = mcp.NewOAuthService(cfg, st)
+	}
 
 	s := &Server{
 		cfg:           cfg,
 		store:         st,
 		oauth:         oauth,
 		tokens:        tokens,
-		mcpOAuth:      mcp.NewOAuthService(cfg, st),
-		restClient:    rc,
+		mcpOAuth:      mcpOAuth,
 		schema:        schema,
 		crm:           crm,
 		ops:           ops,
@@ -545,7 +561,7 @@ func (s *Server) handleOAuthInstallPost(w http.ResponseWriter, r *http.Request) 
 	if strings.Contains(r.Header.Get("Accept"), "text/html") {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
-		_, _ = fmt.Fprintf(w, `<!doctype html><html><head><meta charset="utf-8"><script src="https://api.bitrix24.com/api/v1/"></script></head><body><p>Bitrix24 connected (%s).</p><script>if(window.BX24){BX24.init(function(){BX24.installFinish();});}</script></body></html>`, conn.Domain)
+		_, _ = fmt.Fprintf(w, `<!doctype html><html><head><meta charset="utf-8"><script src="https://api.bitrix24.com/api/v1/"></script></head><body><p>Bitrix24 connected (%s).</p><script>if(window.BX24){BX24.init(function(){BX24.installFinish();});}</script></body></html>`, escapeHTML(conn.Domain))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{

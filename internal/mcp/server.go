@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"strconv"
 
 	"github.com/SeRGei93/b24-mcp/internal/bitrix"
 	"github.com/SeRGei93/b24-mcp/internal/config"
@@ -27,16 +26,14 @@ func NewServer(
 	)
 
 	connFor := func(requested string) (string, error) {
-		if authorizedConnectionID != "" && requested != "" && requested != authorizedConnectionID {
-			return "", config.NewAppError("This MCP token is not authorized for that Bitrix24 connection", "CONNECTION_ACCESS_DENIED", 403)
+		resolved, err := ResolveConnectionID(authorizedConnectionID, requested)
+		if err != nil {
+			return "", err
 		}
-		if authorizedConnectionID != "" {
-			return authorizedConnectionID, nil
-		}
-		if requested == "" {
+		if resolved == "" {
 			return "", config.NewAppError("connectionId is required", "MISSING_CONNECTION_ID", 400)
 		}
-		return requested, nil
+		return resolved, nil
 	}
 
 	// 1. bitrix_list_connections
@@ -144,7 +141,7 @@ func NewServer(
 				return nil, err
 			}
 			args := req.GetArguments()
-			typeID := toInt(args["entityTypeId"])
+			typeID := bitrix.ToInt(args["entityTypeId"])
 			entityName := req.GetString("entityName", "")
 			if typeID <= 0 && entityName == "" {
 				return nil, config.NewAppError("Supply entityTypeId or entityName", "MISSING_ENTITY", 400)
@@ -154,11 +151,11 @@ func NewServer(
 				if err != nil {
 					return nil, err
 				}
-				typeID = toInt(resolved["entityTypeId"])
+				typeID = bitrix.ToInt(resolved["entityTypeId"])
 			}
 			var categoryID *int
 			if catVal, ok := args["categoryId"]; ok && catVal != nil {
-				c := toInt(catVal)
+				c := bitrix.ToInt(catVal)
 				categoryID = &c
 			}
 			return schema.Describe(ctx, connID, typeID, categoryID, req.GetBool("refresh", false))
@@ -237,10 +234,10 @@ func NewServer(
 				return nil, err
 			}
 			args := req.GetArguments()
-			typeID := toInt(args["entityTypeId"])
+			typeID := bitrix.ToInt(args["entityTypeId"])
 			var categoryID *int
 			if catVal, ok := args["categoryId"]; ok && catVal != nil {
-				c := toInt(catVal)
+				c := bitrix.ToInt(catVal)
 				categoryID = &c
 			}
 			catID := 0
@@ -299,7 +296,7 @@ func NewServer(
 			}
 			args := req.GetArguments()
 			filter, _ := args["filter"].(map[string]any)
-			limit := toInt(args["limit"])
+			limit := bitrix.ToInt(args["limit"])
 			if limit <= 0 {
 				limit = 100
 			}
@@ -326,7 +323,7 @@ func NewServer(
 
 			return crm.SearchItems(ctx, bitrix.SearchItemsInput{
 				ConnectionID:       connID,
-				EntityTypeID:       toInt(args["entityTypeId"]),
+				EntityTypeID:       bitrix.ToInt(args["entityTypeId"]),
 				Filter:             filter,
 				Select:             sel,
 				Order:              order,
@@ -358,12 +355,12 @@ func NewServer(
 				return nil, err
 			}
 			args := req.GetArguments()
-			typeID := toInt(args["entityTypeId"])
+			typeID := bitrix.ToInt(args["entityTypeId"])
 
 			var ids []int
 			if idsRaw, ok := args["ids"].([]any); ok {
 				for _, idVal := range idsRaw {
-					if id := toInt(idVal); id > 0 {
+					if id := bitrix.ToInt(idVal); id > 0 {
 						ids = append(ids, id)
 					}
 				}
@@ -374,7 +371,7 @@ func NewServer(
 			}
 
 			if idVal, ok := args["id"]; ok && idVal != nil {
-				singleID := toInt(idVal)
+				singleID := bitrix.ToInt(idVal)
 				if singleID > 0 {
 					return crm.GetItem(ctx, connID, typeID, singleID)
 				}
@@ -417,7 +414,7 @@ func NewServer(
 			extractIDs := func(key string) {
 				if raw, ok := args[key].([]any); ok {
 					for _, item := range raw {
-						if id := toInt(item); id > 0 {
+						if id := bitrix.ToInt(item); id > 0 {
 							ownerIDs = append(ownerIDs, id)
 						}
 					}
@@ -430,14 +427,14 @@ func NewServer(
 
 			var singleOwnerID *int
 			if val, ok := args["ownerId"]; ok && val != nil {
-				id := toInt(val)
+				id := bitrix.ToInt(val)
 				if id > 0 {
 					singleOwnerID = &id
 				}
 			}
 			if singleOwnerID == nil {
 				if val, ok := args["dealId"]; ok && val != nil {
-					id := toInt(val)
+					id := bitrix.ToInt(val)
 					if id > 0 {
 						singleOwnerID = &id
 					}
@@ -448,7 +445,7 @@ func NewServer(
 				return nil, config.NewAppError("Supply dealIds, ownerIds, dealId, or ownerId", "MISSING_OWNER_ID", 400)
 			}
 
-			typeID := toInt(args["entityTypeId"])
+			typeID := bitrix.ToInt(args["entityTypeId"])
 			if typeID <= 0 {
 				typeID = 2
 			}
@@ -465,7 +462,7 @@ func NewServer(
 			}
 			var limitPtr *int
 			if limVal, ok := args["limit"]; ok && limVal != nil {
-				l := toInt(limVal)
+				l := bitrix.ToInt(limVal)
 				if l > 0 {
 					limitPtr = &l
 				}
@@ -530,7 +527,7 @@ func NewServer(
 				return nil, err
 			}
 			args := req.GetArguments()
-			typeID := toInt(args["entityTypeId"])
+			typeID := bitrix.ToInt(args["entityTypeId"])
 			fields, _ := args["fields"].(map[string]any)
 			return ops.PrepareCreate(ctx, connID, typeID, fields)
 		}), nil
@@ -558,8 +555,8 @@ func NewServer(
 				return nil, err
 			}
 			args := req.GetArguments()
-			typeID := toInt(args["entityTypeId"])
-			id := toInt(args["id"])
+			typeID := bitrix.ToInt(args["entityTypeId"])
+			id := bitrix.ToInt(args["id"])
 			fields, _ := args["fields"].(map[string]any)
 			return ops.PrepareUpdate(ctx, connID, typeID, id, fields)
 		}), nil
@@ -587,8 +584,8 @@ func NewServer(
 				return nil, err
 			}
 			args := req.GetArguments()
-			typeID := toInt(args["entityTypeId"])
-			id := toInt(args["id"])
+			typeID := bitrix.ToInt(args["entityTypeId"])
+			id := bitrix.ToInt(args["id"])
 			stageID := req.GetString("stageId", "")
 			return ops.PrepareMove(ctx, connID, typeID, id, stageID)
 		}), nil
@@ -643,20 +640,15 @@ func NewServer(
 	)
 	srv.AddTool(listPendingTool, func(ctx context.Context, req mcpproto.CallToolRequest) (*mcpproto.CallToolResult, error) {
 		return executeTool(func() (any, error) {
-			if ops == nil {
-				return nil, config.NewAppError("Operation service is unavailable", "SERVICE_UNAVAILABLE", 503)
+			resolved, err := ResolveConnectionID(authorizedConnectionID, req.GetString("connectionId", ""))
+			if err != nil {
+				return nil, err
 			}
-			reqConn := req.GetString("connectionId", "")
 			var filterConn *string
-			if authorizedConnectionID != "" {
-				if reqConn != "" && reqConn != authorizedConnectionID {
-					return nil, config.NewAppError("This MCP token is not authorized for that Bitrix24 connection", "CONNECTION_ACCESS_DENIED", 403)
-				}
-				filterConn = &authorizedConnectionID
-			} else if reqConn != "" {
-				filterConn = &reqConn
+			if resolved != "" {
+				filterConn = &resolved
 			}
-			return ops.List(ctx, filterConn)
+			return st.ListPendingOperations(ctx, filterConn)
 		}), nil
 	})
 
@@ -697,21 +689,5 @@ func executeTool(work func() (any, error)) *mcpproto.CallToolResult {
 		Content: []mcpproto.Content{
 			mcpproto.NewTextContent(string(encoded)),
 		},
-	}
-}
-
-func toInt(v any) int {
-	switch val := v.(type) {
-	case int:
-		return val
-	case int64:
-		return int(val)
-	case float64:
-		return int(val)
-	case string:
-		i, _ := strconv.Atoi(val)
-		return i
-	default:
-		return 0
 	}
 }

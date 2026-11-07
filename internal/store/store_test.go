@@ -274,11 +274,6 @@ func TestStore_McpOAuthLifecycleAndPruning(t *testing.T) {
 		t.Fatalf("CreateAuthorizationRequest failed: %v", err)
 	}
 
-	attempts, err := st.IncrementAuthorizationAttempts(ctx, "req-hash-1")
-	if err != nil || attempts != 1 {
-		t.Errorf("expected attempts=1, got %d err=%v", attempts, err)
-	}
-
 	consumedReq, err := st.ConsumeAuthorizationRequestAndCreateCode(
 		ctx,
 		"req-hash-1",
@@ -469,6 +464,13 @@ func TestStore_PendingOperationsAndAuditLogs(t *testing.T) {
 	completed, err := st.GetPendingOperation(ctx, op.ID)
 	if err != nil || completed.Status != "completed" {
 		t.Fatalf("expected completed op, got %+v err=%v", completed, err)
+	}
+	if completed.Params["entityTypeId"] != float64(2) {
+		t.Errorf("expected decoded Params[entityTypeId]=2, got %+v", completed.Params)
+	}
+	resMap, ok := completed.Result.(map[string]any)
+	if !ok || resMap["id"] != float64(42) {
+		t.Errorf("expected decoded Result={id:42}, got %+v", completed.Result)
 	}
 
 	// 4. Cancel pending operation

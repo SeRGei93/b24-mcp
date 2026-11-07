@@ -211,6 +211,9 @@ func (c *RestClient) Call(ctx context.Context, connectionID string, method strin
 		if code == "" && len(payload.Result) > 0 {
 			return &payload, nil
 		}
+		if code == "" {
+			code = "INVALID_RESPONSE"
+		}
 
 		if code != "" && slices.Contains(tokenCodes, code) && !refreshedForRequest {
 			refreshedForRequest = true
@@ -328,18 +331,119 @@ func (c *RestClient) CallBatch(
 	return combined, nil
 }
 
+// CollectPages fetches the first page (start=0) of a paginated Bitrix24 REST method
+// and, if additional pages exist within c.cfg.BitrixMaxPages and the optional limit,
+// fetches subsequent pages via CallBatch (when total is known) or sequential Call fallback.
+func (c *RestClient) CollectPages(
+	ctx context.Context,
+	connectionID string,
+	method string,
+	params map[string]any,
+	limit int,
+	extract func(raw json.RawMessage) []map[string]any,
+) ([]map[string]any, *int, error) {
+	firstParams := make(map[string]any, len(params)+1)
+	for k, v := range params {
+		firstParams[k] = v
+	}
+	firstParams["start"] = 0
+
+	firstResp, err := c.Call(ctx, connectionID, method, firstParams)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	values := extract(firstResp.Result)
+	if values == nil {
+		values = []map[string]any{}
+	}
+	total := firstResp.Total
+
+	if firstResp.Next != nil && c.cfg.BitrixMaxPages > 1 && (limit <= 0 || len(values) < limit) {
+		if total != nil && *total > len(values) {
+			targetCount := *total
+			if limit > 0 && limit < targetCount {
+				targetCount = limit
+			}
+			maxCount := c.cfg.BitrixMaxPages * BitrixBatchLimit
+			if targetCount > maxCount {
+				targetCount = maxCount
+			}
+			var commands []NamedBatchCommand
+			var keys []string
+			page := 1
+			for start := *firstResp.Next; start < targetCount && page < c.cfg.BitrixMaxPages; start += BitrixBatchLimit {
+				key := fmt.Sprintf("p_%d", start)
+				keys = append(keys, key)
+				pageParams := make(map[string]any, len(params)+1)
+				for k, v := range params {
+					pageParams[k] = v
+				}
+				pageParams["start"] = start
+				commands = append(commands, NamedBatchCommand{
+					Key:    key,
+					Method: method,
+					Params: pageParams,
+				})
+				page++
+			}
+			if len(commands) > 0 {
+				batchResult, bErr := c.CallBatch(ctx, connectionID, commands, false)
+				if bErr == nil {
+					for _, k := range keys {
+						if raw, ok := batchResult[k]; ok {
+							values = append(values, extract(raw)...)
+						}
+					}
+				}
+			}
+		} else {
+			start := *firstResp.Next
+			for page := 1; page < c.cfg.BitrixMaxPages && (limit <= 0 || len(values) < limit); page++ {
+				pageParams := make(map[string]any, len(params)+1)
+				for k, v := range params {
+					pageParams[k] = v
+				}
+				pageParams["start"] = start
+				resp, rErr := c.Call(ctx, connectionID, method, pageParams)
+				if rErr != nil {
+					break
+				}
+				values = append(values, extract(resp.Result)...)
+				if resp.Next == nil {
+					break
+				}
+				start = *resp.Next
+			}
+		}
+	}
+
+	return values, total, nil
+}
+
 func sleepBackoff(ctx context.Context, attempt int, retryAfter string) error {
-	var delay time.Duration
+	var (
+		delay          time.Duration
+		hasRetryAfter  bool
+		maxRetryWait   = 10 * time.Second
+	)
 	if retryAfter != "" {
 		if sec, err := strconv.Atoi(retryAfter); err == nil && sec >= 0 {
 			delay = time.Duration(sec) * time.Second
+			if delay > maxRetryWait {
+				delay = maxRetryWait
+			}
+			hasRetryAfter = true
 		}
 	}
-	if delay == 0 {
+	if !hasRetryAfter {
 		base := 250 * math.Pow(2, float64(attempt))
 		jitter := rand.Float64() * 200
 		totalMs := math.Min(base+jitter, 5000)
 		delay = time.Duration(totalMs) * time.Millisecond
+	}
+	if delay <= 0 {
+		return ctx.Err()
 	}
 	select {
 	case <-time.After(delay):

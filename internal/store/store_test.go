@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/SeRGei93/b24-mcp/internal/config"
 	"github.com/SeRGei93/b24-mcp/internal/store"
@@ -106,3 +107,88 @@ func TestStore_IdempotentMigrationsAndConnectivity(t *testing.T) {
 		t.Errorf("expected Ping to fail after Close")
 	}
 }
+
+func TestStore_ConnectionsAndOAuthStates(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.NewStore(":memory:", testKeyHex)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+	if err := st.Migrate(ctx, nil); err != nil {
+		t.Fatalf("migrate failed: %v", err)
+	}
+
+	created, err := st.UpsertConnection(ctx, store.UpsertConnectionInput{
+		Domain:            "example.bitrix24.com",
+		MemberID:          "member-1",
+		BitrixUserID:      "42",
+		ClientEndpoint:    "https://example.bitrix24.com/rest/",
+		AccessToken:       "plain-access-1",
+		RefreshToken:      "plain-refresh-1",
+		Scope:             "crm",
+		ExpiresAt:         time.Now().Add(time.Hour),
+		Mode:              config.ModeReadOnly,
+		AdminToolsEnabled: false,
+	})
+	if err != nil {
+		t.Fatalf("UpsertConnection failed: %v", err)
+	}
+	if created.ID == "" || created.AccessToken != "plain-access-1" || created.Status != "active" {
+		t.Fatalf("unexpected created connection: %+v", created)
+	}
+
+	// Update same member_id + bitrix_user_id on same domain
+	updated, err := st.UpsertConnection(ctx, store.UpsertConnectionInput{
+		Domain:            "example.bitrix24.com",
+		MemberID:          "member-1",
+		BitrixUserID:      "42",
+		ClientEndpoint:    "https://example.bitrix24.com/rest/",
+		AccessToken:       "plain-access-2",
+		RefreshToken:      "plain-refresh-2",
+		Scope:             "crm,user",
+		ExpiresAt:         time.Now().Add(2 * time.Hour),
+		Mode:              config.ModeWriteWithConfirmation,
+		AdminToolsEnabled: true,
+	})
+	if err != nil {
+		t.Fatalf("UpsertConnection update failed: %v", err)
+	}
+	if updated.ID != created.ID || updated.AccessToken != "plain-access-2" || updated.Mode != config.ModeWriteWithConfirmation || !updated.AdminToolsEnabled {
+		t.Errorf("unexpected updated connection: %+v", updated)
+	}
+
+	// Reject cross-domain overwrite for same (member_id, bitrix_user_id)
+	_, err = st.UpsertConnection(ctx, store.UpsertConnectionInput{
+		Domain:            "other.bitrix24.com",
+		MemberID:          "member-1",
+		BitrixUserID:      "42",
+		ClientEndpoint:    "https://other.bitrix24.com/rest/",
+		AccessToken:       "plain-access-3",
+		RefreshToken:      "plain-refresh-3",
+		Scope:             "crm",
+		ExpiresAt:         time.Now().Add(time.Hour),
+		Mode:              config.ModeReadOnly,
+		AdminToolsEnabled: false,
+	})
+	if err == nil || !strings.Contains(err.Error(), "different portal domain") {
+		t.Errorf("expected cross-domain conflict error, got %v", err)
+	}
+
+	// OAuth state create + single-use consume
+	if err := st.CreateOAuthState(ctx, "raw-state-1", "example.bitrix24.com", config.ModeReadOnly, time.Now().Add(time.Minute), ""); err != nil {
+		t.Fatalf("CreateOAuthState failed: %v", err)
+	}
+	state, err := st.ConsumeOAuthState(ctx, "raw-state-1")
+	if err != nil || state == nil {
+		t.Fatalf("expected state to be consumed, got state=%+v err=%v", state, err)
+	}
+	if state.Domain != "example.bitrix24.com" || state.Mode != config.ModeReadOnly || state.McpRequestHash != "" {
+		t.Errorf("unexpected state: %+v", state)
+	}
+	again, err := st.ConsumeOAuthState(ctx, "raw-state-1")
+	if err != nil || again != nil {
+		t.Errorf("expected second consume to return nil, got %+v err=%v", again, err)
+	}
+}
+

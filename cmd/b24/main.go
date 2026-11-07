@@ -10,9 +10,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/SeRGei93/b24-mcp/internal/bitrix"
 	"github.com/SeRGei93/b24-mcp/internal/config"
+	"github.com/SeRGei93/b24-mcp/internal/mcp"
 	"github.com/SeRGei93/b24-mcp/internal/server"
 	"github.com/SeRGei93/b24-mcp/internal/store"
+	mcpserver "github.com/mark3labs/mcp-go/server"
 )
 
 func main() {
@@ -43,7 +46,15 @@ func run() error {
 		return err
 	}
 
-	handler := server.NewHandler(cfg, st, logger)
+	if cfg.Transport == "stdio" {
+		mcpSrv := mcp.NewServer(st, "")
+		return mcpserver.ServeStdio(mcpSrv)
+	}
+
+	oauth := bitrix.NewOAuthService(cfg, st, nil)
+	tokens := bitrix.NewTokenManager(st, oauth, logger)
+	handler := server.NewHandler(cfg, st, oauth, tokens, logger)
+
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 	httpServer := &http.Server{
 		Addr:              addr,

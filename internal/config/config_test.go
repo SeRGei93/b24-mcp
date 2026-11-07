@@ -217,3 +217,16 @@ func TestLogger_RedactsSecrets(t *testing.T) {
 		t.Errorf("unexpected nested map in log output: %+v", parsed["nested"])
 	}
 }
+
+func TestIsValidBearerToken(t *testing.T) {
+	token := strings.Repeat("a", 32)
+	if !config.IsValidBearerToken("Bearer "+token, token) {
+		t.Errorf("expected exact bearer token to be valid")
+	}
+	for _, invalid := range []string{token, "Bearer " + strings.Repeat("b", 32), "Bearer " + token + "x", ""} {
+		if config.IsValidBearerToken(invalid, token) {
+			t.Errorf("expected %q to be rejected", invalid)
+		}
+	}
+}
+

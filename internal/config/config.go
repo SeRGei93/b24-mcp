@@ -2,6 +2,7 @@ package config
 
 import (
 	"bufio"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -24,6 +25,15 @@ const (
 	ModeReadOnly              ConnectionMode = "read_only"
 	ModeWriteWithConfirmation ConnectionMode = "write_with_confirmation"
 )
+
+func ParseConnectionMode(raw string) (ConnectionMode, error) {
+	switch ConnectionMode(raw) {
+	case ModeReadOnly, ModeWriteWithConfirmation:
+		return ConnectionMode(raw), nil
+	default:
+		return "", errors.New("invalid connection mode")
+	}
+}
 
 type TrustProxyConfig struct {
 	Enabled   bool
@@ -167,11 +177,8 @@ func Load(env map[string]string) (*Config, error) {
 	bitrixPortalDomain := strings.TrimSpace(env["BITRIX_PORTAL_DOMAIN"])
 
 	defaultModeStr := getDefault(env, "BITRIX_MCP_DEFAULT_MODE", string(ModeReadOnly))
-	var defaultMode ConnectionMode
-	switch ConnectionMode(defaultModeStr) {
-	case ModeReadOnly, ModeWriteWithConfirmation:
-		defaultMode = ConnectionMode(defaultModeStr)
-	default:
+	defaultMode, err := ParseConnectionMode(defaultModeStr)
+	if err != nil {
 		issues = append(issues, "BITRIX_MCP_DEFAULT_MODE: invalid mode")
 	}
 
@@ -437,3 +444,65 @@ func (l *Logger) write(level, message string, fields map[string]any) {
 	defer l.mu.Unlock()
 	_, _ = l.out.Write(append(encoded, '\n'))
 }
+
+func IsValidBearerToken(authorization, expectedToken string) bool {
+	if !strings.HasPrefix(authorization, "Bearer ") || expectedToken == "" {
+		return false
+	}
+	supplied := authorization[len("Bearer "):]
+	return IsValidSecret(supplied, expectedToken)
+}
+
+func IsValidSecret(supplied, expected string) bool {
+	if len(supplied) != len(expected) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(supplied), []byte(expected)) == 1
+}
+
+type AppError struct {
+	Message    string
+	Code       string
+	StatusCode int
+	OAuthCode  string
+	Cause      error
+}
+
+func (e *AppError) Error() string {
+	return e.Message
+}
+
+func (e *AppError) Unwrap() error {
+	return e.Cause
+}
+
+func NewAppError(message, code string, statusCode int) *AppError {
+	if statusCode == 0 {
+		statusCode = 400
+	}
+	return &AppError{Message: message, Code: code, StatusCode: statusCode}
+}
+
+func NewNotFoundError(message string) *AppError {
+	return &AppError{Message: message, Code: "NOT_FOUND", StatusCode: 404}
+}
+
+func NewPolicyError(message string) *AppError {
+	return &AppError{Message: message, Code: "POLICY_DENIED", StatusCode: 403}
+}
+
+func NewAuthenticationError(message string) *AppError {
+	if message == "" {
+		message = "Unauthorized"
+	}
+	return &AppError{Message: message, Code: "UNAUTHORIZED", StatusCode: 401}
+}
+
+func SafeErrorMessage(err error) string {
+	var appErr *AppError
+	if errors.As(err, &appErr) {
+		return appErr.Message
+	}
+	return "An unexpected internal error occurred"
+}
+

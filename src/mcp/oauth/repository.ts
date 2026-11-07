@@ -133,6 +133,7 @@ export class SqliteMcpOAuthStore implements McpOAuthStore {
   constructor(private readonly pool: DbPool) {}
 
   async registerClient(client: McpOAuthClient): Promise<void> {
+    await this.cleanupExpired();
     await this.pool.query(`
       INSERT INTO mcp_oauth_clients (
         client_id, redirect_uris, token_endpoint_auth_method, grant_types, response_types,
@@ -364,12 +365,20 @@ export class SqliteMcpOAuthStore implements McpOAuthStore {
   private async cleanupExpired(): Promise<void> {
     const now = new Date().toISOString();
     const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1_000).toISOString();
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1_000).toISOString();
     await this.pool.query("DELETE FROM mcp_oauth_authorization_requests WHERE expires_at <= ?1", [now]);
     await this.pool.query("DELETE FROM mcp_oauth_authorization_codes WHERE expires_at <= ?1", [now]);
     await this.pool.query(`
       DELETE FROM mcp_oauth_tokens
       WHERE refresh_expires_at <= ?1 OR (revoked_at IS NOT NULL AND revoked_at < ?2)
     `, [now, sevenDaysAgo]);
+    await this.pool.query(`
+      DELETE FROM mcp_oauth_clients
+      WHERE created_at < ?1
+        AND NOT EXISTS (SELECT 1 FROM mcp_oauth_tokens WHERE mcp_oauth_tokens.client_id = mcp_oauth_clients.client_id)
+        AND NOT EXISTS (SELECT 1 FROM mcp_oauth_authorization_codes WHERE mcp_oauth_authorization_codes.client_id = mcp_oauth_clients.client_id)
+        AND NOT EXISTS (SELECT 1 FROM mcp_oauth_authorization_requests WHERE mcp_oauth_authorization_requests.client_id = mcp_oauth_clients.client_id)
+    `, [thirtyDaysAgo]);
   }
 }
 

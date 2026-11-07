@@ -126,7 +126,46 @@ describe("MCP OAuth 2.1", () => {
         scope: "mcp:tools",
         resource: "https://mcp.example.com/mcp",
       }).toString();
-      const authorization = await app.inject({ method: "GET", url: `${authorizeUrl.pathname}${authorizeUrl.search}` });
+      const consentPage = await app.inject({ method: "GET", url: `${authorizeUrl.pathname}${authorizeUrl.search}` });
+      expect(consentPage.statusCode).toBe(200);
+      expect(consentPage.headers["x-frame-options"]).toBe("DENY");
+      expect(consentPage.body).toContain("Codex test client");
+      expect(createMcpAuthorizationUrl).not.toHaveBeenCalled();
+
+      const requestTokenMatch = /name="request_token" value="([^"]+)"/.exec(consentPage.body);
+      const csrfTokenMatch = /name="csrf_token" value="([^"]+)"/.exec(consentPage.body);
+      const setCookieHeader = String(consentPage.headers["set-cookie"] ?? "");
+      const cookiePair = setCookieHeader.split(";")[0]!;
+      expect(requestTokenMatch?.[1]).toBeTruthy();
+      expect(csrfTokenMatch?.[1]).toBeTruthy();
+      expect(cookiePair).toContain("mcp_oauth_csrf=");
+
+      const csrfRejected = await app.inject({
+        method: "POST",
+        url: "/authorize",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        payload: new URLSearchParams({
+          request_token: requestTokenMatch![1]!,
+          csrf_token: "wrong-csrf",
+          decision: "approve",
+        }).toString(),
+      });
+      expect(csrfRejected.statusCode).toBe(403);
+      expect(createMcpAuthorizationUrl).not.toHaveBeenCalled();
+
+      const authorization = await app.inject({
+        method: "POST",
+        url: "/authorize",
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          cookie: cookiePair,
+        },
+        payload: new URLSearchParams({
+          request_token: requestTokenMatch![1]!,
+          csrf_token: csrfTokenMatch![1]!,
+          decision: "approve",
+        }).toString(),
+      });
       expect(authorization.statusCode).toBe(302);
       expect(authorization.headers.location).toContain("example.bitrix24.com/oauth/authorize/");
       expect(createMcpAuthorizationUrl).toHaveBeenCalledOnce();

@@ -54,7 +54,12 @@ export interface AuthorizationInput {
 }
 
 export interface PendingAuthorizationInfo {
+  requestToken: string;
   requestHash: string;
+  clientId: string;
+  clientName?: string;
+  redirectUri: string;
+  scope: string;
 }
 
 export interface AuthorizationCodeExchangeInput {
@@ -223,9 +228,9 @@ export class McpOAuthService {
       fail("invalid_scope", `Only ${MCP_OAUTH_SCOPE} is supported`);
     }
 
-    const requestId = randomToken(32);
+    const requestToken = randomToken(32);
     const request: McpOAuthAuthorizationRequest = {
-      requestHash: hashMcpOAuthSecret(requestId),
+      requestHash: hashMcpOAuthSecret(requestToken),
       clientId: client.clientId,
       redirectUri,
       state: input.state,
@@ -236,7 +241,23 @@ export class McpOAuthService {
       attempts: 0,
     };
     await this.store.createAuthorizationRequest(request);
-    return { requestHash: request.requestHash };
+    return {
+      requestToken,
+      requestHash: request.requestHash,
+      clientId: client.clientId,
+      clientName: client.clientName,
+      redirectUri,
+      scope: MCP_OAUTH_SCOPE,
+    };
+  }
+
+  async getPendingAuthorization(requestToken: string): Promise<McpOAuthAuthorizationRequest> {
+    const requestHash = hashMcpOAuthSecret(requestToken);
+    const request = await this.store.getAuthorizationRequest(requestHash);
+    if (!request) {
+      throw new McpOAuthProtocolError("invalid_request", "Authorization request expired or invalid", 400);
+    }
+    return request;
   }
 
   async completeBitrixAuthorization(requestHash: string, connectionId: string): Promise<string> {

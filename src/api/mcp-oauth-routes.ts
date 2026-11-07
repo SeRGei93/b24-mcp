@@ -1,7 +1,9 @@
+import { randomBytes } from "node:crypto";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod/v4";
 import type { AppContainer } from "../container.js";
-import { McpOAuthProtocolError } from "../mcp/oauth/service.js";
+import { McpOAuthProtocolError, type PendingAuthorizationInfo } from "../mcp/oauth/service.js";
+import { isValidBearerToken, isValidSecret } from "../security/auth.js";
 
 const registrationSchema = z.object({
   redirect_uris: z.array(z.url()).min(1).max(10),
@@ -25,6 +27,12 @@ const authorizationSchema = z.object({
   state: z.string().optional(),
   scope: z.string().optional(),
   resource: z.string().optional(),
+});
+
+const authorizationDecisionSchema = z.object({
+  request_token: z.string().min(1),
+  csrf_token: z.string().min(1),
+  decision: z.enum(["approve", "deny"]),
 });
 
 const authorizationCodeTokenSchema = z.object({
@@ -105,18 +113,37 @@ export function registerMcpOAuthRoutes(app: FastifyInstance, container: AppConta
         scope: input.scope,
         resource: input.resource,
       });
-      try {
-        const location = await container.oauth.createMcpAuthorizationUrl(pending.requestHash);
-        return reply.redirect(location);
-      } catch (error) {
-        request.log.error({ err: error }, "Could not start Bitrix24 authorization");
+      if (isValidBearerToken(request.headers.authorization, container.config.mcpAuthToken)) {
+        return await redirectToBitrixAuthorization(container, request, reply, pending.requestHash);
+      }
+      return sendAuthorizationConsentPage(container, reply, pending);
+    } catch (error) {
+      const normalized = normalizeOAuthError(error, "invalid_request");
+      if (normalized.safeRedirectUri) return reply.redirect(oauthErrorRedirect(normalized));
+      return sendOAuthError(reply, normalized);
+    }
+  });
+
+  app.post("/authorize", async (request, reply) => {
+    setOAuthHeaders(reply);
+    try {
+      enforceRateLimit(limiter, request, "authorize", 100, 15 * 60_000);
+      const input = authorizationDecisionSchema.parse(request.body);
+      const csrfCookie = readCookie(request.headers.cookie, CONSENT_CSRF_COOKIE);
+      clearConsentCookie(container, reply);
+      if (!csrfCookie || !isValidSecret(input.csrf_token, csrfCookie)) {
+        throw new McpOAuthProtocolError("invalid_request", "Invalid or missing OAuth consent CSRF token", 403);
+      }
+      const pending = await container.mcpOAuth.getPendingAuthorization(input.request_token);
+      if (input.decision !== "approve") {
         const location = await container.mcpOAuth.failBitrixAuthorization(
           pending.requestHash,
-          "temporarily_unavailable",
-          "Bitrix24 authorization is not available for this MCP server",
+          "access_denied",
+          "The user denied the authorization request",
         );
         return reply.redirect(location);
       }
+      return await redirectToBitrixAuthorization(container, request, reply, pending.requestHash);
     } catch (error) {
       const normalized = normalizeOAuthError(error, "invalid_request");
       if (normalized.safeRedirectUri) return reply.redirect(oauthErrorRedirect(normalized));
@@ -243,6 +270,92 @@ class WindowRateLimiter {
   }
 }
 
+const CONSENT_CSRF_COOKIE = "mcp_oauth_csrf";
+
+async function redirectToBitrixAuthorization(
+  container: AppContainer,
+  request: FastifyRequest,
+  reply: FastifyReply,
+  requestHash: string,
+) {
+  try {
+    const location = await container.oauth.createMcpAuthorizationUrl(requestHash);
+    return reply.redirect(location);
+  } catch (error) {
+    request.log.error({ err: error }, "Could not start Bitrix24 authorization");
+    const location = await container.mcpOAuth.failBitrixAuthorization(
+      requestHash,
+      "temporarily_unavailable",
+      "Bitrix24 authorization is not available for this MCP server",
+    );
+    return reply.redirect(location);
+  }
+}
+
+function sendAuthorizationConsentPage(
+  container: AppContainer,
+  reply: FastifyReply,
+  pending: PendingAuthorizationInfo,
+) {
+  const csrfToken = randomBytes(32).toString("base64url");
+  const secureAttr = container.config.appUrl.startsWith("https://") ? "; Secure" : "";
+  reply.header(
+    "set-cookie",
+    `${CONSENT_CSRF_COOKIE}=${csrfToken}; HttpOnly; SameSite=Lax; Path=/authorize; Max-Age=${container.config.mcpOAuthRequestTtlSeconds}${secureAttr}`,
+  );
+  reply.header("x-frame-options", "DENY");
+  reply.header(
+    "content-security-policy",
+    "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'",
+  );
+  reply.type("text/html; charset=utf-8");
+
+  const clientLabel = escapeHtml(pending.clientName ?? pending.clientId);
+  const clientId = escapeHtml(pending.clientId);
+  const redirectOrigin = escapeHtml(new URL(pending.redirectUri).origin);
+  const redirectUri = escapeHtml(pending.redirectUri);
+  const scope = escapeHtml(pending.scope);
+  const requestToken = escapeHtml(pending.requestToken);
+  const escapedCsrf = escapeHtml(csrfToken);
+
+  return reply.code(200).send(
+    `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Authorize MCP Client</title>`
+    + `<style>body{font-family:system-ui,-apple-system,sans-serif;max-width:480px;margin:48px auto;padding:0 16px;color:#111}card{display:block;border:1px solid #ddd;border-radius:8px;padding:24px}code{background:#f4f4f5;padding:2px 6px;border-radius:4px;word-break:break-all}.actions{display:flex;gap:12px;margin-top:20px}button{padding:10px 18px;border-radius:6px;border:1px solid #ccc;cursor:pointer;font-weight:600}button[value="approve"]{background:#111;color:#fff;border-color:#111}</style></head>`
+    + `<body><card><h1>Authorize Bitrix24 MCP Access</h1>`
+    + `<p>Client <strong>${clientLabel}</strong> (<code>${clientId}</code>) is requesting access to your Bitrix24 MCP server.</p>`
+    + `<p>Redirect origin: <code>${redirectOrigin}</code><br>Callback URI: <code>${redirectUri}</code><br>Scope: <code>${scope}</code></p>`
+    + `<form method="post" action="/authorize">`
+    + `<input type="hidden" name="request_token" value="${requestToken}">`
+    + `<input type="hidden" name="csrf_token" value="${escapedCsrf}">`
+    + `<div class="actions"><button type="submit" name="decision" value="approve">Approve</button>`
+    + `<button type="submit" name="decision" value="deny">Deny</button></div>`
+    + `</form></card></body></html>`,
+  );
+}
+
+function clearConsentCookie(container: AppContainer, reply: FastifyReply): void {
+  const secureAttr = container.config.appUrl.startsWith("https://") ? "; Secure" : "";
+  reply.header("set-cookie", `${CONSENT_CSRF_COOKIE}=; HttpOnly; SameSite=Lax; Path=/authorize; Max-Age=0${secureAttr}`);
+}
+
+function readCookie(cookieHeader: string | undefined, name: string): string | undefined {
+  if (!cookieHeader) return undefined;
+  for (const part of cookieHeader.split(";")) {
+    const [rawKey, ...rest] = part.trim().split("=");
+    if (rawKey === name) return rest.join("=");
+  }
+  return undefined;
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll("\"", "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
 function enforceRateLimit(
   limiter: WindowRateLimiter,
   request: FastifyRequest,
@@ -250,11 +363,11 @@ function enforceRateLimit(
   limit: number,
   windowMs: number,
 ): void {
-  const globalLimit = Math.max(limit * 25, 100);
-  if (!limiter.consume(`${bucket}:global`, globalLimit, windowMs)) {
+  if (!limiter.consume(`${bucket}:source:${request.ip}`, limit, windowMs)) {
     throw new McpOAuthProtocolError("temporarily_unavailable", "Too many OAuth requests", 429);
   }
-  if (!limiter.consume(`${bucket}:source:${request.ip}`, limit, windowMs)) {
+  const globalLimit = Math.max(limit * 25, 100);
+  if (!limiter.consume(`${bucket}:global`, globalLimit, windowMs)) {
     throw new McpOAuthProtocolError("temporarily_unavailable", "Too many OAuth requests", 429);
   }
 }

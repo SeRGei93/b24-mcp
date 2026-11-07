@@ -6,6 +6,48 @@ import { TokenManager } from "./token-manager.js";
 
 const RETRYABLE_CODES = new Set(["QUERY_LIMIT_EXCEEDED", "OPERATION_TIME_LIMIT", "TOO_MANY_REQUESTS"]);
 const TOKEN_CODES = new Set(["expired_token", "INVALID_TOKEN", "invalid_token"]);
+const BITRIX_BATCH_LIMIT = 50;
+
+export interface BitrixBatchCommand {
+  method: string;
+  params?: Record<string, unknown>;
+}
+
+export interface BitrixBatchPayload<T = unknown> {
+  result?: Record<string, T> | T[];
+  result_error?: Record<string, { error?: string; error_description?: string }> | unknown[];
+  result_total?: Record<string, number> | number[];
+  result_next?: Record<string, number> | number[];
+}
+
+function appendBatchParams(search: URLSearchParams, prefix: string, value: unknown): void {
+  if (value === undefined || value === null) return;
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => {
+      appendBatchParams(search, `${prefix}[${index}]`, item);
+    });
+    return;
+  }
+  if (typeof value === "object") {
+    for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+      appendBatchParams(search, `${prefix}[${key}]`, nested);
+    }
+    return;
+  }
+  search.append(prefix, String(value));
+}
+
+export function buildBatchCommand(method: string, params: Record<string, unknown> = {}): string {
+  if (!/^[a-z][a-z0-9_.]+$/i.test(method)) {
+    throw new BitrixApiError("Invalid Bitrix REST method name", "INVALID_METHOD", 400);
+  }
+  const search = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    appendBatchParams(search, key, value);
+  }
+  const query = search.toString();
+  return query ? `${method}?${query}` : method;
+}
 
 export class BitrixRestClient {
   constructor(
@@ -13,6 +55,54 @@ export class BitrixRestClient {
     private readonly tokens: TokenManager,
     private readonly logger: AppLogger,
   ) {}
+
+  async callBatch<T = unknown>(
+    connectionId: string,
+    commands: Record<string, BitrixBatchCommand>,
+    halt = false,
+  ): Promise<Record<string, T>> {
+    const entries = Object.entries(commands);
+    if (entries.length === 0) return {};
+
+    const combined: Record<string, T> = {};
+    for (let offset = 0; offset < entries.length; offset += BITRIX_BATCH_LIMIT) {
+      const chunk = entries.slice(offset, offset + BITRIX_BATCH_LIMIT);
+      const cmd: Record<string, string> = {};
+      for (const [key, command] of chunk) {
+        cmd[key] = buildBatchCommand(command.method, command.params);
+      }
+
+      const response = await this.call<BitrixBatchPayload<T>>(connectionId, "batch", {
+        halt: halt ? 1 : 0,
+        cmd,
+      });
+
+      const rawErrors = response.result?.result_error;
+      if (rawErrors && typeof rawErrors === "object" && !Array.isArray(rawErrors)) {
+        const firstErrorEntry = Object.entries(rawErrors)[0];
+        if (firstErrorEntry) {
+          const [failedKey, errObj] = firstErrorEntry;
+          const errCode = errObj?.error ?? "BATCH_COMMAND_ERROR";
+          throw new BitrixApiError(
+            `Bitrix24 batch command '${failedKey}' failed (${errCode})`,
+            errCode,
+            502,
+          );
+        }
+      }
+
+      const rawResults = response.result?.result;
+      if (rawResults && typeof rawResults === "object") {
+        for (const [key] of chunk) {
+          const value = (rawResults as Record<string, T>)[key];
+          if (value !== undefined) {
+            combined[key] = value;
+          }
+        }
+      }
+    }
+    return combined;
+  }
 
   async call<T = unknown>(connectionId: string, method: string, params: Record<string, unknown> = {}): Promise<BitrixResponse<T>> {
     if (!/^[a-z][a-z0-9_.]+$/i.test(method)) throw new BitrixApiError("Invalid Bitrix REST method name", "INVALID_METHOD", 400);

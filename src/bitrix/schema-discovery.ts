@@ -1,7 +1,9 @@
 import type { AppConfig } from "../config/env.js";
 import type { SchemaCacheRepository } from "../db/repositories.js";
 import { AppError } from "../errors.js";
-import { BitrixRestClient } from "./rest-client.js";
+import { BitrixRestClient, type BitrixBatchCommand } from "./rest-client.js";
+
+const BITRIX_PAGE_SIZE = 50;
 
 export interface EntityType {
   entityTypeId: number;
@@ -69,12 +71,60 @@ export class SchemaDiscoveryService {
       this.categories(connectionId, entityTypeId, refresh).catch(() => []),
     ]);
     const selectedCategories = categoryId === undefined ? categories : categories.filter((category) => Number(category.id) === categoryId);
-    const stages = await Promise.all(
-      (selectedCategories.length ? selectedCategories : [{ id: categoryId ?? 0 }]).map(async (category) => ({
-        categoryId: Number(category.id ?? 0),
-        stages: await this.stages(connectionId, entityTypeId, Number(category.id ?? 0), refresh).catch(() => []),
-      })),
-    );
+    const categoryIds = (selectedCategories.length ? selectedCategories : [{ id: categoryId ?? 0 }])
+      .map((category) => Number(category.id ?? 0));
+
+    const stagesByCategory = new Map<number, Record<string, unknown>[]>();
+    const uncachedCategoryIds: number[] = [];
+
+    for (const catId of categoryIds) {
+      if (!refresh) {
+        const cachedStages = await this.cache.get<Record<string, unknown>[]>(
+          connectionId,
+          `stages:${entityTypeId}:${catId}`,
+          this.config.schemaCacheTtlSeconds,
+        );
+        if (cachedStages !== null) {
+          stagesByCategory.set(catId, cachedStages);
+          continue;
+        }
+      }
+      uncachedCategoryIds.push(catId);
+    }
+
+    if (uncachedCategoryIds.length === 1) {
+      const catId = uncachedCategoryIds[0]!;
+      const loaded = await this.stages(connectionId, entityTypeId, catId, refresh).catch(() => []);
+      stagesByCategory.set(catId, loaded);
+    } else if (uncachedCategoryIds.length > 1) {
+      const commands: Record<string, BitrixBatchCommand> = {};
+      for (const catId of uncachedCategoryIds) {
+        commands[`cat_${catId}`] = {
+          method: "crm.status.list",
+          params: {
+            filter: { ENTITY_ID: stageEntityId(entityTypeId, catId) },
+            order: { SORT: "ASC" },
+          },
+        };
+      }
+      try {
+        const batchResult = await this.bitrix.callBatch<Record<string, unknown>[]>(connectionId, commands);
+        for (const catId of uncachedCategoryIds) {
+          const list = Array.isArray(batchResult[`cat_${catId}`]) ? batchResult[`cat_${catId}`]! : [];
+          await this.cache.set(connectionId, `stages:${entityTypeId}:${catId}`, list);
+          stagesByCategory.set(catId, list);
+        }
+      } catch {
+        for (const catId of uncachedCategoryIds) {
+          stagesByCategory.set(catId, []);
+        }
+      }
+    }
+
+    const stages = categoryIds.map((catId) => ({
+      categoryId: catId,
+      stages: stagesByCategory.get(catId) ?? [],
+    }));
     return { entity, fields, categories, stages };
   }
 
@@ -107,17 +157,46 @@ export class SchemaDiscoveryService {
     params: Record<string, unknown>,
     nestedKey?: string,
   ): Promise<T[]> {
-    const values: T[] = [];
-    let start = 0;
-    for (let page = 0; page < this.config.bitrixMaxPages; page += 1) {
-      const response = await this.bitrix.call<unknown>(connectionId, method, { ...params, start });
-      const result = response.result as Record<string, unknown> | unknown[];
-      const pageValues = nestedKey && !Array.isArray(result)
-        ? (result[nestedKey] as T[] | undefined) ?? []
-        : Array.isArray(result) ? result as T[] : [];
-      values.push(...pageValues);
-      if (response.next === undefined) break;
-      start = response.next;
+    const extract = (result: unknown): T[] => {
+      if (nestedKey && result && typeof result === "object" && !Array.isArray(result)) {
+        return ((result as Record<string, unknown>)[nestedKey] as T[] | undefined) ?? [];
+      }
+      return Array.isArray(result) ? (result as T[]) : [];
+    };
+
+    const firstResponse = await this.bitrix.call<unknown>(connectionId, method, { ...params, start: 0 });
+    const values: T[] = [...extract(firstResponse.result)];
+    const total = firstResponse.total;
+
+    if (firstResponse.next !== undefined && this.config.bitrixMaxPages > 1) {
+      if (total !== undefined && total > values.length) {
+        const targetCount = Math.min(total, this.config.bitrixMaxPages * BITRIX_PAGE_SIZE);
+        const commands: Record<string, BitrixBatchCommand> = {};
+        const keys: string[] = [];
+        for (
+          let start = firstResponse.next, page = 1;
+          start < targetCount && page < this.config.bitrixMaxPages;
+          start += BITRIX_PAGE_SIZE, page += 1
+        ) {
+          const key = `p_${start}`;
+          keys.push(key);
+          commands[key] = { method, params: { ...params, start } };
+        }
+        if (keys.length > 0) {
+          const batchResult = await this.bitrix.callBatch<unknown>(connectionId, commands);
+          for (const key of keys) {
+            values.push(...extract(batchResult[key]));
+          }
+        }
+      } else {
+        let start = firstResponse.next;
+        for (let page = 1; page < this.config.bitrixMaxPages; page += 1) {
+          const response = await this.bitrix.call<unknown>(connectionId, method, { ...params, start });
+          values.push(...extract(response.result));
+          if (response.next === undefined) break;
+          start = response.next;
+        }
+      }
     }
     return values;
   }

@@ -1,0 +1,71 @@
+# Прод-стек для Dokploy. Traefik (панель Dokploy) проксирует публичный HTTPS-домен
+# из раздела Domains на сервис app:3000 (сеть dokploy-network).
+#
+# SQLite хранится в именованном volume sqlite_data (/app/data/bitrix24-mcp.sqlite).
+#
+# Dokploy деплоит через `compose up`, поэтому указан `pull_policy: always`,
+# чтобы всегда подтягивался свежий образ :latest из GHCR.
+name: b24-mcp
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+x-app-hardening: &app-hardening
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
+x-healthcheck: &healthcheck
+  test:
+    [
+      "CMD",
+      "node",
+      "-e",
+      "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+    ]
+  interval: 30s
+  timeout: 5s
+  retries: 3
+  start_period: 15s
+
+services:
+  app:
+    image: ghcr.io/sergei93/b24-mcp:${IMAGE_TAG:-latest}
+    pull_policy: always
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: "3000"
+      APP_URL: ${APP_URL:?set APP_URL to the public HTTPS domain}
+      DATABASE_PATH: ${DATABASE_PATH:-/app/data/bitrix24-mcp.sqlite}
+      BITRIX_CLIENT_ID: ${BITRIX_CLIENT_ID:?set BITRIX_CLIENT_ID}
+      BITRIX_CLIENT_SECRET: ${BITRIX_CLIENT_SECRET:?set BITRIX_CLIENT_SECRET}
+      BITRIX_PORTAL_DOMAIN: ${BITRIX_PORTAL_DOMAIN:-}
+      BITRIX_MCP_DEFAULT_MODE: ${BITRIX_MCP_DEFAULT_MODE:-read_only}
+      BITRIX_MCP_ADMIN_TOOLS: ${BITRIX_MCP_ADMIN_TOOLS:-false}
+      MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:?set MCP_AUTH_TOKEN}
+      TOKEN_ENCRYPTION_KEY: ${TOKEN_ENCRYPTION_KEY:?set TOKEN_ENCRYPTION_KEY}
+      MCP_OAUTH_REQUEST_TTL_SECONDS: ${MCP_OAUTH_REQUEST_TTL_SECONDS:-600}
+      MCP_OAUTH_CODE_TTL_SECONDS: ${MCP_OAUTH_CODE_TTL_SECONDS:-300}
+      MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS: ${MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS:-3600}
+      MCP_OAUTH_REFRESH_TOKEN_TTL_SECONDS: ${MCP_OAUTH_REFRESH_TOKEN_TTL_SECONDS:-2592000}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    volumes:
+      - sqlite_data:/app/data
+    networks: [default, dokploy-network] # dokploy-network → Traefik (порт 3000)
+    restart: unless-stopped
+    healthcheck: *healthcheck
+    <<: *app-hardening
+    logging: *logging
+
+volumes:
+  sqlite_data:
+
+networks:
+  default:
+  dokploy-network:
+    external: true

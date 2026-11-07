@@ -19,7 +19,9 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "check": "npm run typecheck && npm test && npm run build"
+    "check": "npm run typecheck && npm test && npm run build",
+    "setup:hooks": "sh scripts/install-hooks.sh",
+    "prepare": "sh scripts/install-hooks.sh"
   },
   "engines": {
     "node": ">=22.5"

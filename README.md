@@ -7,7 +7,7 @@ This is an independent open-source project and is not an official Bitrix24 produ
 ## What is included
 
 - Bring-your-own Bitrix24 OAuth application with an automatic MCP-to-Bitrix24 authorization-code flow and refresh tokens.
-- AES-256-GCM token encryption in PostgreSQL and concurrency-safe automatic refresh.
+- AES-256-GCM token encryption in SQLite and concurrency-safe automatic refresh.
 - Read-only tools for connections, entity types, fields, funnels, stages, users, and CRM items.
 - Dynamic discovery for SPAs through `crm.type.list` and universal `crm.item.*` methods.
 - Schema metadata cache with explicit invalidation.
@@ -20,7 +20,7 @@ Raw REST calls, deletion, schema administration, robots, Bizproc, and event bind
 
 ## Quick start
 
-Requirements: Node.js 20.11+, PostgreSQL 14+ (16 recommended), and a local/public Bitrix24 OAuth application with CRM scope.
+Requirements: Node.js 22.5+ (uses built-in `node:sqlite`) and a local/public Bitrix24 OAuth application with CRM scope.
 
 Version 0.3.1 accepts hosted `*.bitrix24.*` cloud portal domains and the exact custom portal configured through `BITRIX_PORTAL_DOMAIN`. Other custom and on-premise domains remain rejected.
 
@@ -166,8 +166,7 @@ To allow preparation for a portal, initiate OAuth with `?mode=write_with_confirm
 | Variable | Required | Default | Purpose |
 | --- | --- | --- | --- |
 | `APP_URL` | yes | — | Public server URL; HTTPS except localhost |
-| `DATABASE_URL` | yes | — | PostgreSQL connection string |
-| `DATABASE_SSL` | no | `false` | Require a verified TLS PostgreSQL connection |
+| `DATABASE_PATH` | no | `./data/bitrix24-mcp.sqlite` | SQLite database file path (or `:memory:`) |
 | `BITRIX_CLIENT_ID` | yes | — | Deployment-owned Bitrix24 OAuth app ID |
 | `BITRIX_CLIENT_SECRET` | yes | — | Deployment-owned Bitrix24 OAuth app secret |
 | `BITRIX_PORTAL_DOMAIN` | conditional | stored portal | Portal used for the automatic OAuth redirect and exact allowlist entry for a custom domain |
@@ -185,13 +184,7 @@ See `.env.example` for all runtime and retry settings.
 
 ## Docker and Coolify
 
-For local Compose, set `DATABASE_URL` to use hostname `postgres` and make it agree with the PostgreSQL variables:
-
-```text
-DATABASE_URL=postgresql://bitrix_mcp:<POSTGRES_PASSWORD>@postgres:5432/bitrix_mcp
-```
-
-Then run `docker compose up --build`; Compose automatically loads `docker-compose.override.yml` to publish port 3000 for local use. In Coolify, deploy only `docker-compose.yml`, attach a public HTTPS domain to the `app` service on port 3000, and set every variable marked required by Compose. The production stack exposes the app only to Coolify's proxy network. Persistent storage is the `postgres_data` volume, and PostgreSQL is never published on the host.
+Run `docker compose up --build`; Compose automatically loads `docker-compose.override.yml` to publish port 3000 for local use. In Coolify, deploy only `docker-compose.yml`, attach a public HTTPS domain to the `app` service on port 3000, and set every variable marked required by Compose. The production stack exposes the app only to Coolify's proxy network. Persistent storage is the `sqlite_data` volume mounted at `/app/data`.
 
 ## Architecture
 
@@ -204,7 +197,7 @@ MCP client
   -> MCP tools
   -> policy guard / confirmation workflow
   -> CRM and schema services
-  -> token manager and encrypted PostgreSQL store
+  -> token manager and encrypted SQLite store
   -> Bitrix24 OAuth / REST API
 ```
 

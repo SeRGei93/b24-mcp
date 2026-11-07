@@ -15,6 +15,7 @@ RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
 FROM node:22-alpine AS runtime
 ENV NODE_ENV=production
 WORKDIR /app
+RUN mkdir -p /app/data && chown -R node:node /app/data
 COPY --from=production-dependencies /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY package.json LICENSE README.md ./

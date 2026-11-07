@@ -1,6 +1,6 @@
 # Contributing
 
-1. Use Node.js 20.11 or newer and PostgreSQL 16 for local development.
+1. Use Node.js 22.5 or newer (uses built-in SQLite via `node:sqlite`) for local development.
 2. Copy `.env.example` to `.env`, generate fresh local secrets, and never commit that file.
 3. Install dependencies with `npm ci`.
 4. Run `npm run check` before opening a pull request.

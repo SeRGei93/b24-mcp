@@ -7,8 +7,7 @@ services:
       HOST: 0.0.0.0
       PORT: 3000
       APP_URL: ${APP_URL:?Set APP_URL to the public HTTPS URL}
-      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL; use postgres as the hostname for the bundled database}
-      DATABASE_SSL: ${DATABASE_SSL:-false}
+      DATABASE_PATH: ${DATABASE_PATH:-/app/data/bitrix24-mcp.sqlite}
       BITRIX_CLIENT_ID: ${BITRIX_CLIENT_ID:?Set BITRIX_CLIENT_ID}
       BITRIX_CLIENT_SECRET: ${BITRIX_CLIENT_SECRET:?Set BITRIX_CLIENT_SECRET}
       BITRIX_PORTAL_DOMAIN: ${BITRIX_PORTAL_DOMAIN:-}
@@ -21,26 +20,10 @@ services:
       MCP_OAUTH_REFRESH_TOKEN_TTL_SECONDS: ${MCP_OAUTH_REFRESH_TOKEN_TTL_SECONDS:-2592000}
       TOKEN_ENCRYPTION_KEY: ${TOKEN_ENCRYPTION_KEY:?Set a stable 32-byte base64 TOKEN_ENCRYPTION_KEY}
       LOG_LEVEL: ${LOG_LEVEL:-info}
+    volumes:
+      - sqlite_data:/app/data
     expose:
       - "3000"
-    depends_on:
-      postgres:
-        condition: service_healthy
-
-  postgres:
-    image: postgres:16-alpine
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: ${POSTGRES_DB:-bitrix_mcp}
-      POSTGRES_USER: ${POSTGRES_USER:-bitrix_mcp}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
 
 volumes:
-  postgres_data:
+  sqlite_data:

@@ -7,7 +7,7 @@ Please do not open a public issue for a suspected vulnerability. Use GitHub's pr
 ## Security model
 
 - Every deployment supplies its own Bitrix24 OAuth application credentials.
-- OAuth access and refresh tokens are encrypted at rest with AES-256-GCM. The encryption key is never stored in PostgreSQL.
+- OAuth access and refresh tokens are encrypted at rest with AES-256-GCM. The encryption key is never stored in SQLite.
 - OAuth `state` values are random, stored only as SHA-256 hashes, expire after ten minutes by default, and are consumed once.
 - API-only installation callbacks are validated against Bitrix24's `app.info` method before any supplied token is stored.
 - Outbound portal requests are restricted to hosted HTTPS Bitrix24 domains or the exact custom domain configured in `BITRIX_PORTAL_DOMAIN` to reduce SSRF exposure.
@@ -22,6 +22,6 @@ Please do not open a public issue for a suspected vulnerability. Use GitHub's pr
 
 ## Operator responsibilities
 
-Use HTTPS, restrict network access to PostgreSQL, rotate `MCP_AUTH_TOKEN` when exposure is suspected, back up `TOKEN_ENCRYPTION_KEY` separately, and test with a non-production Bitrix24 portal first. Losing the encryption key makes stored Bitrix24 OAuth tokens unrecoverable. Changing it requires reconnecting every portal.
+Use HTTPS, restrict filesystem access to the SQLite database file, rotate `MCP_AUTH_TOKEN` when exposure is suspected, back up `TOKEN_ENCRYPTION_KEY` separately, and test with a non-production Bitrix24 portal first. Losing the encryption key makes stored Bitrix24 OAuth tokens unrecoverable. Changing it requires reconnecting every portal.
 
 Grant the Bitrix24 OAuth app and OAuth user only the scopes and CRM permissions actually required. Application policy cannot grant access that Bitrix24 denies, and it cannot compensate for an over-privileged OAuth user.

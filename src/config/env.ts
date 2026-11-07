@@ -22,13 +22,39 @@ const appBaseUrl = publicUrl.refine((value) => {
   return (url.pathname === "/" || url.pathname === "") && !url.search && !url.hash;
 }, { message: "APP_URL must be an origin without a path, query, or fragment" });
 
+export function normalizeSqlitePath(raw: string): string {
+  const trimmed = raw.trim();
+  if (trimmed === ":memory:" || trimmed.startsWith("file::memory:")) {
+    return ":memory:";
+  }
+  if (trimmed.startsWith("sqlite://")) {
+    return trimmed.slice("sqlite://".length);
+  }
+  if (trimmed.startsWith("sqlite:")) {
+    return trimmed.slice("sqlite:".length);
+  }
+  if (trimmed.startsWith("file://")) {
+    return trimmed.slice("file://".length);
+  }
+  if (trimmed.startsWith("file:")) {
+    return trimmed.slice("file:".length);
+  }
+  return trimmed;
+}
+
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   HOST: z.string().default("0.0.0.0"),
   PORT: z.coerce.number().int().min(1).max(65_535).default(3000),
   APP_URL: appBaseUrl,
-  DATABASE_URL: z.string().min(1),
-  DATABASE_SSL: booleanFromEnv,
+  DATABASE_PATH: z.preprocess(
+    (value) => value === "" ? undefined : value,
+    z.string().min(1).optional(),
+  ),
+  DATABASE_URL: z.preprocess(
+    (value) => value === "" ? undefined : value,
+    z.string().min(1).optional(),
+  ),
   BITRIX_CLIENT_ID: z.string().min(1),
   BITRIX_CLIENT_SECRET: z.string().min(1),
   BITRIX_PORTAL_DOMAIN: z.preprocess(
@@ -58,8 +84,7 @@ export interface AppConfig {
   host: string;
   port: number;
   appUrl: string;
-  databaseUrl: string;
-  databaseSsl: boolean;
+  databasePath: string;
   bitrixClientId: string;
   bitrixClientSecret: string;
   bitrixPortalDomain?: string;
@@ -89,13 +114,13 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
   }
 
   const env = parsed.data;
+  const databasePath = normalizeSqlitePath(env.DATABASE_PATH ?? env.DATABASE_URL ?? "./data/bitrix24-mcp.sqlite");
   return {
     nodeEnv: env.NODE_ENV,
     host: env.HOST,
     port: env.PORT,
     appUrl: env.APP_URL.replace(/\/$/, ""),
-    databaseUrl: env.DATABASE_URL,
-    databaseSsl: env.DATABASE_SSL,
+    databasePath,
     bitrixClientId: env.BITRIX_CLIENT_ID,
     bitrixClientSecret: env.BITRIX_CLIENT_SECRET,
     bitrixPortalDomain: env.BITRIX_PORTAL_DOMAIN,

@@ -18,12 +18,12 @@ interface ConnectionRow {
   access_token_encrypted: string;
   refresh_token_encrypted: string;
   scope: string;
-  expires_at: Date;
+  expires_at: string | Date;
   mode: ConnectionMode;
-  admin_tools_enabled: boolean;
+  admin_tools_enabled: number | boolean;
   status: ConnectionRecord["status"];
-  created_at: Date;
-  updated_at: Date;
+  created_at: string | Date;
+  updated_at: string | Date;
 }
 
 interface PendingOperationRow {
@@ -31,15 +31,23 @@ interface PendingOperationRow {
   connection_id: string;
   operation_type: OperationType;
   method: string;
-  params_json: Record<string, unknown>;
+  params_json: string | Record<string, unknown>;
   human_summary: string;
   status: PendingOperationRecord["status"];
-  result_json: unknown;
+  result_json: string | null | unknown;
   error_message: string | null;
-  created_at: Date;
-  expires_at: Date;
-  confirmed_at: Date | null;
-  completed_at: Date | null;
+  created_at: string | Date;
+  expires_at: string | Date;
+  confirmed_at: string | Date | null;
+  completed_at: string | Date | null;
+}
+
+function toDate(value: string | Date): Date {
+  return value instanceof Date ? value : new Date(value);
+}
+
+function parseJson<T>(value: unknown): T {
+  return typeof value === "string" ? (JSON.parse(value) as T) : (value as T);
 }
 
 function mapConnection(row: ConnectionRow): ConnectionRecord {
@@ -52,12 +60,12 @@ function mapConnection(row: ConnectionRow): ConnectionRecord {
     accessTokenEncrypted: row.access_token_encrypted,
     refreshTokenEncrypted: row.refresh_token_encrypted,
     scope: row.scope,
-    expiresAt: row.expires_at,
+    expiresAt: toDate(row.expires_at),
     mode: row.mode,
-    adminToolsEnabled: row.admin_tools_enabled,
+    adminToolsEnabled: Boolean(row.admin_tools_enabled),
     status: row.status,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
+    createdAt: toDate(row.created_at),
+    updatedAt: toDate(row.updated_at),
   };
 }
 
@@ -67,15 +75,15 @@ function mapOperation(row: PendingOperationRow): PendingOperationRecord {
     connectionId: row.connection_id,
     operationType: row.operation_type,
     method: row.method,
-    params: row.params_json,
+    params: parseJson<Record<string, unknown>>(row.params_json),
     humanSummary: row.human_summary,
     status: row.status,
-    result: row.result_json,
+    result: row.result_json === null ? null : parseJson<unknown>(row.result_json),
     errorMessage: row.error_message,
-    createdAt: row.created_at,
-    expiresAt: row.expires_at,
-    confirmedAt: row.confirmed_at,
-    completedAt: row.completed_at,
+    createdAt: toDate(row.created_at),
+    expiresAt: toDate(row.expires_at),
+    confirmedAt: row.confirmed_at ? toDate(row.confirmed_at) : null,
+    completedAt: row.completed_at ? toDate(row.completed_at) : null,
   };
 }
 
@@ -88,7 +96,7 @@ export class ConnectionRepository {
   }
 
   async get(id: string, client: DbPool | DbClient = this.pool): Promise<ConnectionRecord> {
-    const result = await client.query<ConnectionRow>("SELECT * FROM bitrix_connections WHERE id = $1", [id]);
+    const result = await client.query<ConnectionRow>("SELECT * FROM bitrix_connections WHERE id = ?1", [id]);
     const row = result.rows[0];
     if (!row) throw new NotFoundError(`Bitrix connection '${id}' was not found`);
     return mapConnection(row);
@@ -106,47 +114,48 @@ export class ConnectionRepository {
     mode: ConnectionMode;
     adminToolsEnabled: boolean;
   }): Promise<ConnectionRecord> {
+    const now = new Date().toISOString();
     const result = await this.pool.query<ConnectionRow>(`
       INSERT INTO bitrix_connections (
         id, domain, member_id, bitrix_user_id, client_endpoint, access_token_encrypted,
-        refresh_token_encrypted, scope, expires_at, mode, admin_tools_enabled
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+        refresh_token_encrypted, scope, expires_at, mode, admin_tools_enabled, status,
+        created_at, updated_at
+      ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'active',?12,?12)
       ON CONFLICT (member_id, bitrix_user_id) DO UPDATE SET
-        domain = EXCLUDED.domain,
-        bitrix_user_id = EXCLUDED.bitrix_user_id,
-        client_endpoint = EXCLUDED.client_endpoint,
-        access_token_encrypted = EXCLUDED.access_token_encrypted,
-        refresh_token_encrypted = EXCLUDED.refresh_token_encrypted,
-        scope = EXCLUDED.scope,
-        expires_at = EXCLUDED.expires_at,
-        mode = EXCLUDED.mode,
-        admin_tools_enabled = EXCLUDED.admin_tools_enabled,
+        domain = excluded.domain,
+        bitrix_user_id = excluded.bitrix_user_id,
+        client_endpoint = excluded.client_endpoint,
+        access_token_encrypted = excluded.access_token_encrypted,
+        refresh_token_encrypted = excluded.refresh_token_encrypted,
+        scope = excluded.scope,
+        expires_at = excluded.expires_at,
+        mode = excluded.mode,
+        admin_tools_enabled = excluded.admin_tools_enabled,
         status = 'active',
-        updated_at = now()
+        updated_at = excluded.updated_at
       RETURNING *
     `, [
-      randomUUID(), input.domain, input.memberId, input.bitrixUserId, input.clientEndpoint,
-      input.accessTokenEncrypted, input.refreshTokenEncrypted, input.scope, input.expiresAt,
-      input.mode, input.adminToolsEnabled,
+      randomUUID(),
+      input.domain,
+      input.memberId,
+      input.bitrixUserId,
+      input.clientEndpoint,
+      input.accessTokenEncrypted,
+      input.refreshTokenEncrypted,
+      input.scope,
+      input.expiresAt.toISOString(),
+      input.mode,
+      input.adminToolsEnabled ? 1 : 0,
+      now,
     ]);
     return mapConnection(result.rows[0]!);
   }
 
   async withRefreshLock<T>(id: string, callback: (connection: ConnectionRecord, client: DbClient) => Promise<T>): Promise<T> {
-    const client = await this.pool.connect();
-    try {
-      await client.query("BEGIN");
-      await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`bitrix-refresh:${id}`]);
+    return this.pool.withLock(`bitrix-refresh:${id}`, async (client) => {
       const connection = await this.get(id, client);
-      const value = await callback(connection, client);
-      await client.query("COMMIT");
-      return value;
-    } catch (error) {
-      await client.query("ROLLBACK").catch(() => undefined);
-      throw error;
-    } finally {
-      client.release();
-    }
+      return callback(connection, client);
+    });
   }
 
   async updateTokens(
@@ -156,21 +165,29 @@ export class ConnectionRepository {
       "accessTokenEncrypted" | "refreshTokenEncrypted" | "expiresAt" | "scope" | "domain" | "clientEndpoint" | "bitrixUserId"
     >,
   ): Promise<ConnectionRecord> {
+    const now = new Date().toISOString();
     const result = await client.query<ConnectionRow>(`
       UPDATE bitrix_connections SET
-        access_token_encrypted = $2,
-        refresh_token_encrypted = $3,
-        expires_at = $4,
-        scope = $5,
-        domain = $6,
-        client_endpoint = $7,
-        bitrix_user_id = $8,
+        access_token_encrypted = ?2,
+        refresh_token_encrypted = ?3,
+        expires_at = ?4,
+        scope = ?5,
+        domain = ?6,
+        client_endpoint = ?7,
+        bitrix_user_id = ?8,
         status = 'active',
-        updated_at = now()
-      WHERE id = $1 RETURNING *
+        updated_at = ?9
+      WHERE id = ?1 RETURNING *
     `, [
-      id, input.accessTokenEncrypted, input.refreshTokenEncrypted, input.expiresAt, input.scope,
-      input.domain, input.clientEndpoint, input.bitrixUserId,
+      id,
+      input.accessTokenEncrypted,
+      input.refreshTokenEncrypted,
+      input.expiresAt.toISOString(),
+      input.scope,
+      input.domain,
+      input.clientEndpoint,
+      input.bitrixUserId,
+      now,
     ]);
     const row = result.rows[0];
     if (!row) throw new NotFoundError(`Bitrix connection '${id}' was not found`);
@@ -178,7 +195,8 @@ export class ConnectionRepository {
   }
 
   async markRevoked(id: string): Promise<void> {
-    await this.pool.query("UPDATE bitrix_connections SET status = 'revoked', updated_at = now() WHERE id = $1", [id]);
+    const now = new Date().toISOString();
+    await this.pool.query("UPDATE bitrix_connections SET status = 'revoked', updated_at = ?2 WHERE id = ?1", [id, now]);
   }
 }
 
@@ -196,19 +214,21 @@ export class OAuthStateRepository {
     expiresAt: Date,
     mcpRequestHash?: string,
   ): Promise<void> {
-    await this.pool.query("DELETE FROM oauth_states WHERE expires_at <= now()");
+    const now = new Date().toISOString();
+    await this.pool.query("DELETE FROM oauth_states WHERE expires_at <= ?1", [now]);
     await this.pool.query(
-      "INSERT INTO oauth_states (state_hash, domain, mode, expires_at, mcp_request_hash) VALUES ($1,$2,$3,$4,$5)",
-      [OAuthStateRepository.hash(rawState), domain, mode, expiresAt, mcpRequestHash ?? null],
+      "INSERT INTO oauth_states (state_hash, domain, mode, expires_at, created_at, mcp_request_hash) VALUES (?1,?2,?3,?4,?5,?6)",
+      [OAuthStateRepository.hash(rawState), domain, mode, expiresAt.toISOString(), now, mcpRequestHash ?? null],
     );
   }
 
   async consume(rawState: string): Promise<OAuthStateRecord | null> {
+    const now = new Date().toISOString();
     const result = await this.pool.query<{ domain: string; mode: ConnectionMode; mcp_request_hash: string | null }>(`
       DELETE FROM oauth_states
-      WHERE state_hash = $1 AND expires_at > now()
+      WHERE state_hash = ?1 AND expires_at > ?2
       RETURNING domain, mode, mcp_request_hash
-    `, [OAuthStateRepository.hash(rawState)]);
+    `, [OAuthStateRepository.hash(rawState), now]);
     const row = result.rows[0];
     return row ? {
       domain: row.domain,
@@ -222,24 +242,28 @@ export class SchemaCacheRepository {
   constructor(private readonly pool: DbPool) {}
 
   async get<T>(connectionId: string, key: string, maxAgeSeconds: number): Promise<T | null> {
-    const result = await this.pool.query<{ payload: T }>(`
+    const minFetchedAt = new Date(Date.now() - maxAgeSeconds * 1_000).toISOString();
+    const result = await this.pool.query<{ payload: string }>(`
       SELECT payload FROM schema_cache
-      WHERE connection_id = $1 AND cache_key = $2
-        AND fetched_at > now() - ($3 * interval '1 second')
-    `, [connectionId, key, maxAgeSeconds]);
-    return result.rows[0]?.payload ?? null;
+      WHERE connection_id = ?1 AND cache_key = ?2
+        AND fetched_at > ?3
+    `, [connectionId, key, minFetchedAt]);
+    const raw = result.rows[0]?.payload;
+    if (raw === undefined) return null;
+    return parseJson<T>(raw);
   }
 
   async set(connectionId: string, key: string, payload: unknown): Promise<void> {
+    const now = new Date().toISOString();
     await this.pool.query(`
       INSERT INTO schema_cache (connection_id, cache_key, payload, fetched_at)
-      VALUES ($1,$2,$3,now())
-      ON CONFLICT (connection_id, cache_key) DO UPDATE SET payload = EXCLUDED.payload, fetched_at = now()
-    `, [connectionId, key, JSON.stringify(payload)]);
+      VALUES (?1,?2,?3,?4)
+      ON CONFLICT (connection_id, cache_key) DO UPDATE SET payload = excluded.payload, fetched_at = excluded.fetched_at
+    `, [connectionId, key, JSON.stringify(payload), now]);
   }
 
   async clear(connectionId: string): Promise<number> {
-    const result = await this.pool.query("DELETE FROM schema_cache WHERE connection_id = $1", [connectionId]);
+    const result = await this.pool.query("DELETE FROM schema_cache WHERE connection_id = ?1", [connectionId]);
     return result.rowCount ?? 0;
   }
 }
@@ -255,66 +279,81 @@ export class PendingOperationRepository {
     humanSummary: string;
     expiresAt: Date;
   }): Promise<PendingOperationRecord> {
+    const now = new Date().toISOString();
     const result = await this.pool.query<PendingOperationRow>(`
       INSERT INTO pending_operations (
-        id, connection_id, operation_type, method, params_json, human_summary, expires_at
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *
-    `, [randomUUID(), input.connectionId, input.operationType, input.method, JSON.stringify(input.params), input.humanSummary, input.expiresAt]);
+        id, connection_id, operation_type, method, params_json, human_summary, created_at, expires_at
+      ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) RETURNING *
+    `, [
+      randomUUID(),
+      input.connectionId,
+      input.operationType,
+      input.method,
+      JSON.stringify(input.params),
+      input.humanSummary,
+      now,
+      input.expiresAt.toISOString(),
+    ]);
     return mapOperation(result.rows[0]!);
   }
 
   async list(connectionId?: string): Promise<PendingOperationRecord[]> {
     await this.expireStale();
     const result = connectionId
-      ? await this.pool.query<PendingOperationRow>("SELECT * FROM pending_operations WHERE connection_id = $1 ORDER BY created_at DESC LIMIT 100", [connectionId])
+      ? await this.pool.query<PendingOperationRow>("SELECT * FROM pending_operations WHERE connection_id = ?1 ORDER BY created_at DESC LIMIT 100", [connectionId])
       : await this.pool.query<PendingOperationRow>("SELECT * FROM pending_operations ORDER BY created_at DESC LIMIT 100");
     return result.rows.map(mapOperation);
   }
 
   async get(id: string): Promise<PendingOperationRecord> {
     await this.expireStale();
-    const result = await this.pool.query<PendingOperationRow>("SELECT * FROM pending_operations WHERE id = $1", [id]);
+    const result = await this.pool.query<PendingOperationRow>("SELECT * FROM pending_operations WHERE id = ?1", [id]);
     const row = result.rows[0];
     if (!row) throw new NotFoundError(`Pending operation '${id}' was not found`);
     return mapOperation(row);
   }
 
   async claim(id: string): Promise<PendingOperationRecord | null> {
+    const now = new Date().toISOString();
     const result = await this.pool.query<PendingOperationRow>(`
-      UPDATE pending_operations SET status = 'executing', confirmed_at = now()
-      WHERE id = $1 AND status = 'pending' AND expires_at > now()
+      UPDATE pending_operations SET status = 'executing', confirmed_at = ?2
+      WHERE id = ?1 AND status = 'pending' AND expires_at > ?2
       RETURNING *
-    `, [id]);
+    `, [id, now]);
     return result.rows[0] ? mapOperation(result.rows[0]) : null;
   }
 
   async cancel(id: string): Promise<PendingOperationRecord | null> {
+    const now = new Date().toISOString();
     const result = await this.pool.query<PendingOperationRow>(`
-      UPDATE pending_operations SET status = 'cancelled', completed_at = now()
-      WHERE id = $1 AND status = 'pending' RETURNING *
-    `, [id]);
+      UPDATE pending_operations SET status = 'cancelled', completed_at = ?2
+      WHERE id = ?1 AND status = 'pending' RETURNING *
+    `, [id, now]);
     return result.rows[0] ? mapOperation(result.rows[0]) : null;
   }
 
   async complete(id: string, resultValue: unknown): Promise<void> {
+    const now = new Date().toISOString();
     await this.pool.query(`
-      UPDATE pending_operations SET status = 'completed', result_json = $2, completed_at = now()
-      WHERE id = $1 AND status = 'executing'
-    `, [id, JSON.stringify(resultValue)]);
+      UPDATE pending_operations SET status = 'completed', result_json = ?2, completed_at = ?3
+      WHERE id = ?1 AND status = 'executing'
+    `, [id, JSON.stringify(resultValue ?? null), now]);
   }
 
   async fail(id: string, message: string): Promise<void> {
+    const now = new Date().toISOString();
     await this.pool.query(`
-      UPDATE pending_operations SET status = 'failed', error_message = $2, completed_at = now()
-      WHERE id = $1 AND status = 'executing'
-    `, [id, message.slice(0, 1_000)]);
+      UPDATE pending_operations SET status = 'failed', error_message = ?2, completed_at = ?3
+      WHERE id = ?1 AND status = 'executing'
+    `, [id, message.slice(0, 1_000), now]);
   }
 
   private async expireStale(): Promise<void> {
+    const now = new Date().toISOString();
     await this.pool.query(`
-      UPDATE pending_operations SET status = 'expired', completed_at = now()
-      WHERE status = 'pending' AND expires_at <= now()
-    `);
+      UPDATE pending_operations SET status = 'expired', completed_at = ?1
+      WHERE status = 'pending' AND expires_at <= ?1
+    `, [now]);
   }
 }
 
@@ -328,12 +367,18 @@ export class AuditRepository {
     outcome: string;
     details?: Record<string, unknown>;
   }): Promise<void> {
+    const now = new Date().toISOString();
     await this.pool.query(`
-      INSERT INTO audit_logs (id, connection_id, operation_id, action, outcome, details_json)
-      VALUES ($1,$2,$3,$4,$5,$6)
+      INSERT INTO audit_logs (id, connection_id, operation_id, action, outcome, details_json, created_at)
+      VALUES (?1,?2,?3,?4,?5,?6,?7)
     `, [
-      randomUUID(), input.connectionId ?? null, input.operationId ?? null, input.action,
-      input.outcome, JSON.stringify(input.details ?? {}),
+      randomUUID(),
+      input.connectionId ?? null,
+      input.operationId ?? null,
+      input.action,
+      input.outcome,
+      JSON.stringify(input.details ?? {}),
+      now,
     ]);
   }
 }

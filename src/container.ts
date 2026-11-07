@@ -16,7 +16,7 @@ import { SchemaDiscoveryService } from "./bitrix/schema-discovery.js";
 import { CrmService } from "./bitrix/crm.js";
 import { PolicyGuard } from "./policy/guard.js";
 import { OperationService } from "./operations/service.js";
-import { PostgresMcpOAuthStore } from "./mcp/oauth/repository.js";
+import { SqliteMcpOAuthStore } from "./mcp/oauth/repository.js";
 import { McpOAuthService } from "./mcp/oauth/service.js";
 
 export interface AppContainer {
@@ -38,7 +38,7 @@ export function createContainer(config: AppConfig, logger: AppLogger, pool = cre
   const schemaCache = new SchemaCacheRepository(pool);
   const pendingOperations = new PendingOperationRepository(pool);
   const audit = new AuditRepository(pool);
-  const mcpOAuthStore = new PostgresMcpOAuthStore(pool);
+  const mcpOAuthStore = new SqliteMcpOAuthStore(pool);
   const cipher = new TokenCipher(config.tokenEncryptionKey);
   const oauth = new BitrixOAuthService(config, states, connections, cipher);
   const tokens = new TokenManager(connections, oauth, cipher, logger);

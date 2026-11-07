@@ -158,6 +158,10 @@ func NewOAuthService(cfg *config.Config, st *store.Store, httpClient *http.Clien
 	return &OAuthService{cfg: cfg, store: st, httpClient: httpClient}
 }
 
+func (s *OAuthService) HTTPClient() *http.Client {
+	return s.httpClient
+}
+
 func (s *OAuthService) allowedPortalDomains() []string {
 	if s.cfg.BitrixPortalDomain != "" {
 		return []string{s.cfg.BitrixPortalDomain}

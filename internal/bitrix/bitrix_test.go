@@ -3,6 +3,7 @@ package bitrix_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -404,4 +405,533 @@ func errorsAsContinuation(err error, target **bitrix.ContinuationError) bool {
 	}
 	return false
 }
+
+func TestFlexMap_DecodesEmptyArrayAndObject(t *testing.T) {
+	var empty bitrix.FlexMap[string]
+	if err := json.Unmarshal([]byte(`[]`), &empty); err != nil {
+		t.Fatalf("expected [] to unmarshal into empty FlexMap, got err=%v", err)
+	}
+	if len(empty) != 0 {
+		t.Errorf("expected empty FlexMap, got %v", empty)
+	}
+
+	var obj bitrix.FlexMap[int]
+	if err := json.Unmarshal([]byte(`{"a":1,"b":2}`), &obj); err != nil {
+		t.Fatalf("expected object to unmarshal into FlexMap, got err=%v", err)
+	}
+	if obj["a"] != 1 || obj["b"] != 2 {
+		t.Errorf("unexpected FlexMap contents: %v", obj)
+	}
+}
+
+func TestRestClient_RefreshesExpiredTokenRetriesAndBatch(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. BuildBatchCommand nested parameter serialization
+	cmdStr, err := bitrix.BuildBatchCommand("crm.item.list", map[string]any{
+		"entityTypeId": 2,
+		"filter":       map[string]any{"stageId": "NEW"},
+		"select":       []string{"id", "title"},
+		"start":        50,
+	})
+	if err != nil {
+		t.Fatalf("BuildBatchCommand failed: %v", err)
+	}
+	decodedCmd, _ := url.QueryUnescape(cmdStr)
+	if decodedCmd != "crm.item.list?entityTypeId=2&filter[stageId]=NEW&select[0]=id&select[1]=title&start=50" {
+		t.Errorf("unexpected batch command string: %s", decodedCmd)
+	}
+
+	var restCalls atomic.Int32
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Hostname() == "oauth.bitrix.info" {
+			return jsonResponse(200, map[string]any{
+				"access_token":    "new-secret",
+				"refresh_token":   "new-refresh",
+				"expires_in":      3600,
+				"scope":           "crm",
+				"domain":          "oauth.bitrix.info",
+				"member_id":       "member-1",
+				"user_id":         "1",
+				"client_endpoint": "https://example.bitrix24.com/rest/",
+			}), nil
+		}
+		callNum := restCalls.Add(1)
+		bodyBytes, _ := io.ReadAll(r.Body)
+		var bodyMap map[string]any
+		_ = json.Unmarshal(bodyBytes, &bodyMap)
+
+		if strings.HasSuffix(r.URL.Path, "crm.item.get.json") {
+			if strings.Contains(r.URL.String(), "old-secret") || strings.Contains(r.URL.String(), "new-secret") {
+				t.Errorf("token must not be exposed in URL: %s", r.URL.String())
+			}
+			if callNum == 1 {
+				return jsonResponse(401, map[string]any{"error": "expired_token"}), nil
+			}
+			if callNum == 2 {
+				if bodyMap["auth"] != "new-secret" {
+					t.Errorf("expected refreshed auth token 'new-secret', got %v", bodyMap["auth"])
+				}
+				resp := jsonResponse(429, map[string]any{"error": "QUERY_LIMIT_EXCEEDED"})
+				resp.Header.Set("Retry-After", "0")
+				return resp, nil
+			}
+			return jsonResponse(200, map[string]any{
+				"result": map[string]any{"item": map[string]any{"id": 7}},
+			}), nil
+		}
+		if strings.HasSuffix(r.URL.Path, "batch.json") {
+			cmdMap, _ := bodyMap["cmd"].(map[string]any)
+			resMap := make(map[string]any, len(cmdMap))
+			for k := range cmdMap {
+				resMap[k] = map[string]any{"ok": k}
+			}
+			return jsonResponse(200, map[string]any{
+				"result": map[string]any{
+					"result":       resMap,
+					"result_error": []any{},
+				},
+			}), nil
+		}
+		return jsonResponse(200, map[string]any{"result": true}), nil
+	})
+
+	cfg, st, _, tm := newTestEnv(t, "", "client-id", rt)
+	conn, err := st.UpsertConnection(ctx, store.UpsertConnectionInput{
+		Domain:         "example.bitrix24.com",
+		MemberID:       "member-1",
+		BitrixUserID:   "1",
+		ClientEndpoint: "https://example.bitrix24.com/rest/",
+		AccessToken:    "old-secret",
+		RefreshToken:   "old-refresh",
+		Scope:          "crm",
+		ExpiresAt:      time.Now().Add(time.Hour),
+		Mode:           config.ModeReadOnly,
+	})
+	if err != nil {
+		t.Fatalf("UpsertConnection failed: %v", err)
+	}
+
+	httpClient := &http.Client{Transport: rt, Timeout: 2 * time.Second}
+	rc := bitrix.NewRestClient(cfg, tm, config.NewLogger(nil, "silent"), httpClient)
+
+	// 2. Reject invalid method before making network call
+	if _, err := rc.Call(ctx, conn.ID, "https://evil.example", nil); err == nil {
+		t.Fatalf("expected invalid method to be rejected")
+	}
+	if restCalls.Load() != 0 {
+		t.Fatalf("expected 0 network calls for invalid method, got %d", restCalls.Load())
+	}
+
+	// 3. Call refreshes on expired_token and retries on 429 QUERY_LIMIT_EXCEEDED
+	resp, err := rc.Call(ctx, conn.ID, "crm.item.get", map[string]any{"entityTypeId": 2, "id": 7})
+	if err != nil {
+		t.Fatalf("rc.Call failed: %v", err)
+	}
+	if !strings.Contains(string(resp.Result), `"id":7`) {
+		t.Errorf("unexpected response result: %s", string(resp.Result))
+	}
+
+	// 4. CallBatch chunks 55 commands into 2 batch requests (50 + 5)
+	var commands []bitrix.NamedBatchCommand
+	for i := 0; i < 55; i++ {
+		commands = append(commands, bitrix.NamedBatchCommand{
+			Key:    "k_" + string(rune('a'+(i%26))) + "_" + url.QueryEscape(string(rune('0'+(i/26)))),
+			Method: "crm.item.get",
+			Params: map[string]any{"id": i + 1},
+		})
+	}
+	batchRes, err := rc.CallBatch(ctx, conn.ID, commands, false)
+	if err != nil || len(batchRes) != 55 {
+		t.Fatalf("expected 55 batch results, got %d err=%v", len(batchRes), err)
+	}
+}
+
+func TestSchemaDiscovery_CachingAndDescribeBatchStages(t *testing.T) {
+	ctx := context.Background()
+	var batchCalls atomic.Int32
+	var typeCalls atomic.Int32
+
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "crm.type.list.json"):
+			typeCalls.Add(1)
+			return jsonResponse(200, map[string]any{
+				"result": map[string]any{
+					"types": []map[string]any{
+						{"entityTypeId": 128, "title": "Smart Process"},
+					},
+				},
+			}), nil
+		case strings.HasSuffix(r.URL.Path, "crm.item.fields.json"):
+			return jsonResponse(200, map[string]any{
+				"result": map[string]any{
+					"fields": map[string]any{"TITLE": map[string]any{"type": "string"}},
+				},
+			}), nil
+		case strings.HasSuffix(r.URL.Path, "crm.category.list.json"):
+			return jsonResponse(200, map[string]any{
+				"result": map[string]any{
+					"categories": []map[string]any{
+						{"id": 0, "name": "Default"},
+						{"id": 5, "name": "Enterprise"},
+					},
+				},
+			}), nil
+		case strings.HasSuffix(r.URL.Path, "batch.json"):
+			batchCalls.Add(1)
+			return jsonResponse(200, map[string]any{
+				"result": map[string]any{
+					"result": map[string]any{
+						"cat_0": []map[string]any{{"STATUS_ID": "NEW", "NAME": "New"}},
+						"cat_5": []map[string]any{{"STATUS_ID": "C5:NEW", "NAME": "Ent New"}},
+					},
+					"result_error": []any{},
+				},
+			}), nil
+		default:
+			return jsonResponse(200, map[string]any{"result": []any{}}), nil
+		}
+	})
+
+	cfg, st, _, tm := newTestEnv(t, "", "client-id", rt)
+	conn, err := st.UpsertConnection(ctx, store.UpsertConnectionInput{
+		Domain:         "example.bitrix24.com",
+		MemberID:       "member-schema",
+		BitrixUserID:   "1",
+		ClientEndpoint: "https://example.bitrix24.com/rest/",
+		AccessToken:    "acc",
+		RefreshToken:   "ref",
+		Scope:          "crm",
+		ExpiresAt:      time.Now().Add(time.Hour),
+		Mode:           config.ModeReadOnly,
+	})
+	if err != nil {
+		t.Fatalf("UpsertConnection failed: %v", err)
+	}
+
+	httpClient := &http.Client{Transport: rt, Timeout: 2 * time.Second}
+	rc := bitrix.NewRestClient(cfg, tm, config.NewLogger(nil, "silent"), httpClient)
+	schema := bitrix.NewSchemaDiscovery(cfg, st, rc)
+
+	// 1. ListEntityTypes merges built-in + dynamic and caches result
+	types1, err := schema.ListEntityTypes(ctx, conn.ID, false)
+	if err != nil || len(types1) != 6 {
+		t.Fatalf("expected 6 entity types (5 built-in + 1 dynamic), got %d err=%v", len(types1), err)
+	}
+	types2, err := schema.ListEntityTypes(ctx, conn.ID, false)
+	if err != nil || len(types2) != 6 || typeCalls.Load() != 1 {
+		t.Fatalf("expected cached ListEntityTypes (1 HTTP call), got calls=%d err=%v", typeCalls.Load(), err)
+	}
+
+	// 2. ResolveEntityType by title
+	resolved, err := schema.ResolveEntityType(ctx, conn.ID, "Smart Process")
+	if err != nil || resolved["entityTypeId"] != 128 {
+		t.Fatalf("expected entityTypeId 128 for 'Smart Process', got %+v err=%v", resolved, err)
+	}
+
+	// 3. Describe batch-fetches uncached category stages
+	desc, err := schema.Describe(ctx, conn.ID, 2, nil, false)
+	if err != nil {
+		t.Fatalf("Describe failed: %v", err)
+	}
+	if batchCalls.Load() != 1 {
+		t.Errorf("expected 1 batch call for 2 uncached categories, got %d", batchCalls.Load())
+	}
+	descJSON, _ := json.Marshal(desc)
+	if !strings.Contains(string(descJSON), "C5:NEW") {
+		t.Errorf("expected C5:NEW in describe output: %s", string(descJSON))
+	}
+
+	// 4. Refresh clears schema cache
+	refreshed, err := schema.Refresh(ctx, conn.ID)
+	if err != nil || refreshed["clearedEntries"] == int64(0) {
+		t.Errorf("expected non-zero clearedEntries on Refresh, got %+v err=%v", refreshed, err)
+	}
+}
+
+func TestCrmService_SearchBatchAndProducts(t *testing.T) {
+	ctx := context.Background()
+
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		bodyBytes, _ := io.ReadAll(r.Body)
+		bodyStr := string(bodyBytes)
+
+		switch {
+		case strings.HasSuffix(r.URL.Path, "crm.item.list.json"):
+			if strings.Contains(bodyStr, `"start":50`) {
+				return jsonResponse(200, map[string]any{
+					"result": map[string]any{
+						"items": []map[string]any{
+							{"id": 51, "title": "Deal 51"},
+						},
+					},
+					"total": 51,
+				}), nil
+			}
+			// Page 1: 50 items, next=50
+			items := make([]map[string]any, 50)
+			for i := 0; i < 50; i++ {
+				items[i] = map[string]any{"id": i + 1, "title": fmt.Sprintf("Deal %d", i+1)}
+			}
+			return jsonResponse(200, map[string]any{
+				"result": map[string]any{
+					"items": items,
+				},
+				"next":  50,
+				"total": 51,
+			}), nil
+
+		case strings.HasSuffix(r.URL.Path, "crm.item.get.json"):
+			return jsonResponse(200, map[string]any{
+				"result": map[string]any{
+					"item": map[string]any{"id": 100, "title": "Smart Item 100"},
+				},
+			}), nil
+
+		case strings.HasSuffix(r.URL.Path, "user.get.json"):
+			return jsonResponse(200, map[string]any{
+				"result": []map[string]any{
+					{"ID": "1", "NAME": "John", "LAST_NAME": "Doe"},
+				},
+			}), nil
+
+		case strings.HasSuffix(r.URL.Path, "batch.json"):
+			if strings.Contains(bodyStr, "crm.item.list") {
+				return jsonResponse(200, map[string]any{
+					"result": map[string]any{
+						"result": map[string]any{
+							"p_50": map[string]any{
+								"items": []map[string]any{
+									{"id": 51, "title": "Deal 51"},
+								},
+							},
+						},
+						"result_error": []any{},
+					},
+				}), nil
+			}
+			if strings.Contains(bodyStr, "crm.item.productrow.list") {
+				return jsonResponse(200, map[string]any{
+					"result": map[string]any{
+						"result": map[string]any{
+							"1": map[string]any{
+								"productRows": []map[string]any{
+									{"ID": "10", "PRODUCT_NAME": "Widget A", "PRICE": 100},
+								},
+							},
+						},
+						"result_error": []any{},
+					},
+				}), nil
+			}
+			if strings.Contains(bodyStr, "crm.item.get") {
+				return jsonResponse(200, map[string]any{
+					"result": map[string]any{
+						"result": map[string]any{
+							"1": map[string]any{"item": map[string]any{"id": 1, "title": "Deal 1"}},
+							"2": map[string]any{"item": map[string]any{"id": 2, "title": "Deal 2"}},
+						},
+						"result_error": []any{},
+					},
+				}), nil
+			}
+			return jsonResponse(200, map[string]any{"result": map[string]any{"result": map[string]any{}}}), nil
+
+		default:
+			return jsonResponse(200, map[string]any{"result": map[string]any{}}), nil
+		}
+	})
+
+	cfg, st, _, tm := newTestEnv(t, "", "client-id", rt)
+	conn, err := st.UpsertConnection(ctx, store.UpsertConnectionInput{
+		Domain:         "example.bitrix24.com",
+		MemberID:       "member-crm",
+		BitrixUserID:   "1",
+		ClientEndpoint: "https://example.bitrix24.com/rest/",
+		AccessToken:    "acc",
+		RefreshToken:   "ref",
+		Scope:          "crm",
+		ExpiresAt:      time.Now().Add(time.Hour),
+		Mode:           config.ModeWriteWithConfirmation,
+	})
+	if err != nil {
+		t.Fatalf("UpsertConnection failed: %v", err)
+	}
+
+	httpClient := &http.Client{Transport: rt, Timeout: 2 * time.Second}
+	rc := bitrix.NewRestClient(cfg, tm, config.NewLogger(nil, "silent"), httpClient)
+	crmSvc := bitrix.NewCrmService(cfg, rc)
+
+	// Test 1: SearchItems pagination (fetching 51 deals across 2 pages)
+	searchRes, err := crmSvc.SearchItems(ctx, bitrix.SearchItemsInput{
+		ConnectionID:       conn.ID,
+		EntityTypeID:       2,
+		Limit:              60,
+		IncludeProductRows: true,
+	})
+	if err != nil {
+		t.Fatalf("SearchItems failed: %v", err)
+	}
+	if len(searchRes.Items) != 51 {
+		t.Fatalf("expected 51 items, got %d", len(searchRes.Items))
+	}
+	// Verify product rows were attached to item 1
+	if rows, ok := searchRes.Items[0]["productRows"].([]map[string]any); !ok || len(rows) != 1 {
+		t.Errorf("expected productRows attached to item 1, got %+v", searchRes.Items[0]["productRows"])
+	}
+
+	// Test 2: GetItem for dynamic entity
+	itemRes, err := crmSvc.GetItem(ctx, conn.ID, 128, 100)
+	if err != nil {
+		t.Fatalf("GetItem failed: %v", err)
+	}
+	itemMap, ok := itemRes.(map[string]any)
+	if !ok || itemMap["title"] != "Smart Item 100" {
+		t.Errorf("expected item title 'Smart Item 100', got %+v", itemRes)
+	}
+
+	// Test 3: GetItems batch
+	batchItems, err := crmSvc.GetItems(ctx, conn.ID, 2, []int{1, 2})
+	if err != nil {
+		t.Fatalf("GetItems failed: %v", err)
+	}
+	if len(batchItems) != 2 {
+		t.Fatalf("expected 2 items, got %d", len(batchItems))
+	}
+
+	// Test 4: ListUsers batch
+	users, err := crmSvc.ListUsers(ctx, conn.ID, map[string]any{"ID": "1"})
+	if err != nil {
+		t.Fatalf("ListUsers failed: %v", err)
+	}
+	if len(users) != 1 || users[0]["NAME"] != "John" {
+		t.Fatalf("expected user John, got %+v", users)
+	}
+}
+
+func TestOperationService_TwoStepLifecycleAndPolicyGuard(t *testing.T) {
+	ctx := context.Background()
+
+	executedMethod := ""
+	var executedParams any
+
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		bodyBytes, _ := io.ReadAll(r.Body)
+		switch {
+		case strings.HasSuffix(r.URL.Path, "crm.item.add.json"):
+			executedMethod = "crm.item.add"
+			_ = json.Unmarshal(bodyBytes, &executedParams)
+			return jsonResponse(200, map[string]any{"result": 42}), nil
+		case strings.HasSuffix(r.URL.Path, "crm.item.update.json"):
+			executedMethod = "crm.item.update"
+			_ = json.Unmarshal(bodyBytes, &executedParams)
+			return jsonResponse(200, map[string]any{"result": true}), nil
+		default:
+			return jsonResponse(200, map[string]any{"result": true}), nil
+		}
+	})
+
+	cfg, st, _, tm := newTestEnv(t, "", "client-id", rt)
+	conn, err := st.UpsertConnection(ctx, store.UpsertConnectionInput{
+		Domain:         "example.bitrix24.com",
+		MemberID:       "member-ops",
+		BitrixUserID:   "1",
+		ClientEndpoint: "https://example.bitrix24.com/rest/",
+		AccessToken:    "acc",
+		RefreshToken:   "ref",
+		Scope:          "crm",
+		ExpiresAt:      time.Now().Add(time.Hour),
+		Mode:           config.ModeWriteWithConfirmation,
+	})
+	if err != nil {
+		t.Fatalf("UpsertConnection failed: %v", err)
+	}
+
+	httpClient := &http.Client{Transport: rt, Timeout: 2 * time.Second}
+	rc := bitrix.NewRestClient(cfg, tm, config.NewLogger(nil, "silent"), httpClient)
+	policyGuard := bitrix.NewPolicyGuard()
+	opSvc := bitrix.NewOperationService(cfg, st, policyGuard, rc)
+
+	// 1. Prepare Create
+	prep, err := opSvc.PrepareCreate(ctx, conn.ID, 2, map[string]any{"TITLE": "New Big Deal"})
+	if err != nil {
+		t.Fatalf("PrepareCreate failed: %v", err)
+	}
+	opID, _ := prep["operation_id"].(string)
+	if opID == "" || prep["requires_confirmation"] != true {
+		t.Fatalf("expected pending operation, got %+v", prep)
+	}
+
+	// Check listing pending
+	list, err := opSvc.List(ctx, &conn.ID)
+	if err != nil || len(list) != 1 {
+		t.Fatalf("expected 1 pending operation in list, got %d, err=%v", len(list), err)
+	}
+
+	// 2. Confirm operation
+	confirmRes, err := opSvc.Confirm(ctx, opID, "")
+	if err != nil {
+		t.Fatalf("Confirm failed: %v", err)
+	}
+	if confirmRes["status"] != "completed" {
+		t.Fatalf("expected completed status, got %+v", confirmRes)
+	}
+	if executedMethod != "crm.item.add" {
+		t.Fatalf("expected crm.item.add to be executed, got %q", executedMethod)
+	}
+
+	// Verify audit log was written (1 prepared + 1 completed)
+	audit, err := st.ListAuditLogs(ctx, 10, 0)
+	if err != nil || len(audit) != 2 {
+		t.Fatalf("expected 2 audit log entries, got %d err=%v", len(audit), err)
+	}
+	var foundCompleted bool
+	for _, l := range audit {
+		if l.OperationID != nil && *l.OperationID == opID && l.Outcome == "completed" {
+			foundCompleted = true
+			break
+		}
+	}
+	if !foundCompleted {
+		t.Fatalf("expected audit log matching op %s with outcome completed, got %+v", opID, audit)
+	}
+
+	// 3. Cancel test
+	prepCancel, err := opSvc.PrepareUpdate(ctx, conn.ID, 2, 42, map[string]any{"TITLE": "Updated Deal"})
+	if err != nil {
+		t.Fatalf("PrepareUpdate failed: %v", err)
+	}
+	cancelID, _ := prepCancel["operation_id"].(string)
+
+	cancelRes, err := opSvc.Cancel(ctx, cancelID, "")
+	if err != nil {
+		t.Fatalf("Cancel failed: %v", err)
+	}
+	if cancelRes["status"] != "cancelled" {
+		t.Fatalf("expected cancelled status, got %+v", cancelRes)
+	}
+
+	// 4. Policy Guard rejection in read_only mode
+	_, err = st.UpsertConnection(ctx, store.UpsertConnectionInput{
+		Domain:         "example.bitrix24.com",
+		MemberID:       "member-ops",
+		BitrixUserID:   "1",
+		ClientEndpoint: "https://example.bitrix24.com/rest/",
+		AccessToken:    "acc",
+		RefreshToken:   "ref",
+		Scope:          "crm",
+		ExpiresAt:      time.Now().Add(time.Hour),
+		Mode:           config.ModeReadOnly,
+	})
+	if err != nil {
+		t.Fatalf("update connection to read_only failed: %v", err)
+	}
+
+	_, err = opSvc.PrepareCreate(ctx, conn.ID, 2, map[string]any{"TITLE": "Blocked Deal"})
+	if err == nil {
+		t.Fatalf("expected PrepareCreate to be blocked in read_only mode")
+	}
+}
+
 

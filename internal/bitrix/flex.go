@@ -86,3 +86,30 @@ func (sc *FlexScope) UnmarshalJSON(data []byte) error {
 	*sc = FlexScope(str)
 	return nil
 }
+
+// FlexMap handles polymorphic PHP JSON arrays: [] when empty vs {"k": v} when populated.
+type FlexMap[T any] map[string]T
+
+func (m *FlexMap[T]) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		*m = nil
+		return nil
+	}
+	if trimmed[0] == '[' {
+		// Empty PHP array serialized as JSON []
+		var arr []any
+		if err := json.Unmarshal(trimmed, &arr); err != nil {
+			return err
+		}
+		*m = make(FlexMap[T])
+		return nil
+	}
+	var raw map[string]T
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	*m = FlexMap[T](raw)
+	return nil
+}
+

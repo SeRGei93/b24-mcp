@@ -1,15 +1,19 @@
 package mcp_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"io"
+	"net/http"
 	"net/url"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/SeRGei93/b24-mcp/internal/bitrix"
 	"github.com/SeRGei93/b24-mcp/internal/config"
 	"github.com/SeRGei93/b24-mcp/internal/mcp"
 	"github.com/SeRGei93/b24-mcp/internal/store"
@@ -60,7 +64,7 @@ func TestMCPServer_ListConnectionsAndIsolation(t *testing.T) {
 	}
 
 	// 1. Unscoped MCP server returns both connections without secrets
-	srv := mcp.NewServer(st, "")
+	srv := mcp.NewServer(st, nil, nil, nil, "")
 	inProc, err := client.NewInProcessClient(srv)
 	if err != nil {
 		t.Fatalf("NewInProcessClient failed: %v", err)
@@ -79,6 +83,9 @@ func TestMCPServer_ListConnectionsAndIsolation(t *testing.T) {
 	toolsRes, err := inProc.ListTools(ctx, mcpproto.ListToolsRequest{})
 	if err != nil {
 		t.Fatalf("ListTools failed: %v", err)
+	}
+	if len(toolsRes.Tools) != 18 {
+		t.Fatalf("expected all 18 MCP tools to be registered, got %d", len(toolsRes.Tools))
 	}
 	foundList := false
 	for _, tool := range toolsRes.Tools {
@@ -106,7 +113,7 @@ func TestMCPServer_ListConnectionsAndIsolation(t *testing.T) {
 	}
 
 	// 2. Scoped MCP server only returns the authorized connection
-	scopedSrv := mcp.NewServer(st, first.ID)
+	scopedSrv := mcp.NewServer(st, nil, nil, nil, first.ID)
 	scopedClient, err := client.NewInProcessClient(scopedSrv)
 	if err != nil {
 		t.Fatalf("NewInProcessClient failed: %v", err)
@@ -247,6 +254,225 @@ func TestMcpOAuthService_LoopbackAndPKCEAndRotation(t *testing.T) {
 		RedirectURI:  "https://client.example.com/callback",
 	}); err == nil {
 		t.Fatalf("expected mismatched PKCE verifier to be rejected")
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
+
+func jsonResponse(status int, body any) *http.Response {
+	b, _ := json.Marshal(body)
+	return &http.Response{
+		StatusCode: status,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(bytes.NewReader(b)),
+	}
+}
+
+func TestMCPServer_AllToolsExecution(t *testing.T) {
+	ctx := context.Background()
+
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "crm.type.list.json"):
+			return jsonResponse(200, map[string]any{
+				"result": map[string]any{
+					"types": []map[string]any{
+						{"id": 128, "entityTypeId": 128, "title": "Invoice SPA"},
+					},
+				},
+			}), nil
+		case strings.HasSuffix(r.URL.Path, "crm.item.list.json"):
+			return jsonResponse(200, map[string]any{
+				"result": map[string]any{
+					"items": []map[string]any{
+						{"id": 1, "title": "Test Item 1"},
+					},
+				},
+				"total": 1,
+			}), nil
+		case strings.HasSuffix(r.URL.Path, "crm.item.get.json"):
+			return jsonResponse(200, map[string]any{
+				"result": map[string]any{
+					"item": map[string]any{"id": 1, "title": "Test Item 1"},
+				},
+			}), nil
+		case strings.HasSuffix(r.URL.Path, "crm.item.add.json"):
+			return jsonResponse(200, map[string]any{"result": map[string]any{"item": map[string]any{"id": 99}}}), nil
+		default:
+			return jsonResponse(200, map[string]any{"result": map[string]any{}}), nil
+		}
+	})
+
+	cfg, err := config.Load(map[string]string{
+		"APP_URL":              "https://mcp.example.com",
+		"DATABASE_PATH":        ":memory:",
+		"BITRIX_CLIENT_ID":     "client-id",
+		"BITRIX_CLIENT_SECRET": "client-secret",
+		"MCP_AUTH_TOKEN":       strings.Repeat("a", 32),
+		"TOKEN_ENCRYPTION_KEY": testMCPKeyHex,
+	})
+	if err != nil {
+		t.Fatalf("failed to load config: %v", err)
+	}
+
+	st, err := store.NewStore(cfg.DatabasePath, cfg.TokenEncryptionKey)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+	if err := st.Migrate(ctx, nil); err != nil {
+		t.Fatalf("migrate failed: %v", err)
+	}
+
+	conn, err := st.UpsertConnection(ctx, store.UpsertConnectionInput{
+		Domain:         "example.bitrix24.com",
+		MemberID:       "member-mcp",
+		BitrixUserID:   "1",
+		ClientEndpoint: "https://example.bitrix24.com/rest/",
+		AccessToken:    "acc",
+		RefreshToken:   "ref",
+		Scope:          "crm",
+		ExpiresAt:      time.Now().Add(time.Hour),
+		Mode:           config.ModeWriteWithConfirmation,
+	})
+	if err != nil {
+		t.Fatalf("UpsertConnection failed: %v", err)
+	}
+
+	httpClient := &http.Client{Transport: rt, Timeout: 2 * time.Second}
+	oauth := bitrix.NewOAuthService(cfg, st, httpClient)
+	tokens := bitrix.NewTokenManager(st, oauth, nil)
+	rc := bitrix.NewRestClient(cfg, tokens, nil, httpClient)
+	schema := bitrix.NewSchemaDiscovery(cfg, st, rc)
+	crmSvc := bitrix.NewCrmService(cfg, rc)
+	guard := bitrix.NewPolicyGuard()
+	ops := bitrix.NewOperationService(cfg, st, guard, rc)
+
+	srv := mcp.NewServer(st, schema, crmSvc, ops, "")
+	inProc, err := client.NewInProcessClient(srv)
+	if err != nil {
+		t.Fatalf("NewInProcessClient failed: %v", err)
+	}
+	defer inProc.Close()
+	if err := inProc.Start(ctx); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	initReq := mcpproto.InitializeRequest{}
+	initReq.Params.ProtocolVersion = mcpproto.LATEST_PROTOCOL_VERSION
+	initReq.Params.ClientInfo = mcpproto.Implementation{Name: "test-client", Version: "1.0.0"}
+	if _, err := inProc.Initialize(ctx, initReq); err != nil {
+		t.Fatalf("Initialize failed: %v", err)
+	}
+
+	// 1. Discover Portal
+	discReq := mcpproto.CallToolRequest{}
+	discReq.Params.Name = "bitrix_discover_portal"
+	discReq.Params.Arguments = map[string]any{"connectionId": conn.ID}
+	discRes, err := inProc.CallTool(ctx, discReq)
+	if err != nil || discRes.IsError {
+		t.Fatalf("bitrix_discover_portal failed: %v, res: %+v", err, discRes)
+	}
+	discText := discRes.Content[0].(mcpproto.TextContent).Text
+	if !strings.Contains(discText, "Invoice SPA") {
+		t.Errorf("expected Invoice SPA in discover response, got: %s", discText)
+	}
+
+	// 2. Search Items
+	searchReq := mcpproto.CallToolRequest{}
+	searchReq.Params.Name = "bitrix_search_items"
+	searchReq.Params.Arguments = map[string]any{
+		"connectionId": conn.ID,
+		"entityTypeId": 2,
+		"limit":        10,
+	}
+	searchRes, err := inProc.CallTool(ctx, searchReq)
+	if err != nil || searchRes.IsError {
+		t.Fatalf("bitrix_search_items failed: %v, res: %+v", err, searchRes)
+	}
+	searchText := searchRes.Content[0].(mcpproto.TextContent).Text
+	if !strings.Contains(searchText, "Test Item 1") {
+		t.Errorf("expected Test Item 1 in search response, got: %s", searchText)
+	}
+
+	// 3. Prepare Create Item
+	prepReq := mcpproto.CallToolRequest{}
+	prepReq.Params.Name = "bitrix_prepare_create_item"
+	prepReq.Params.Arguments = map[string]any{
+		"connectionId": conn.ID,
+		"entityTypeId": 2,
+		"fields":       map[string]any{"TITLE": "Brand New Deal"},
+	}
+	prepRes, err := inProc.CallTool(ctx, prepReq)
+	if err != nil || prepRes.IsError {
+		t.Fatalf("bitrix_prepare_create_item failed: %v, res: %+v", err, prepRes)
+	}
+	prepText := prepRes.Content[0].(mcpproto.TextContent).Text
+	var prepObj map[string]any
+	_ = json.Unmarshal([]byte(prepText), &prepObj)
+	opID, _ := prepObj["operation_id"].(string)
+	if opID == "" {
+		t.Fatalf("expected operation_id in prep response: %s", prepText)
+	}
+
+	// 4. List Pending Operations
+	listReq := mcpproto.CallToolRequest{}
+	listReq.Params.Name = "bitrix_list_pending_operations"
+	listReq.Params.Arguments = map[string]any{"connectionId": conn.ID}
+	listRes, err := inProc.CallTool(ctx, listReq)
+	if err != nil || listRes.IsError {
+		t.Fatalf("bitrix_list_pending_operations failed: %v, res: %+v", err, listRes)
+	}
+	listText := listRes.Content[0].(mcpproto.TextContent).Text
+	if !strings.Contains(listText, opID) {
+		t.Errorf("expected opID %s in list pending operations: %s", opID, listText)
+	}
+
+	// 5. Confirm Operation
+	confReq := mcpproto.CallToolRequest{}
+	confReq.Params.Name = "bitrix_confirm_operation"
+	confReq.Params.Arguments = map[string]any{"operationId": opID}
+	confRes, err := inProc.CallTool(ctx, confReq)
+	if err != nil || confRes.IsError {
+		t.Fatalf("bitrix_confirm_operation failed: %v, res: %+v", err, confRes)
+	}
+	confText := confRes.Content[0].(mcpproto.TextContent).Text
+	if !strings.Contains(confText, "completed") {
+		t.Errorf("expected completed status in confirm response: %s", confText)
+	}
+
+	// 6. Test Scoped Server isolates connection access
+	scopedSrv := mcp.NewServer(st, schema, crmSvc, ops, conn.ID)
+	scopedInProc, err := client.NewInProcessClient(scopedSrv)
+	if err != nil {
+		t.Fatalf("NewInProcessClient failed: %v", err)
+	}
+	defer scopedInProc.Close()
+	if err := scopedInProc.Start(ctx); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	if _, err := scopedInProc.Initialize(ctx, initReq); err != nil {
+		t.Fatalf("Initialize failed: %v", err)
+	}
+
+	// Calling with another connection ID should be rejected
+	badReq := mcpproto.CallToolRequest{}
+	badReq.Params.Name = "bitrix_discover_portal"
+	badReq.Params.Arguments = map[string]any{"connectionId": "wrong-connection-id"}
+	badRes, err := scopedInProc.CallTool(ctx, badReq)
+	if err != nil {
+		t.Fatalf("unexpected transport error: %v", err)
+	}
+	if !badRes.IsError {
+		t.Fatalf("expected error when accessing unauthorized connection")
+	}
+	badText := badRes.Content[0].(mcpproto.TextContent).Text
+	if !strings.Contains(badText, "CONNECTION_ACCESS_DENIED") {
+		t.Errorf("expected CONNECTION_ACCESS_DENIED error code, got: %s", badText)
 	}
 }
 

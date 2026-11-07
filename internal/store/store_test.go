@@ -358,4 +358,154 @@ func TestStore_McpOAuthLifecycleAndPruning(t *testing.T) {
 	}
 }
 
+func TestStore_SchemaCache(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.NewStore(":memory:", testKeyHex)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+	if err := st.Migrate(ctx, nil); err != nil {
+		t.Fatalf("migrate failed: %v", err)
+	}
+
+	conn, err := st.UpsertConnection(ctx, store.UpsertConnectionInput{
+		Domain:         "example.bitrix24.com",
+		MemberID:       "member-cache",
+		BitrixUserID:   "1",
+		ClientEndpoint: "https://example.bitrix24.com/rest/",
+		AccessToken:    "acc",
+		RefreshToken:   "ref",
+		Scope:          "crm",
+		ExpiresAt:      time.Now().Add(time.Hour),
+		Mode:           config.ModeReadOnly,
+	})
+	if err != nil {
+		t.Fatalf("UpsertConnection failed: %v", err)
+	}
+
+	payload := []map[string]any{{"entityTypeId": float64(2), "title": "Deal"}}
+	if err := st.SetSchemaCache(ctx, conn.ID, "entity-types", payload); err != nil {
+		t.Fatalf("SetSchemaCache failed: %v", err)
+	}
+
+	var got []map[string]any
+	found, err := st.GetSchemaCache(ctx, conn.ID, "entity-types", 60, &got)
+	if err != nil || !found || len(got) != 1 || got[0]["title"] != "Deal" {
+		t.Fatalf("expected cached entity-types, found=%v got=%+v err=%v", found, got, err)
+	}
+
+	cleared, err := st.ClearSchemaCache(ctx, conn.ID)
+	if err != nil || cleared != 1 {
+		t.Fatalf("expected 1 cleared entry, got %d err=%v", cleared, err)
+	}
+
+	foundAfter, err := st.GetSchemaCache(ctx, conn.ID, "entity-types", 60, &got)
+	if err != nil || foundAfter {
+		t.Errorf("expected cache miss after ClearSchemaCache, found=%v err=%v", foundAfter, err)
+	}
+}
+
+func TestStore_PendingOperationsAndAuditLogs(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.NewStore(":memory:", testKeyHex)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+	if err := st.Migrate(ctx, nil); err != nil {
+		t.Fatalf("migrate failed: %v", err)
+	}
+
+	conn, err := st.UpsertConnection(ctx, store.UpsertConnectionInput{
+		Domain:         "example.bitrix24.com",
+		MemberID:       "member-ops",
+		BitrixUserID:   "1",
+		ClientEndpoint: "https://example.bitrix24.com/rest/",
+		AccessToken:    "acc",
+		RefreshToken:   "ref",
+		Scope:          "crm",
+		ExpiresAt:      time.Now().Add(time.Hour),
+		Mode:           config.ModeWriteWithConfirmation,
+	})
+	if err != nil {
+		t.Fatalf("UpsertConnection failed: %v", err)
+	}
+
+	// 1. Create pending operation
+	op, err := st.CreatePendingOperation(ctx, store.CreatePendingOperationInput{
+		ConnectionID:  conn.ID,
+		OperationType: "create_item",
+		Method:        "crm.item.add",
+		Params:        map[string]any{"entityTypeId": 2, "fields": map[string]any{"title": "Deal 1"}},
+		HumanSummary:  "Create Deal 1",
+		ExpiresAt:     time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("CreatePendingOperation failed: %v", err)
+	}
+	if op.Status != "pending" || op.Method != "crm.item.add" {
+		t.Fatalf("unexpected op: %+v", op)
+	}
+
+	// 2. Claim pending operation
+	claimed, err := st.ClaimPendingOperation(ctx, op.ID)
+	if err != nil || claimed == nil {
+		t.Fatalf("ClaimPendingOperation failed: %v", err)
+	}
+	if claimed.Status != "executing" {
+		t.Errorf("expected status 'executing', got %s", claimed.Status)
+	}
+	// Re-claim must return nil
+	reclaimed, err := st.ClaimPendingOperation(ctx, op.ID)
+	if err != nil || reclaimed != nil {
+		t.Errorf("expected re-claim to return nil, got %+v err=%v", reclaimed, err)
+	}
+
+	// 3. Complete pending operation
+	if err := st.CompletePendingOperation(ctx, op.ID, map[string]any{"id": 42}); err != nil {
+		t.Fatalf("CompletePendingOperation failed: %v", err)
+	}
+	completed, err := st.GetPendingOperation(ctx, op.ID)
+	if err != nil || completed.Status != "completed" {
+		t.Fatalf("expected completed op, got %+v err=%v", completed, err)
+	}
+
+	// 4. Cancel pending operation
+	op2, err := st.CreatePendingOperation(ctx, store.CreatePendingOperationInput{
+		ConnectionID:  conn.ID,
+		OperationType: "update_item",
+		Method:        "crm.item.update",
+		Params:        map[string]any{"entityTypeId": 2, "id": 42},
+		HumanSummary:  "Update Deal",
+		ExpiresAt:     time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("CreatePendingOperation 2 failed: %v", err)
+	}
+	cancelled, err := st.CancelPendingOperation(ctx, op2.ID)
+	if err != nil || cancelled == nil || cancelled.Status != "cancelled" {
+		t.Fatalf("expected cancelled op, got %+v err=%v", cancelled, err)
+	}
+
+	// 5. Audit logs
+	if err := st.RecordAuditLog(ctx, store.RecordAuditLogInput{
+		ConnectionID: conn.ID,
+		OperationID:  op.ID,
+		Action:       "create_item",
+		Outcome:      "completed",
+		Details:      map[string]any{"method": "crm.item.add"},
+	}); err != nil {
+		t.Fatalf("RecordAuditLog failed: %v", err)
+	}
+
+	// 6. List pending operations
+	listed, err := st.ListPendingOperations(ctx, &conn.ID)
+	if err != nil || len(listed) != 2 {
+		t.Fatalf("expected 2 listed ops, got %d err=%v", len(listed), err)
+	}
+}
+
+
+
 

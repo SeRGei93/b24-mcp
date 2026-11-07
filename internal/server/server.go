@@ -44,6 +44,10 @@ type Server struct {
 	oauth         *bitrix.OAuthService
 	tokens        *bitrix.TokenManager
 	mcpOAuth      *mcp.OAuthService
+	restClient    *bitrix.RestClient
+	schema        *bitrix.SchemaDiscovery
+	crm           *bitrix.CrmService
+	ops           *bitrix.OperationService
 	limiter       *WindowRateLimiter
 	logger        *config.Logger
 	allowedOrigin string
@@ -63,12 +67,26 @@ func NewHandler(
 		allowedOrigin = parsedOrigin.Scheme + "://" + parsedOrigin.Host
 	}
 
+	var httpClient *http.Client
+	if oauth != nil {
+		httpClient = oauth.HTTPClient()
+	}
+	rc := bitrix.NewRestClient(cfg, tokens, logger, httpClient)
+	schema := bitrix.NewSchemaDiscovery(cfg, st, rc)
+	crm := bitrix.NewCrmService(cfg, rc)
+	guard := bitrix.NewPolicyGuard()
+	ops := bitrix.NewOperationService(cfg, st, guard, rc)
+
 	s := &Server{
 		cfg:           cfg,
 		store:         st,
 		oauth:         oauth,
 		tokens:        tokens,
 		mcpOAuth:      mcp.NewOAuthService(cfg, st),
+		restClient:    rc,
+		schema:        schema,
+		crm:           crm,
+		ops:           ops,
 		limiter:       NewWindowRateLimiter(8192),
 		logger:        logger,
 		allowedOrigin: allowedOrigin,
@@ -575,7 +593,7 @@ func (s *Server) handleMCPPost(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, err)
 		return
 	}
-	mcpSrv := mcp.NewServer(s.store, access.ConnectionID)
+	mcpSrv := mcp.NewServer(s.store, s.schema, s.crm, s.ops, access.ConnectionID)
 	streamSrv := mcpserver.NewStreamableHTTPServer(
 		mcpSrv,
 		mcpserver.WithStateLess(true),

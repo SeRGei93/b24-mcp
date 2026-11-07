@@ -46,13 +46,19 @@ func run() error {
 		return err
 	}
 
+	oauth := bitrix.NewOAuthService(cfg, st, nil)
+	tokens := bitrix.NewTokenManager(st, oauth, logger)
+	rc := bitrix.NewRestClient(cfg, tokens, logger, oauth.HTTPClient())
+	schema := bitrix.NewSchemaDiscovery(cfg, st, rc)
+	crm := bitrix.NewCrmService(cfg, rc)
+	guard := bitrix.NewPolicyGuard()
+	ops := bitrix.NewOperationService(cfg, st, guard, rc)
+
 	if cfg.Transport == "stdio" {
-		mcpSrv := mcp.NewServer(st, "")
+		mcpSrv := mcp.NewServer(st, schema, crm, ops, "")
 		return mcpserver.ServeStdio(mcpSrv)
 	}
 
-	oauth := bitrix.NewOAuthService(cfg, st, nil)
-	tokens := bitrix.NewTokenManager(st, oauth, logger)
 	handler := server.NewHandler(cfg, st, oauth, tokens, logger)
 
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)

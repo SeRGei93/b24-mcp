@@ -196,6 +196,32 @@ func (s *OAuthService) CreateAuthorizationURL(
 	return u.String(), nil
 }
 
+func (s *OAuthService) CreateMcpAuthorizationURL(ctx context.Context, mcpRequestHash string) (string, error) {
+	domain, err := s.resolveAuthorizationDomain(ctx)
+	if err != nil {
+		return "", err
+	}
+	return s.CreateAuthorizationURL(ctx, domain, s.cfg.DefaultMode, mcpRequestHash)
+}
+
+func (s *OAuthService) resolveAuthorizationDomain(ctx context.Context) (string, error) {
+	if s.cfg.BitrixPortalDomain != "" {
+		return NormalizePortalDomain(s.cfg.BitrixPortalDomain, s.allowedPortalDomains())
+	}
+	active, err := s.resolveInstallationAllowedDomains(ctx)
+	if err != nil {
+		return "", err
+	}
+	if len(active) == 1 {
+		return NormalizePortalDomain(active[0], s.allowedPortalDomains())
+	}
+	return "", config.NewAppError(
+		"Install the local Bitrix24 application first or configure BITRIX_PORTAL_DOMAIN",
+		"BITRIX_PORTAL_NOT_CONFIGURED",
+		http.StatusServiceUnavailable,
+	)
+}
+
 func (s *OAuthService) HandleCallbackWithContext(ctx context.Context, input CallbackInput) (*CallbackResult, error) {
 	if input.State == "" {
 		return nil, config.NewAuthenticationError("OAuth callback is missing state")

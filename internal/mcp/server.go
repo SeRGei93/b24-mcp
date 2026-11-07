@@ -46,6 +46,16 @@ func NewServer(st *store.Store, authorizedConnectionID string) *mcpserver.MCPSer
 	return srv
 }
 
+func ResolveConnectionID(authorizedConnectionID, requestedConnectionID string) (string, error) {
+	if authorizedConnectionID != "" && requestedConnectionID != "" && requestedConnectionID != authorizedConnectionID {
+		return "", config.NewAppError("This MCP token is not authorized for that Bitrix24 connection", "CONNECTION_ACCESS_DENIED", 403)
+	}
+	if authorizedConnectionID != "" {
+		return authorizedConnectionID, nil
+	}
+	return requestedConnectionID, nil
+}
+
 func executeTool(work func() (any, error)) *mcpproto.CallToolResult {
 	val, err := work()
 	if err != nil {

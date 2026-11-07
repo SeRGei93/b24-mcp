@@ -192,3 +192,170 @@ func TestStore_ConnectionsAndOAuthStates(t *testing.T) {
 	}
 }
 
+func TestStore_McpOAuthLifecycleAndPruning(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.NewStore(":memory:", testKeyHex)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+	if err := st.Migrate(ctx, nil); err != nil {
+		t.Fatalf("migrate failed: %v", err)
+	}
+
+	conn, err := st.UpsertConnection(ctx, store.UpsertConnectionInput{
+		Domain:         "example.bitrix24.com",
+		MemberID:       "member-oauth",
+		BitrixUserID:   "7",
+		ClientEndpoint: "https://example.bitrix24.com/rest/",
+		AccessToken:    "enc-access",
+		RefreshToken:   "enc-refresh",
+		Scope:          "crm",
+		ExpiresAt:      time.Now().Add(time.Hour),
+		Mode:           config.ModeReadOnly,
+	})
+	if err != nil {
+		t.Fatalf("UpsertConnection failed: %v", err)
+	}
+
+	// Register an unused client created > 30 days ago to verify pruning on next registration
+	staleClient := store.McpOAuthClient{
+		ClientID:                "stale-client",
+		RedirectURIs:            []string{"http://127.0.0.1:3000/callback"},
+		TokenEndpointAuthMethod: "none",
+		GrantTypes:              []string{"authorization_code", "refresh_token"},
+		ResponseTypes:           []string{"code"},
+		ClientName:              "Stale Client",
+		Scope:                   "mcp:tools",
+		CreatedAt:               time.Now().Add(-31 * 24 * time.Hour),
+	}
+	if err := st.RegisterOAuthClient(ctx, staleClient); err != nil {
+		t.Fatalf("RegisterOAuthClient (stale) failed: %v", err)
+	}
+
+	// Register active client -> should prune stale-client
+	activeClient := store.McpOAuthClient{
+		ClientID:                "client-1",
+		RedirectURIs:            []string{"http://127.0.0.1:3000/callback"},
+		TokenEndpointAuthMethod: "none",
+		GrantTypes:              []string{"authorization_code", "refresh_token"},
+		ResponseTypes:           []string{"code"},
+		ClientName:              "SQLite Client",
+		Scope:                   "mcp:tools",
+		CreatedAt:               time.Now(),
+	}
+	if err := st.RegisterOAuthClient(ctx, activeClient); err != nil {
+		t.Fatalf("RegisterOAuthClient (active) failed: %v", err)
+	}
+
+	pruned, err := st.GetOAuthClient(ctx, "stale-client")
+	if err != nil || pruned != nil {
+		t.Errorf("expected stale-client to be pruned, got %+v err=%v", pruned, err)
+	}
+
+	gotClient, err := st.GetOAuthClient(ctx, "client-1")
+	if err != nil || gotClient == nil || len(gotClient.RedirectURIs) != 1 || gotClient.RedirectURIs[0] != "http://127.0.0.1:3000/callback" {
+		t.Fatalf("unexpected client-1: %+v err=%v", gotClient, err)
+	}
+
+	// Create authorization request
+	err = st.CreateAuthorizationRequest(ctx, store.McpOAuthAuthorizationRequest{
+		RequestHash:   "req-hash-1",
+		ClientID:      "client-1",
+		RedirectURI:   "http://127.0.0.1:3000/callback",
+		State:         "state-1",
+		CodeChallenge: "challenge-1",
+		Resource:      "https://mcp.example.com/mcp",
+		Scope:         "mcp:tools",
+		ExpiresAt:     time.Now().Add(time.Minute),
+		Attempts:      0,
+	})
+	if err != nil {
+		t.Fatalf("CreateAuthorizationRequest failed: %v", err)
+	}
+
+	attempts, err := st.IncrementAuthorizationAttempts(ctx, "req-hash-1")
+	if err != nil || attempts != 1 {
+		t.Errorf("expected attempts=1, got %d err=%v", attempts, err)
+	}
+
+	consumedReq, err := st.ConsumeAuthorizationRequestAndCreateCode(
+		ctx,
+		"req-hash-1",
+		"code-hash-1",
+		time.Now().Add(time.Minute),
+		conn.ID,
+	)
+	if err != nil || consumedReq == nil || consumedReq.ClientID != "client-1" || consumedReq.State != "state-1" {
+		t.Fatalf("unexpected consumedReq: %+v err=%v", consumedReq, err)
+	}
+
+	// Single-use authorization code consumption
+	consumedCode, err := st.ConsumeAuthorizationCode(ctx, "code-hash-1")
+	if err != nil || consumedCode == nil || consumedCode.ConnectionID != conn.ID {
+		t.Fatalf("unexpected consumedCode: %+v err=%v", consumedCode, err)
+	}
+	secondCode, err := st.ConsumeAuthorizationCode(ctx, "code-hash-1")
+	if err != nil || secondCode != nil {
+		t.Errorf("expected second ConsumeAuthorizationCode to return nil, got %+v err=%v", secondCode, err)
+	}
+
+	// Issue token pair, find, rotate, and revoke
+	err = st.IssueTokenPair(ctx, store.NewMcpOAuthTokenRecord{
+		AccessTokenHash:  "access-1",
+		RefreshTokenHash: "refresh-1",
+		ClientID:         "client-1",
+		ConnectionID:     conn.ID,
+		Resource:         "https://mcp.example.com/mcp",
+		Scope:            "mcp:tools",
+		AccessExpiresAt:  time.Now().Add(time.Hour),
+		RefreshExpiresAt: time.Now().Add(24 * time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("IssueTokenPair failed: %v", err)
+	}
+
+	foundAccess, err := st.FindAccessToken(ctx, "access-1")
+	if err != nil || foundAccess == nil || foundAccess.ConnectionID != conn.ID {
+		t.Fatalf("expected access-1 to be found, got %+v err=%v", foundAccess, err)
+	}
+
+	rotated, err := st.RotateRefreshToken(ctx, "refresh-1", "client-1", "https://mcp.example.com/mcp", store.NewMcpOAuthTokenRecord{
+		AccessTokenHash:  "access-2",
+		RefreshTokenHash: "refresh-2",
+		ClientID:         "client-1",
+		ConnectionID:     conn.ID,
+		Resource:         "https://mcp.example.com/mcp",
+		Scope:            "mcp:tools",
+		AccessExpiresAt:  time.Now().Add(time.Hour),
+		RefreshExpiresAt: time.Now().Add(24 * time.Hour),
+	})
+	if err != nil || rotated == nil || rotated.AccessTokenHash != "access-1" {
+		t.Fatalf("expected refresh-1 to rotate, got %+v err=%v", rotated, err)
+	}
+
+	// Old access token and old refresh token must now be invalid
+	oldAccess, err := st.FindAccessToken(ctx, "access-1")
+	if err != nil || oldAccess != nil {
+		t.Errorf("expected old access-1 to be revoked after rotation, got %+v err=%v", oldAccess, err)
+	}
+	reusedRefresh, err := st.FindRefreshToken(ctx, "refresh-1", "client-1", "https://mcp.example.com/mcp")
+	if err != nil || reusedRefresh != nil {
+		t.Errorf("expected old refresh-1 to be unavailable after rotation, got %+v err=%v", reusedRefresh, err)
+	}
+
+	// New access token must be valid until revoked
+	newAccess, err := st.FindAccessToken(ctx, "access-2")
+	if err != nil || newAccess == nil || newAccess.AccessTokenHash != "access-2" {
+		t.Fatalf("expected access-2 to be valid, got %+v err=%v", newAccess, err)
+	}
+	if err := st.RevokeToken(ctx, "access-2"); err != nil {
+		t.Fatalf("RevokeToken failed: %v", err)
+	}
+	revokedAccess, err := st.FindAccessToken(ctx, "access-2")
+	if err != nil || revokedAccess != nil {
+		t.Errorf("expected access-2 to be nil after revoke, got %+v err=%v", revokedAccess, err)
+	}
+}
+
+

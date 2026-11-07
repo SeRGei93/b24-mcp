@@ -2,7 +2,10 @@ package mcp_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -127,4 +130,123 @@ func TestMCPServer_ListConnectionsAndIsolation(t *testing.T) {
 	if strings.Contains(scopedStr, "other.bitrix24.com") {
 		t.Errorf("expected other.bitrix24.com to be filtered out: %s", scopedStr)
 	}
+
+	// 3. ResolveConnectionID denies access to another connection
+	if _, err := mcp.ResolveConnectionID(first.ID, "00000000-0000-4000-8000-000000000002"); err == nil || !strings.Contains(err.Error(), "not authorized") {
+		t.Errorf("expected CONNECTION_ACCESS_DENIED when requesting another connection, got %v", err)
+	}
+	resolved, err := mcp.ResolveConnectionID(first.ID, first.ID)
+	if err != nil || resolved != first.ID {
+		t.Errorf("expected ResolveConnectionID to allow matching connection, got %q err=%v", resolved, err)
+	}
 }
+
+func TestMcpOAuthService_LoopbackAndPKCEAndRotation(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. RedirectURIMatches & IsSafeOAuthRedirectURI
+	if !mcp.RedirectURIMatches("http://127.0.0.1:49152/callback", "http://127.0.0.1:3000/callback") {
+		t.Errorf("expected loopback port flexibility on 127.0.0.1")
+	}
+	if mcp.RedirectURIMatches("http://localhost:49152/callback", "http://127.0.0.1:3000/callback") {
+		t.Errorf("expected localhost vs 127.0.0.1 mismatch")
+	}
+	if mcp.RedirectURIMatches("https://client.example/callback", "https://client.example/other") {
+		t.Errorf("expected path mismatch to fail")
+	}
+	if !mcp.IsSafeOAuthRedirectURI("http://[::1]:43123/callback") {
+		t.Errorf("expected IPv6 loopback redirect URI to be safe")
+	}
+	if mcp.IsSafeOAuthRedirectURI("http://public.example.com/callback") {
+		t.Errorf("expected non-loopback HTTP redirect URI to be rejected")
+	}
+
+	cfg, err := config.Load(map[string]string{
+		"APP_URL":              "https://mcp.example.com",
+		"DATABASE_PATH":        ":memory:",
+		"BITRIX_CLIENT_ID":     "client-id",
+		"BITRIX_CLIENT_SECRET": "client-secret",
+		"MCP_AUTH_TOKEN":       strings.Repeat("a", 32),
+		"TOKEN_ENCRYPTION_KEY": testMCPKeyHex,
+	})
+	if err != nil {
+		t.Fatalf("failed to load config: %v", err)
+	}
+	st, err := store.NewStore(cfg.DatabasePath, cfg.TokenEncryptionKey)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+	if err := st.Migrate(ctx, nil); err != nil {
+		t.Fatalf("migrate failed: %v", err)
+	}
+
+	conn, err := st.UpsertConnection(ctx, store.UpsertConnectionInput{
+		Domain:         "example.bitrix24.com",
+		MemberID:       "member-1",
+		BitrixUserID:   "1",
+		ClientEndpoint: "https://example.bitrix24.com/rest/",
+		AccessToken:    "acc",
+		RefreshToken:   "ref",
+		Scope:          "crm",
+		ExpiresAt:      time.Now().Add(time.Hour),
+		Mode:           config.ModeReadOnly,
+	})
+	if err != nil {
+		t.Fatalf("UpsertConnection failed: %v", err)
+	}
+
+	svc := mcp.NewOAuthService(cfg, st)
+
+	// 2. Reject unsafe redirect registration
+	if _, err := svc.RegisterClient(ctx, mcp.ClientRegistrationInput{
+		RedirectURIs: []string{"http://public.example.com/callback"},
+	}); err == nil {
+		t.Fatalf("expected unsafe redirect registration to fail")
+	}
+
+	// 3. Register client, begin authorization, complete Bitrix auth, and reject mismatched PKCE verifier
+	reg, err := svc.RegisterClient(ctx, mcp.ClientRegistrationInput{
+		RedirectURIs: []string{"https://client.example.com/callback"},
+		ClientName:   "Security test",
+	})
+	if err != nil {
+		t.Fatalf("RegisterClient failed: %v", err)
+	}
+
+	verifier := strings.Repeat("z", 64)
+	sum := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+
+	pending, err := svc.BeginAuthorization(ctx, mcp.AuthorizationInput{
+		ResponseType:        "code",
+		ClientID:            reg.ClientID,
+		RedirectURI:         "https://client.example.com/callback",
+		CodeChallenge:       challenge,
+		CodeChallengeMethod: "S256",
+		Resource:            "https://mcp.example.com/mcp",
+	})
+	if err != nil {
+		t.Fatalf("BeginAuthorization failed: %v", err)
+	}
+
+	cbURLStr, err := svc.CompleteBitrixAuthorization(ctx, pending.RequestHash, conn.ID)
+	if err != nil {
+		t.Fatalf("CompleteBitrixAuthorization failed: %v", err)
+	}
+	cbURL, err := url.Parse(cbURLStr)
+	if err != nil {
+		t.Fatalf("invalid callback URL: %v", err)
+	}
+	authCode := cbURL.Query().Get("code")
+
+	if _, err := svc.ExchangeAuthorizationCode(ctx, mcp.AuthorizationCodeExchangeInput{
+		ClientID:     reg.ClientID,
+		Code:         authCode,
+		CodeVerifier: strings.Repeat("x", 64),
+		RedirectURI:  "https://client.example.com/callback",
+	}); err == nil {
+		t.Fatalf("expected mismatched PKCE verifier to be rejected")
+	}
+}
+

@@ -324,3 +324,84 @@ func TestTokenManager_DeduplicatesRefreshAndMarksRevoked(t *testing.T) {
 		t.Errorf("expected connection status 'revoked', got %q", afterRevoke.Status)
 	}
 }
+
+func TestOAuthService_CreateMcpAuthorizationURLAndContinuationError(t *testing.T) {
+	ctx := context.Background()
+	_, st, oauth, _ := newTestEnv(t, "", "client-id", nil)
+
+	// 1. Without BITRIX_PORTAL_DOMAIN or active connection -> 503 BITRIX_PORTAL_NOT_CONFIGURED
+	if _, err := oauth.CreateMcpAuthorizationURL(ctx, ""); err == nil || !strings.Contains(err.Error(), "BITRIX_PORTAL_DOMAIN") {
+		t.Fatalf("expected BITRIX_PORTAL_NOT_CONFIGURED error when no portal is configured, got %v", err)
+	}
+
+	// 2. Seed a single active connection and an MCP authorization request
+	_, err := st.UpsertConnection(ctx, store.UpsertConnectionInput{
+		Domain:         "active.bitrix24.com",
+		MemberID:       "member-active",
+		BitrixUserID:   "1",
+		ClientEndpoint: "https://active.bitrix24.com/rest/",
+		AccessToken:    "acc",
+		RefreshToken:   "ref",
+		Scope:          "crm",
+		ExpiresAt:      time.Now().Add(time.Hour),
+		Mode:           config.ModeReadOnly,
+	})
+	if err != nil {
+		t.Fatalf("UpsertConnection failed: %v", err)
+	}
+	if err := st.RegisterOAuthClient(ctx, store.McpOAuthClient{
+		ClientID:                "mcp-client",
+		RedirectURIs:            []string{"http://127.0.0.1:3000/cb"},
+		TokenEndpointAuthMethod: "none",
+		GrantTypes:              []string{"authorization_code"},
+		ResponseTypes:           []string{"code"},
+		Scope:                   "mcp:tools",
+		CreatedAt:               time.Now(),
+	}); err != nil {
+		t.Fatalf("RegisterOAuthClient failed: %v", err)
+	}
+	if err := st.CreateAuthorizationRequest(ctx, store.McpOAuthAuthorizationRequest{
+		RequestHash:   "req-hash-cont",
+		ClientID:      "mcp-client",
+		RedirectURI:   "http://127.0.0.1:3000/cb",
+		State:         "client-state",
+		CodeChallenge: "challenge",
+		Resource:      "https://mcp.example.com/mcp",
+		Scope:         "mcp:tools",
+		ExpiresAt:     time.Now().Add(time.Minute),
+	}); err != nil {
+		t.Fatalf("CreateAuthorizationRequest failed: %v", err)
+	}
+
+	authURLStr, err := oauth.CreateMcpAuthorizationURL(ctx, "req-hash-cont")
+	if err != nil {
+		t.Fatalf("CreateMcpAuthorizationURL failed: %v", err)
+	}
+	parsedURL, err := url.Parse(authURLStr)
+	if err != nil || parsedURL.Host != "active.bitrix24.com" {
+		t.Fatalf("expected redirect to active.bitrix24.com, got %q err=%v", authURLStr, err)
+	}
+	stateParam := parsedURL.Query().Get("state")
+
+	// 3. Denied callback with mcp_request_hash returns ContinuationError with access_denied
+	_, cbErr := oauth.HandleCallbackWithContext(ctx, bitrix.CallbackInput{
+		State: stateParam,
+		Error: "access_denied",
+	})
+	var contErr *bitrix.ContinuationError
+	if cbErr == nil || !strings.Contains(cbErr.Error(), "Bitrix24 authorization was denied") {
+		t.Fatalf("expected continuation error on denied callback, got %v", cbErr)
+	}
+	if ok := errorsAsContinuation(cbErr, &contErr); !ok || contErr.McpRequestHash != "req-hash-cont" || contErr.OAuthErrorCode != "access_denied" {
+		t.Errorf("unexpected ContinuationError: %+v", contErr)
+	}
+}
+
+func errorsAsContinuation(err error, target **bitrix.ContinuationError) bool {
+	if c, ok := err.(*bitrix.ContinuationError); ok {
+		*target = c
+		return true
+	}
+	return false
+}
+

@@ -1,80 +1,54 @@
-# bitrix24-mcp-server
+# Битрикс 24 MCP
 
-Self-hosted [Model Context Protocol](https://modelcontextprotocol.io/) server for Bitrix24 CRM and smart-process automations (SPAs). Written in pure Go (`CGO_ENABLED=0`) using `modernc.org/sqlite` for zero external database setup.
+Self-hosted [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) сервер для **Битрикс24 CRM** и смарт-процессов (SPA). Написан на чистом Go (`CGO_ENABLED=0`) со встроенной базой данных SQLite (`modernc.org/sqlite`) — не требует внешних СУБД или дополнительных сервисов.
 
-## Features
+## Основные возможности
 
-- **Bitrix24 OAuth 2.0**: Automatic authorization flow, token refresh, and AES-256-GCM encryption at rest in SQLite.
-- **MCP OAuth 2.1**: Dynamic client registration (DCR), S256 PKCE, and static bearer token (`MCP_AUTH_TOKEN`) fallback.
-- **CRM & SPA Discovery**: Built-in entities (Lead, Deal, Contact, Company, Invoice) and custom SPAs (`crm.type.list`), fields, categories/funnels, and stages with schema caching.
-- **Two-Step Writes**: Create, update, and stage-move operations are prepared first and executed only after explicit confirmation (`bitrix_confirm_operation`).
+- **CRM и смарт-процессы (SPA)**: автоматическое обнаружение системных сущностей (Лиды, Сделки, Контакты, Компании, Счета) и пользовательских смарт-процессов, их полей, воронок и стадий с кэшированием схемы.
+- **Пакетные операции (Batch API)**: прозрачная пагинация и пакетная выгрузка элементов и товарных позиций (`crm.item.productrow.list`) через `batch`-запросы Битрикс24.
+- **Безопасная двухэтапная запись**: режим `read_only` по умолчанию; операции создания, обновления и смены стадии (`write_with_confirmation`) сначала подготавливаются и выполняются только после явного подтверждения (`bitrix_confirm_operation`).
+- **OAuth 2.1 + PKCE и шифрование**: встроенный сервер авторизации MCP (Dynamic Client Registration, S256 PKCE, экран согласия с защитой от CSRF), сквозная привязка к OAuth 2.0 Битрикс24 и хранение токенов в SQLite с шифрованием **AES-256-GCM**.
 
-## Quick Start
+## Защитный шлюз vs прямой вебхук
 
-Requirements: **Go 1.24+** and a Bitrix24 OAuth local/public application with `crm` scope.
+Сервер работает как **интеллектуальный шлюз безопасности (Security Proxy & Gateway)** между LLM и Битрикс24, устраняя ключевые риски прямого подключения через входящий вебхук:
+
+- **Защита от галлюцинаций и prompt injection**: любые операции записи требуют подтверждения человеком (`Human-in-the-loop`). Деструктивные методы (`delete`, изменение настроек и прав) исключены из сервера в принципе.
+- **Безопасность токенов**: вместо вечного открытого секрета вебхука в URL — полноценный OAuth 2.0 с автоматической ротацией короткоживущих токенов и шифрованием на диске (AES-256-GCM).
+- **Изоляция пользователей**: через MCP OAuth 2.1 каждый агент или сотрудник работает строго под своей учётной записью, не имея доступа к чужим данным, а все действия фиксируются в аудит-логе.
+- **Защита от лимитов API (Rate Limits)**: пакетный Batch-движок объединяет запросы пачками до 50 штук (защищая от лимита Битрикс24 в 2 req/s), автоматически пагинирует данные и кэширует схему CRM в локальной SQLite.
+
+## Быстрый старт
 
 ```bash
 cp .env.example .env
+# Заполните APP_URL, BITRIX_CLIENT_ID, BITRIX_CLIENT_SECRET, TOKEN_ENCRYPTION_KEY и MCP_AUTH_TOKEN в .env
+
 CGO_ENABLED=0 go build -o b24 ./cmd/b24
 ./b24
 ```
 
-Configure your Bitrix24 local application paths:
+Или через Docker Compose:
 
-```text
-Handler path:              https://your-server.example.com/oauth/bitrix/callback
-Initial installation path: https://your-server.example.com/oauth/bitrix/install
+```bash
+docker compose up --build -d
 ```
 
-## Connect an MCP Client
+Подключение MCP-клиента (Streamable HTTP):
 
-Streamable HTTP endpoint:
-
-```text
-https://your-server.example.com/mcp
+```bash
+claude mcp add --transport http bitrix24 https://your-server.example.com/mcp
 ```
 
-- **Claude / Claude Code / Codex (OAuth 2.1)**:
-  ```bash
-  claude mcp add --transport http bitrix24 https://your-server.example.com/mcp
-  # or
-  codex mcp add bitrix24 --url https://your-server.example.com/mcp && codex mcp login bitrix24
-  ```
-- **Static Bearer Token**:
-  ```json
-  {
-    "mcpServers": {
-      "bitrix24": {
-        "url": "https://your-server.example.com/mcp",
-        "headers": {
-          "Authorization": "Bearer <MCP_AUTH_TOKEN>"
-        }
-      }
-    }
-  }
-  ```
-- **Stdio**: Set `MCP_TRANSPORT=stdio` and run `./b24`.
+## Документация
 
-## Available Tools
+Подробная документация разделена по логическим разделам в директории [`docs/`](docs/):
 
-**Read-only:**
-- `bitrix_list_connections`, `bitrix_discover_portal`, `bitrix_list_crm_entities`, `bitrix_describe_entity`
-- `bitrix_list_fields`, `bitrix_list_categories`, `bitrix_list_stages`, `bitrix_refresh_schema_cache`
-- `bitrix_search_items`, `bitrix_get_item`, `bitrix_list_product_rows`, `bitrix_list_users`
-
-**Write (requires `write_with_confirmation` mode):**
-- `bitrix_prepare_create_item`, `bitrix_prepare_update_item`, `bitrix_prepare_move_item_stage`
-- `bitrix_confirm_operation`, `bitrix_cancel_operation`, `bitrix_list_pending_operations`
-
-## Configuration
-
-| Variable | Required | Default | Description |
-| --- | --- | --- | --- |
-| `APP_URL` | yes | — | Public server URL (HTTPS, or `http://localhost` for dev) |
-| `DATABASE_PATH` | no | `./data/bitrix24-mcp.sqlite` | SQLite database file path (or `:memory:`) |
-| `BITRIX_CLIENT_ID` | yes | — | Bitrix24 OAuth app client ID |
-| `BITRIX_CLIENT_SECRET` | yes | — | Bitrix24 OAuth app client secret |
-| `BITRIX_PORTAL_DOMAIN` | no | — | Portal domain for OAuth redirect and custom domain allowlist |
-| `MCP_AUTH_TOKEN` | yes | — | Static bearer token (min 32 chars) |
-| `TOKEN_ENCRYPTION_KEY` | yes | — | 32-byte base64 or 64-char hex key for AES-256-GCM |
-| `BITRIX_MCP_DEFAULT_MODE` | no | `read_only` | `read_only` or `write_with_confirmation` |
+- [**Быстрый старт и настройка Битрикс24**](docs/getting-started.md) — создание локального приложения в Битрикс24, первый запуск и подключение AI-клиентов (Claude, Codex, Cursor).
+- [**Конфигурация и переменные окружения**](docs/configuration.md) — полный справочник переменных `.env`, таймаутов, лимитов, TTL и настроек прокси.
+- [**Аутентификация и OAuth-потоки**](docs/authentication.md) — работа MCP OAuth 2.1 (DCR + PKCE), статический `MCP_AUTH_TOKEN`, изоляция подключений и автообновление токенов Битрикс24.
+- [**Справочник MCP-инструментов**](docs/tools.md) — описание всех 18 инструментов (обнаружение схемы, поиск, чтение, товарные позиции, двухшаговая запись).
+- [**HTTP API и эндпоинты**](docs/http-api.md) — спецификация всех HTTP-маршрутов сервера, `.well-known` метаданных, колбэков Битрикс24 и лимитов запросов.
+- [**Архитектура и внутреннее устройство**](docs/architecture.md) — структура пакетов Go, устройство REST/Batch-клиента, пагинация, кэш схемы и структура таблиц SQLite.
+- [**Безопасность и модель угроз**](docs/security.md) — шифрование AES-256-GCM, хэширование токенов, защита от SSRF, политики доступа и аудит операций.
+- [**Деплой, Docker, Dokploy и разработка**](docs/deployment.md) — локальная сборка, Docker Compose, продакшн-деплой в Dokploy, GitHub Actions CI/CD и тестирование.

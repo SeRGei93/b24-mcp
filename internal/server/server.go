@@ -140,7 +140,7 @@ func (s *Server) registerRoutes() {
 func (s *Server) handleRoot(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{
 		"name":                  "bitrix24-mcp-server",
-		"version":               "0.3.1",
+		"version":               "0.1",
 		"mcp_endpoint":          "/mcp",
 		"oauth_start":           "/oauth/bitrix/start?domain=your-portal.bitrix24.com",
 		"bitrix_oauth_callback": "/oauth/bitrix/callback",

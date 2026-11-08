@@ -21,7 +21,7 @@ func NewServer(
 ) *mcpserver.MCPServer {
 	srv := mcpserver.NewMCPServer(
 		"bitrix24-mcp-server",
-		"0.3.1",
+		"0.1",
 		mcpserver.WithToolCapabilities(false),
 	)
 

@@ -599,13 +599,6 @@ func NewTokenManager(st *store.Store, oauth *OAuthService, logger *config.Logger
 	}
 }
 
-func (tm *TokenManager) Store() *store.Store {
-	if tm == nil {
-		return nil
-	}
-	return tm.store
-}
-
 func isTokenReusable(conn *store.Connection, forceRefresh bool, staleAccessToken string) bool {
 	if conn != nil && conn.IsWebhook() {
 		return true

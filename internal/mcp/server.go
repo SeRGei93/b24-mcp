@@ -274,14 +274,15 @@ func NewServer(
 	searchItemsTool := mcpproto.NewTool(
 		"bitrix_search_items",
 		mcpproto.WithTitleAnnotation("Search CRM items"),
-		mcpproto.WithDescription("Search leads, deals, contacts, companies, or SPA items with Bitrix filters and batch pagination. Set includeProductRows=true to fetch product rows for all matched items in one batch request."),
+		mcpproto.WithDescription("Search leads, deals, contacts, companies, quotes, smart invoices, or SPA items with Bitrix filters and pagination. Set includeProductRows=true to fetch product rows for all matched items in one batch request."),
 		mcpproto.WithString("connectionId", mcpproto.Description("ID returned by bitrix_list_connections after OAuth authorization"), mcpproto.Required()),
-		mcpproto.WithInteger("entityTypeId", mcpproto.Description("Bitrix CRM entityTypeId (1 lead, 2 deal, 3 contact, 4 company, or an SPA ID)"), mcpproto.Required()),
-		mcpproto.WithObject("filter", mcpproto.Description("Bitrix filter object")),
-		mcpproto.WithArray("select", mcpproto.Description("Fields to select")),
+		mcpproto.WithInteger("entityTypeId", mcpproto.Description("Bitrix CRM entityTypeId (1 lead, 2 deal, 3 contact, 4 company, 7 quote, 31 smart invoice, or an SPA ID)"), mcpproto.Required()),
+		mcpproto.WithObject("filter", mcpproto.Description("Bitrix filter object or REST 3.0 filter expression array")),
+		mcpproto.WithArray("select", mcpproto.Description("Fields to select (supports relational dot-notation such as stage.name, company.title)")),
 		mcpproto.WithObject("order", mcpproto.Description("Order map (e.g. {'id': 'ASC'})")),
-		mcpproto.WithInteger("limit", mcpproto.Description("Maximum items to return"), mcpproto.DefaultNumber(100)),
-		mcpproto.WithBoolean("includeProductRows", mcpproto.Description("Automatically batch-fetch product rows (crm.item.productrow.list) for all returned items in one request"), mcpproto.DefaultBool(false)),
+		mcpproto.WithInteger("limit", mcpproto.Description("Maximum items to return (up to 1000)"), mcpproto.DefaultNumber(100)),
+		mcpproto.WithInteger("page", mcpproto.Description("Page number for pagination (1-based)"), mcpproto.DefaultNumber(1)),
+		mcpproto.WithBoolean("includeProductRows", mcpproto.Description("Automatically batch-fetch product rows for all returned items in one request"), mcpproto.DefaultBool(false)),
 		mcpproto.WithReadOnlyHintAnnotation(true),
 		mcpproto.WithDestructiveHintAnnotation(false),
 	)
@@ -295,20 +296,17 @@ func NewServer(
 				return nil, err
 			}
 			args := req.GetArguments()
-			filter, _ := args["filter"].(map[string]any)
+			filter := args["filter"]
 			limit := bitrix.ToInt(args["limit"])
 			if limit <= 0 {
 				limit = 100
 			}
-
-			var sel []string
-			if selRaw, ok := args["select"].([]any); ok {
-				for _, s := range selRaw {
-					if str, ok := s.(string); ok && str != "" {
-						sel = append(sel, str)
-					}
-				}
+			page := bitrix.ToInt(args["page"])
+			if page <= 0 {
+				page = 1
 			}
+
+			sel := extractStringSlice(args["select"])
 
 			order := make(map[string]string)
 			if ordRaw, ok := args["order"].(map[string]any); ok {
@@ -328,6 +326,7 @@ func NewServer(
 				Select:             sel,
 				Order:              order,
 				Limit:              limit,
+				Page:               page,
 				IncludeProductRows: incRows,
 			})
 		}), nil
@@ -373,11 +372,12 @@ func NewServer(
 	getItemTool := mcpproto.NewTool(
 		"bitrix_get_item",
 		mcpproto.WithTitleAnnotation("Get CRM item(s)"),
-		mcpproto.WithDescription("Get one CRM/SPA item by id, or multiple items in a single batch call by supplying ids."),
+		mcpproto.WithDescription("Get one CRM/SPA item by id, or up to 1000 items in a single call by supplying ids."),
 		mcpproto.WithString("connectionId", mcpproto.Description("ID returned by bitrix_list_connections after OAuth authorization"), mcpproto.Required()),
 		mcpproto.WithInteger("entityTypeId", mcpproto.Description("Bitrix CRM entityTypeId"), mcpproto.Required()),
 		mcpproto.WithInteger("id", mcpproto.Description("Single CRM item ID")),
-		mcpproto.WithArray("ids", mcpproto.Description("Multiple CRM item IDs to fetch in one Bitrix24 batch request")),
+		mcpproto.WithArray("ids", mcpproto.Description("Multiple CRM item IDs (up to 1000) to fetch in one request")),
+		mcpproto.WithArray("select", mcpproto.Description("Fields to select (supports relational dot-notation such as stage.name, company.title)")),
 		mcpproto.WithReadOnlyHintAnnotation(true),
 		mcpproto.WithDestructiveHintAnnotation(false),
 	)
@@ -392,6 +392,7 @@ func NewServer(
 			}
 			args := req.GetArguments()
 			typeID := bitrix.ToInt(args["entityTypeId"])
+			sel := extractStringSlice(args["select"])
 
 			var ids []int
 			if idsRaw, ok := args["ids"].([]any); ok {
@@ -403,13 +404,13 @@ func NewServer(
 			}
 
 			if len(ids) > 0 {
-				return crm.GetItems(ctx, connID, typeID, ids)
+				return crm.GetItems(ctx, connID, typeID, ids, sel)
 			}
 
 			if idVal, ok := args["id"]; ok && idVal != nil {
 				singleID := bitrix.ToInt(idVal)
 				if singleID > 0 {
-					return crm.GetItem(ctx, connID, typeID, singleID)
+					return crm.GetItem(ctx, connID, typeID, singleID, sel)
 				}
 			}
 
@@ -726,6 +727,23 @@ func ResolveConnectionID(authorizedConnectionID, requestedConnectionID string) (
 		return authorizedConnectionID, nil
 	}
 	return requestedConnectionID, nil
+}
+
+func extractStringSlice(raw any) []string {
+	switch v := raw.(type) {
+	case []string:
+		return v
+	case []any:
+		var out []string
+		for _, item := range v {
+			if s, ok := item.(string); ok && s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
 }
 
 func executeTool(work func() (any, error)) *mcpproto.CallToolResult {

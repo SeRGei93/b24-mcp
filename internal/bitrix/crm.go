@@ -3,7 +3,6 @@ package bitrix
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"regexp"
 	"slices"
@@ -27,26 +26,12 @@ var (
 	}
 )
 
-func ToOwnerTypeCode(entityTypeID int) string {
-	switch entityTypeID {
-	case 1:
-		return "L"
-	case 2:
-		return "D"
-	case 3:
-		return "C"
-	case 4:
-		return "CO"
-	case 7:
-		return "Q"
-	case 31:
-		return "SI"
-	default:
-		return fmt.Sprintf("T%x", entityTypeID)
-	}
+func toOwnerTypeCode(entityTypeID int) string {
+	meta, _ := getEntityMeta(entityTypeID)
+	return meta.ownerTypeCode
 }
 
-func NormalizeFieldName(field string) string {
+func normalizeFieldName(field string) string {
 	m := ufRegex.FindStringSubmatch(field)
 	if len(m) > 1 {
 		return "UF_CRM_" + strings.ToUpper(m[1])
@@ -59,7 +44,7 @@ func toCamelCase(s string) string {
 		return ""
 	}
 	if ufRegex.MatchString(s) {
-		return NormalizeFieldName(s)
+		return normalizeFieldName(s)
 	}
 	if strings.Contains(s, ".") {
 		parts := strings.Split(s, ".")
@@ -89,71 +74,21 @@ func toCamelCase(s string) string {
 	return res
 }
 
-func DefaultSelectForEntity(entityTypeID int) []string {
-	switch entityTypeID {
-	case 1: // Lead
-		return []string{
-			"id", "title", "name", "lastName", "companyTitle", "statusId", "stage.name",
-			"opportunity", "currencyId", "assignedById", "assignedBy.firstName", "assignedBy.lastName",
-			"createdTime", "updatedTime",
-		}
-	case 2: // Deal
-		return []string{
-			"id", "title", "stageId", "stage.name", "categoryId", "category.name",
-			"opportunity", "currencyId", "companyId", "company.title", "contactId", "contact.name",
-			"assignedById", "assignedBy.firstName", "assignedBy.lastName",
-			"begindate", "closedate", "createdTime", "updatedTime",
-		}
-	case 3: // Contact
-		return []string{
-			"id", "name", "lastName", "secondName", "companyId", "company.title",
-			"typeId", "assignedById", "assignedBy.firstName", "assignedBy.lastName",
-			"createdTime", "updatedTime",
-		}
-	case 4: // Company
-		return []string{
-			"id", "title", "companyType", "assignedById", "assignedBy.firstName", "assignedBy.lastName",
-			"createdTime", "updatedTime",
-		}
-	case 7: // Quote
-		return []string{
-			"id", "title", "statusId", "stage.name",
-			"opportunity", "currencyId", "companyId", "company.title", "contactId", "contact.name",
-			"assignedById", "assignedBy.firstName", "assignedBy.lastName",
-			"begindate", "closedate", "createdTime", "updatedTime",
-		}
-	case 31: // Smart Invoice
-		return []string{
-			"id", "title", "stageId", "stage.name", "categoryId", "category.name",
-			"opportunity", "currencyId", "companyId", "company.title", "contactId", "contact.name",
-			"assignedById", "assignedBy.firstName", "assignedBy.lastName",
-			"begindate", "closedate", "createdTime", "updatedTime",
-		}
-	default:
-		return []string{
-			"id", "title", "stageId", "stage.name", "categoryId", "category.name",
-			"opportunity", "currencyId", "companyId", "company.title", "contactId", "contact.name",
-			"assignedById", "assignedBy.firstName", "assignedBy.lastName",
-			"createdTime", "updatedTime",
-		}
-	}
+func defaultSelectForEntity(entityTypeID int) []string {
+	meta, _ := getEntityMeta(entityTypeID)
+	return meta.defaultSelect
 }
 
-func CuratedSelect(entityTypeID int, userSelect []string) []string {
-	def := DefaultSelectForEntity(entityTypeID)
+func curatedSelect(entityTypeID int, userSelect []string) []string {
+	def := defaultSelectForEntity(entityTypeID)
 	if len(userSelect) == 0 {
 		return def
 	}
 
-	var hasWildcard bool
 	for _, s := range userSelect {
 		if strings.TrimSpace(s) == "*" {
-			hasWildcard = true
-			break
+			return def
 		}
-	}
-	if hasWildcard {
-		return def
 	}
 
 	var result []string
@@ -163,13 +98,16 @@ func CuratedSelect(entityTypeID int, userSelect []string) []string {
 		if trimmed == "" {
 			continue
 		}
-		norm := NormalizeFieldName(trimmed)
+		norm := normalizeFieldName(trimmed)
 		if norm == "id" || norm == "ID" {
 			hasID = true
 			result = append(result, "id")
 		} else {
 			result = append(result, norm)
 		}
+	}
+	if len(result) == 0 {
+		return def
 	}
 	if !hasID {
 		result = append([]string{"id"}, result...)
@@ -203,7 +141,7 @@ func parseOpPrefix(key string) (op string, field string) {
 	return "=", key
 }
 
-func TranslateFilter(raw any) (any, bool) {
+func translateFilter(raw any) (any, bool) {
 	if raw == nil {
 		return nil, false
 	}
@@ -218,7 +156,42 @@ func TranslateFilter(raw any) (any, bool) {
 	}
 }
 
+func isLogicalFilterGroup(m map[string]any) bool {
+	if condRaw, ok := m["conditions"]; ok {
+		switch condRaw.(type) {
+		case []any, map[string]any:
+			return true
+		}
+	}
+	if t, ok := m["type"].(string); ok && strings.EqualFold(t, "filter") {
+		if _, hasCond := m["conditions"]; hasCond {
+			return true
+		}
+	}
+	return false
+}
+
 func translateFilterMap(m map[string]any) (any, bool) {
+	if len(m) == 0 {
+		return nil, false
+	}
+	if isLogicalFilterGroup(m) {
+		logic := "and"
+		for k, v := range m {
+			if strings.EqualFold(k, "logic") {
+				if s := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", v))); s != "" {
+					logic = s
+				}
+			}
+		}
+		conds, hasSub := translateFilter(m["conditions"])
+		return map[string]any{
+			"type":       "filter",
+			"logic":      logic,
+			"conditions": conds,
+		}, hasSub
+	}
+
 	var (
 		conditions   []any
 		hasSubstring bool
@@ -249,6 +222,20 @@ func translateFilterMap(m map[string]any) (any, bool) {
 }
 
 func translateFilterSlice(s []any) (any, bool) {
+	if len(s) == 0 {
+		return nil, false
+	}
+	if len(s) == 3 {
+		if fStr, ok0 := s[0].(string); ok0 {
+			if opStr, ok1 := s[1].(string); ok1 {
+				op := strings.ToLower(opStr)
+				val := s[2]
+				hasSub := op == "like" || op == "contains" || strings.Contains(fmt.Sprintf("%v", val), "%")
+				return []any{[]any{toCamelCase(fStr), op, val}}, hasSub
+			}
+		}
+	}
+
 	var (
 		updated      []any
 		hasSubstring bool
@@ -280,6 +267,62 @@ func translateFilterSlice(s []any) (any, bool) {
 		}
 	}
 	return updated, hasSubstring
+}
+
+func toLegacyFilter(raw any) map[string]any {
+	if raw == nil {
+		return make(map[string]any)
+	}
+	switch f := raw.(type) {
+	case map[string]any:
+		if isLogicalFilterGroup(f) {
+			return toLegacyFilter(f["conditions"])
+		}
+		return f
+	case []any:
+		res := make(map[string]any)
+		if len(f) == 3 {
+			if _, ok0 := f[0].(string); ok0 {
+				if _, ok1 := f[1].(string); ok1 {
+					addConditionToLegacyMap(res, f)
+					return res
+				}
+			}
+		}
+		for _, item := range f {
+			if cond, ok := item.([]any); ok && len(cond) == 3 {
+				addConditionToLegacyMap(res, cond)
+			}
+		}
+		return res
+	default:
+		return make(map[string]any)
+	}
+}
+
+func addConditionToLegacyMap(dst map[string]any, cond []any) {
+	field := toCamelCase(fmt.Sprintf("%v", cond[0]))
+	op := strings.ToLower(fmt.Sprintf("%v", cond[1]))
+	val := cond[2]
+	switch op {
+	case "like", "contains":
+		if strVal, ok := val.(string); ok {
+			val = strings.Trim(strVal, "%")
+		}
+		dst["%"+field] = val
+	case "in":
+		dst["@"+field] = val
+	case "not in":
+		dst["!@"+field] = val
+	case "=", "!=", ">", ">=", "<", "<=":
+		if strVal, ok := val.(string); ok && strings.Contains(strVal, "%") {
+			dst["%"+field] = strings.Trim(strVal, "%")
+		} else {
+			dst[op+field] = val
+		}
+	default:
+		dst["="+field] = val
+	}
 }
 
 func extractCount(raw json.RawMessage) int {
@@ -318,6 +361,7 @@ type SearchItemsInput struct {
 	Select             []string
 	Order              map[string]string
 	Limit              int
+	Page               int
 	IncludeProductRows bool
 }
 
@@ -364,22 +408,6 @@ func NewCrmService(cfg *config.Config, client *RestClient) *CrmService {
 	}
 }
 
-func (s *CrmService) isV2Mode(ctx context.Context, connectionID string) bool {
-	if s.cfg.BitrixAPIVersion == config.APIVersionV2 {
-		return true
-	}
-	if s.client != nil && s.client.tokens != nil {
-		if st := s.client.tokens.Store(); st != nil {
-			var cachedVersion string
-			found, err := st.GetSchemaCache(ctx, connectionID, "api_version", s.cfg.SchemaCacheTTLSeconds, &cachedVersion)
-			if err == nil && found && cachedVersion == config.APIVersionV2 {
-				return true
-			}
-		}
-	}
-	return false
-}
-
 func (s *CrmService) SearchItems(ctx context.Context, input SearchItemsInput) (*SearchItemsResult, error) {
 	if input.Limit <= 0 {
 		input.Limit = 100
@@ -387,23 +415,25 @@ func (s *CrmService) SearchItems(ctx context.Context, input SearchItemsInput) (*
 	if input.Limit > MaxSearchLimit {
 		return nil, config.NewAppError(fmt.Sprintf("limit cannot exceed %d", MaxSearchLimit), "INVALID_LIMIT", 400)
 	}
+	page := input.Page
+	if page <= 0 {
+		page = 1
+	}
 
 	baseOrder := input.Order
 	if len(baseOrder) == 0 {
 		baseOrder = map[string]string{"id": "ASC"}
 	}
 
-	slug, slugErr := EntitySlug(input.EntityTypeID)
-	transFilter, hasSubstring := TranslateFilter(input.Filter)
-	isV2 := s.isV2Mode(ctx, input.ConnectionID)
+	slug, slugErr := entitySlug(input.EntityTypeID)
+	transFilter, hasSubstring := translateFilter(input.Filter)
 
-	// Try REST 3.0 when not in v2 mode, slug is known, and filter does not require substring match
-	if !isV2 && slugErr == nil && !hasSubstring {
-		curatedSel := CuratedSelect(input.EntityTypeID, input.Select)
+	if !s.client.IsV2Mode(ctx, input.ConnectionID) && slugErr == nil && !hasSubstring {
+		curatedSel := curatedSelect(input.EntityTypeID, input.Select)
 		reqBody := map[string]any{
 			"select":     curatedSel,
 			"order":      baseOrder,
-			"pagination": map[string]any{"limit": input.Limit, "page": 1},
+			"pagination": map[string]any{"limit": input.Limit, "page": page},
 		}
 		if transFilter != nil {
 			reqBody["filter"] = transFilter
@@ -435,11 +465,8 @@ func (s *CrmService) SearchItems(ctx context.Context, input SearchItemsInput) (*
 					Truncated: truncated,
 				}, nil
 			}
-		} else {
-			var appErr *config.AppError
-			if !errors.As(err, &appErr) || !isVersionFallbackError(appErr) {
-				return nil, err
-			}
+		} else if !s.client.ShouldFallbackToV2(err) {
+			return nil, err
 		}
 	}
 
@@ -448,10 +475,7 @@ func (s *CrmService) SearchItems(ctx context.Context, input SearchItemsInput) (*
 	if len(baseSelect) == 0 {
 		baseSelect = []string{"*"}
 	}
-	legacyFilter := input.Filter
-	if legacyFilter == nil {
-		legacyFilter = make(map[string]any)
-	}
+	legacyFilter := toLegacyFilter(input.Filter)
 
 	baseParams := map[string]any{
 		"entityTypeId": input.EntityTypeID,
@@ -459,7 +483,6 @@ func (s *CrmService) SearchItems(ctx context.Context, input SearchItemsInput) (*
 		"select":       baseSelect,
 		"order":        baseOrder,
 	}
-	// Pass start: -1 on bounded queries that do not need total to skip COUNT(*)
 	if input.Limit <= 50 {
 		baseParams["start"] = -1
 	}
@@ -525,11 +548,16 @@ func (s *CrmService) enrichProductRows(ctx context.Context, connectionID string,
 	}
 }
 
-func (s *CrmService) GetItem(ctx context.Context, connectionID string, entityTypeID int, id int) (any, error) {
-	slug, slugErr := EntitySlug(entityTypeID)
-	if slugErr == nil && !s.isV2Mode(ctx, connectionID) {
+func (s *CrmService) GetItem(ctx context.Context, connectionID string, entityTypeID int, id int, userSelect ...[]string) (any, error) {
+	var selInput []string
+	if len(userSelect) > 0 {
+		selInput = userSelect[0]
+	}
+
+	slug, slugErr := entitySlug(entityTypeID)
+	if slugErr == nil && !s.client.IsV2Mode(ctx, connectionID) {
 		method := fmt.Sprintf("crm.%s.get", slug)
-		sel := CuratedSelect(entityTypeID, nil)
+		sel := curatedSelect(entityTypeID, selInput)
 		resp, err := s.client.Call(ctx, connectionID, method, map[string]any{
 			"id":     id,
 			"select": sel,
@@ -544,8 +572,7 @@ func (s *CrmService) GetItem(ctx context.Context, connectionID string, entityTyp
 			}
 			return resp.Result, nil
 		}
-		var appErr *config.AppError
-		if !errors.As(err, &appErr) || !isVersionFallbackError(appErr) {
+		if !s.client.ShouldFallbackToV2(err) {
 			return nil, err
 		}
 	}
@@ -567,9 +594,14 @@ func (s *CrmService) GetItem(ctx context.Context, connectionID string, entityTyp
 	return resp.Result, nil
 }
 
-func (s *CrmService) GetItems(ctx context.Context, connectionID string, entityTypeID int, ids []int) (map[string]any, error) {
-	if len(ids) > MaxBatchItems {
-		return nil, config.NewAppError(fmt.Sprintf("ids cannot exceed %d items", MaxBatchItems), "TOO_MANY_IDS", 400)
+func (s *CrmService) GetItems(ctx context.Context, connectionID string, entityTypeID int, ids []int, userSelect ...[]string) ([]map[string]any, error) {
+	if len(ids) > MaxSearchLimit {
+		return nil, config.NewAppError(fmt.Sprintf("ids cannot exceed %d items", MaxSearchLimit), "TOO_MANY_IDS", 400)
+	}
+
+	var selInput []string
+	if len(userSelect) > 0 {
+		selInput = userSelect[0]
 	}
 
 	var uniqueIDs []int
@@ -578,11 +610,14 @@ func (s *CrmService) GetItems(ctx context.Context, connectionID string, entityTy
 			uniqueIDs = append(uniqueIDs, id)
 		}
 	}
+	if len(uniqueIDs) == 0 {
+		return []map[string]any{}, nil
+	}
 
-	slug, slugErr := EntitySlug(entityTypeID)
-	if slugErr == nil && !s.isV2Mode(ctx, connectionID) {
+	slug, slugErr := entitySlug(entityTypeID)
+	if slugErr == nil && !s.client.IsV2Mode(ctx, connectionID) {
 		method := fmt.Sprintf("crm.%s.list", slug)
-		sel := CuratedSelect(entityTypeID, nil)
+		sel := curatedSelect(entityTypeID, selInput)
 		resp, err := s.client.Call(ctx, connectionID, method, map[string]any{
 			"filter":     []any{[]any{"id", "in", uniqueIDs}},
 			"select":     sel,
@@ -592,22 +627,34 @@ func (s *CrmService) GetItems(ctx context.Context, connectionID string, entityTy
 			var pageObj struct {
 				Items []map[string]any `json:"items"`
 			}
-			if jsonErr := json.Unmarshal(resp.Result, &pageObj); jsonErr == nil && len(pageObj.Items) > 0 {
-				byID := make(map[string]any, len(pageObj.Items))
+			if jsonErr := json.Unmarshal(resp.Result, &pageObj); jsonErr == nil {
+				byID := make(map[int]map[string]any, len(pageObj.Items))
 				for _, item := range pageObj.Items {
-					idStr := fmt.Sprintf("%v", item["id"])
-					byID[idStr] = item
+					itemID := ToInt(item["id"])
+					if itemID == 0 {
+						itemID = ToInt(item["ID"])
+					}
+					if itemID > 0 {
+						byID[itemID] = item
+					}
 				}
-				return byID, nil
+				ordered := make([]map[string]any, 0, len(pageObj.Items))
+				for _, reqID := range uniqueIDs {
+					if item, ok := byID[reqID]; ok {
+						ordered = append(ordered, item)
+					}
+				}
+				return ordered, nil
 			}
-		}
-		var appErr *config.AppError
-		if !errors.As(err, &appErr) || !isVersionFallbackError(appErr) {
+		} else if !s.client.ShouldFallbackToV2(err) {
 			return nil, err
 		}
 	}
 
-	// Legacy batch fallback
+	if len(uniqueIDs) > MaxBatchItems {
+		return nil, config.NewAppError(fmt.Sprintf("ids cannot exceed %d items in legacy v2 mode", MaxBatchItems), "TOO_MANY_IDS", 400)
+	}
+
 	commands := make([]NamedBatchCommand, 0, len(uniqueIDs))
 	for _, id := range uniqueIDs {
 		commands = append(commands, NamedBatchCommand{
@@ -625,31 +672,28 @@ func (s *CrmService) GetItems(ctx context.Context, connectionID string, entityTy
 		return nil, err
 	}
 
-	itemsByID := make(map[string]any, len(uniqueIDs))
+	ordered := make([]map[string]any, 0, len(uniqueIDs))
 	for _, id := range uniqueIDs {
 		key := strconv.Itoa(id)
 		if raw, ok := batchRes[key]; ok {
 			var parsed map[string]any
 			if err := json.Unmarshal(raw, &parsed); err == nil {
-				if item, ok := parsed["item"]; ok {
-					itemsByID[key] = item
+				if item, ok := parsed["item"].(map[string]any); ok {
+					ordered = append(ordered, item)
 				} else {
-					itemsByID[key] = parsed
+					ordered = append(ordered, parsed)
 				}
-			} else {
-				itemsByID[key] = raw
 			}
 		}
 	}
-	return itemsByID, nil
+	return ordered, nil
 }
 
 func (s *CrmService) CountItems(ctx context.Context, input CountItemsInput) (int, error) {
-	slug, slugErr := EntitySlug(input.EntityTypeID)
-	transFilter, hasSubstring := TranslateFilter(input.Filter)
-	isV2 := s.isV2Mode(ctx, input.ConnectionID)
+	slug, slugErr := entitySlug(input.EntityTypeID)
+	transFilter, hasSubstring := translateFilter(input.Filter)
 
-	if !isV2 && slugErr == nil && !hasSubstring {
+	if !s.client.IsV2Mode(ctx, input.ConnectionID) && slugErr == nil && !hasSubstring {
 		method := fmt.Sprintf("crm.%s.aggregate", slug)
 		params := map[string]any{
 			"select": map[string]any{"count": []string{"id"}},
@@ -661,17 +705,12 @@ func (s *CrmService) CountItems(ctx context.Context, input CountItemsInput) (int
 		if err == nil {
 			return extractCount(resp.Result), nil
 		}
-		var appErr *config.AppError
-		if !errors.As(err, &appErr) || !isVersionFallbackError(appErr) {
+		if !s.client.ShouldFallbackToV2(err) {
 			return 0, err
 		}
 	}
 
-	// Legacy fallback to crm.item.list with start: 0 to get total count
-	legacyFilter := input.Filter
-	if legacyFilter == nil {
-		legacyFilter = make(map[string]any)
-	}
+	legacyFilter := toLegacyFilter(input.Filter)
 	resp, err := s.client.Call(ctx, input.ConnectionID, "crm.item.list", map[string]any{
 		"entityTypeId": input.EntityTypeID,
 		"filter":       legacyFilter,
@@ -685,6 +724,28 @@ func (s *CrmService) CountItems(ctx context.Context, input CountItemsInput) (int
 		return *resp.Total, nil
 	}
 	return extractCount(resp.Result), nil
+}
+
+func buildLegacyProductRowBatchCommands(uniqueOwnerIDs []int, ownerType string, filter map[string]any, ord map[string]string) []NamedBatchCommand {
+	commands := make([]NamedBatchCommand, 0, len(uniqueOwnerIDs))
+	for _, oID := range uniqueOwnerIDs {
+		pFilter := make(map[string]any, len(filter)+2)
+		for k, v := range filter {
+			pFilter[k] = v
+		}
+		pFilter["=ownerType"] = ownerType
+		pFilter["=ownerId"] = oID
+		commands = append(commands, NamedBatchCommand{
+			Key:    strconv.Itoa(oID),
+			Method: "crm.item.productrow.list",
+			Params: map[string]any{
+				"filter": pFilter,
+				"order":  ord,
+				"start":  0,
+			},
+		})
+	}
+	return commands
 }
 
 func (s *CrmService) listProductRowsForOwners(
@@ -704,7 +765,7 @@ func (s *CrmService) listProductRowsForOwners(
 	}
 
 	if ownerType == "" {
-		ownerType = ToOwnerTypeCode(entityTypeID)
+		ownerType = toOwnerTypeCode(entityTypeID)
 	}
 	ord := map[string]string{"sort": "asc"}
 	if len(order) > 0 {
@@ -714,10 +775,8 @@ func (s *CrmService) listProductRowsForOwners(
 		}
 	}
 
-	isV2 := s.isV2Mode(ctx, connectionID)
-
 	// Single owner with REST 3.0
-	if !isV2 && len(uniqueOwnerIDs) == 1 {
+	if !s.client.IsV2Mode(ctx, connectionID) && len(uniqueOwnerIDs) == 1 {
 		oID := uniqueOwnerIDs[0]
 		resp, err := s.client.Call(ctx, connectionID, "crm.productrow.list", map[string]any{
 			"filter": []any{
@@ -742,14 +801,17 @@ func (s *CrmService) listProductRowsForOwners(
 					OwnersCount: &count,
 				}, nil
 			}
+		} else if !s.client.ShouldFallbackToV2(err) {
+			return nil, err
 		}
 	}
 
-	// Multiple owners: batch
-	commands := make([]NamedBatchCommand, 0, len(uniqueOwnerIDs))
-	useV3 := !isV2
-	for _, oID := range uniqueOwnerIDs {
-		if useV3 {
+	// Multiple owners (or single owner fallback): batch
+	useV3 := !s.client.IsV2Mode(ctx, connectionID)
+	var commands []NamedBatchCommand
+	if useV3 {
+		commands = make([]NamedBatchCommand, 0, len(uniqueOwnerIDs))
+		for _, oID := range uniqueOwnerIDs {
 			commands = append(commands, NamedBatchCommand{
 				Key:    strconv.Itoa(oID),
 				Method: "crm.productrow.list",
@@ -763,50 +825,14 @@ func (s *CrmService) listProductRowsForOwners(
 					"pagination": map[string]any{"limit": 1000, "page": 1},
 				},
 			})
-		} else {
-			pFilter := make(map[string]any)
-			for k, v := range filter {
-				pFilter[k] = v
-			}
-			pFilter["=ownerType"] = ownerType
-			pFilter["=ownerId"] = oID
-			commands = append(commands, NamedBatchCommand{
-				Key:    strconv.Itoa(oID),
-				Method: "crm.item.productrow.list",
-				Params: map[string]any{
-					"filter": pFilter,
-					"order":  ord,
-					"start":  0,
-				},
-			})
 		}
+	} else {
+		commands = buildLegacyProductRowBatchCommands(uniqueOwnerIDs, ownerType, filter, ord)
 	}
 
 	batchRes, err := s.client.CallBatch(ctx, connectionID, commands, false)
-	if err != nil && useV3 {
-		var appErr *config.AppError
-		if errors.As(err, &appErr) && isVersionFallbackError(appErr) {
-			// Retry with legacy
-			legacyCommands := make([]NamedBatchCommand, 0, len(uniqueOwnerIDs))
-			for _, oID := range uniqueOwnerIDs {
-				pFilter := make(map[string]any)
-				for k, v := range filter {
-					pFilter[k] = v
-				}
-				pFilter["=ownerType"] = ownerType
-				pFilter["=ownerId"] = oID
-				legacyCommands = append(legacyCommands, NamedBatchCommand{
-					Key:    strconv.Itoa(oID),
-					Method: "crm.item.productrow.list",
-					Params: map[string]any{
-						"filter": pFilter,
-						"order":  ord,
-						"start":  0,
-					},
-				})
-			}
-			batchRes, err = s.client.CallBatch(ctx, connectionID, legacyCommands, false)
-		}
+	if err != nil && useV3 && s.client.ShouldFallbackToV2(err) {
+		batchRes, err = s.client.CallBatch(ctx, connectionID, buildLegacyProductRowBatchCommands(uniqueOwnerIDs, ownerType, filter, ord), false)
 	}
 	if err != nil {
 		return nil, err

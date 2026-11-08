@@ -1319,12 +1319,23 @@ func TestRestClient_TelemetryTime_OperatingResetAt_AndIdempotencyKey(t *testing.
 			})
 			return resp, nil
 		}
-		// Second attempt succeeds
+	// Second attempt succeeds with high operating time (>= 400s) to trigger proactive pacing on the next call
+		if cnt == 2 {
+			return jsonResponse(200, map[string]any{
+				"result": map[string]any{"id": 42},
+				"time": map[string]any{
+					"duration":           0.08,
+					"operating":          420.5,
+					"operating_reset_at": nowSec + 600,
+				},
+			}), nil
+		}
+		// Third attempt (after operating pacing) succeeds
 		return jsonResponse(200, map[string]any{
-			"result": map[string]any{"id": 42},
+			"result": map[string]any{"id": 43},
 			"time": map[string]any{
-				"duration":           0.08,
-				"operating":          10.2,
+				"duration":           0.05,
+				"operating":          12.0,
 				"operating_reset_at": nowSec + 600,
 			},
 		}), nil
@@ -1366,7 +1377,7 @@ func TestRestClient_TelemetryTime_OperatingResetAt_AndIdempotencyKey(t *testing.
 	}
 
 	mu.Lock()
-	headers := idempotencyHeaders
+	headers := slices.Clone(idempotencyHeaders)
 	mu.Unlock()
 	if len(headers) != 2 {
 		t.Fatalf("expected 2 requests, got %d", len(headers))
@@ -1375,6 +1386,17 @@ func TestRestClient_TelemetryTime_OperatingResetAt_AndIdempotencyKey(t *testing.
 		if h != "uuid-idem-123" {
 			t.Errorf("attempt %d missing or wrong Idempotency-Key: %q", i, h)
 		}
+	}
+
+	// Next call on the same connection should be proactively paced because previous time.operating >= 400
+	paceStart := time.Now()
+	_, err = rc.Call(ctx, conn.ID, "crm.deal.get", map[string]any{"id": 43})
+	paceElapsed := time.Since(paceStart)
+	if err != nil {
+		t.Fatalf("paced rc.Call failed: %v", err)
+	}
+	if paceElapsed < 150*time.Millisecond {
+		t.Errorf("expected proactive operating pacing delay (>=150ms), got %v", paceElapsed)
 	}
 }
 
@@ -1389,32 +1411,62 @@ func TestRestClient_AutoFallbackToLegacyOn404OrMethodNotFound(t *testing.T) {
 		requestedPaths = append(requestedPaths, r.URL.Path)
 		mu.Unlock()
 
-		if strings.Contains(r.URL.Path, "/rest/api/crm.onpremise.html404") {
-			// Older On-Premise returning non-JSON HTML 404
+		// Connection 1 (onpremise.example.com): returns HTML 404 on /rest/api/*
+		if r.URL.Host == "onpremise.example.com" && strings.Contains(r.URL.Path, "/rest/api/") {
 			return &http.Response{
 				StatusCode: 404,
 				Header:     http.Header{"Content-Type": []string{"text/html; charset=UTF-8"}},
 				Body:       io.NopCloser(strings.NewReader("<!DOCTYPE html><html><head><title>404 Not Found</title></head><body><h1>404 Not Found</h1></body></html>")),
 			}, nil
 		}
-		if strings.Contains(r.URL.Path, "/rest/api/crm.unknown.method") {
-			return jsonResponse(404, map[string]any{
-				"error": map[string]any{
-					"code":    "BITRIX_REST_V3_EXCEPTION_UNKNOWNMETHOD",
-					"message": "Method not found in REST 3.0",
+		if r.URL.Host == "onpremise.example.com" && strings.HasSuffix(r.URL.Path, "crm.item.get.json") {
+			return jsonResponse(200, map[string]any{
+				"result": map[string]any{
+					"item": map[string]any{"id": 77, "title": "Legacy OnPrem Deal"},
 				},
 			}), nil
 		}
-		// Legacy fallback endpoint succeeds
+
+		// Connection 2 (partialv3.example.com): supports crm.deal.get in v3, but returns UNKNOWNMETHOD on crm.deal.aggregate
+		if r.URL.Host == "partialv3.example.com" && strings.HasSuffix(r.URL.Path, "/rest/api/crm.deal.aggregate") {
+			return jsonResponse(404, map[string]any{
+				"error": map[string]any{
+					"code":    "BITRIX_REST_V3_EXCEPTION_UNKNOWNMETHOD",
+					"message": "Method crm.deal.aggregate not found in REST 3.0",
+				},
+			}), nil
+		}
+		if r.URL.Host == "partialv3.example.com" && strings.HasSuffix(r.URL.Path, "crm.item.list.json") {
+			return jsonResponse(200, map[string]any{
+				"result": map[string]any{"items": []any{}},
+				"total":  19,
+			}), nil
+		}
+		if r.URL.Host == "partialv3.example.com" && strings.HasSuffix(r.URL.Path, "/rest/api/crm.deal.get") {
+			return jsonResponse(200, map[string]any{
+				"result": map[string]any{
+					"item": map[string]any{"id": 88, "title": "Still REST 3.0 Deal"},
+				},
+			}), nil
+		}
+
+		// Legacy-only crm.type.list
+		if strings.HasSuffix(r.URL.Path, "crm.type.list.json") {
+			return jsonResponse(200, map[string]any{
+				"result": map[string]any{"types": []any{}},
+			}), nil
+		}
+
 		return jsonResponse(200, map[string]any{
-			"result": map[string]any{"fallback": true},
+			"result": map[string]any{"ok": true},
 		}), nil
 	})
 
 	cfg, st, _, tm := newTestEnv(t, "", "client-id", rt)
 	rc := bitrix.NewRestClient(cfg, tm, config.NewLogger(nil, "silent"), &http.Client{Transport: rt})
+	crmSvc := bitrix.NewCrmService(cfg, rc)
 
-	conn, err := st.UpsertConnection(ctx, store.UpsertConnectionInput{
+	connOnPrem, err := st.UpsertConnection(ctx, store.UpsertConnectionInput{
 		Domain:         "onpremise.example.com",
 		MemberID:       "member-onprem",
 		BitrixUserID:   "1",
@@ -1429,30 +1481,31 @@ func TestRestClient_AutoFallbackToLegacyOn404OrMethodNotFound(t *testing.T) {
 		t.Fatalf("UpsertConnection failed: %v", err)
 	}
 
-	// 1. auto mode: REST 3.0 returns HTML 404 -> caches v2 in schema_cache and seamlessly executes legacy v2
-	resp, err := rc.Call(ctx, conn.ID, "crm.onpremise.html404", nil)
+	// 1. auto mode: REST 3.0 returns HTML 404 on /rest/api/crm.deal.get -> caches v2 in schema_cache and CrmService seamlessly executes crm.item.get.json
+	itemRaw, err := crmSvc.GetItem(ctx, connOnPrem.ID, 2, 77)
 	if err != nil {
-		t.Fatalf("expected seamless fallback to v2, got error: %v", err)
+		t.Fatalf("expected seamless fallback to v2 crm.item.get, got error: %v", err)
 	}
-	if !strings.Contains(string(resp.Result), `"fallback":true`) {
-		t.Errorf("expected fallback result, got: %s", string(resp.Result))
+	itemMap, ok := itemRaw.(map[string]any)
+	if !ok || itemMap["title"] != "Legacy OnPrem Deal" {
+		t.Errorf("expected Legacy OnPrem Deal from v2 fallback, got: %+v", itemRaw)
 	}
 
 	// Verify schema_cache cached "v2"
 	var cachedVersion string
-	found, err := st.GetSchemaCache(ctx, conn.ID, "api_version", 900, &cachedVersion)
+	found, err := st.GetSchemaCache(ctx, connOnPrem.ID, "api_version", 900, &cachedVersion)
 	if err != nil || !found || cachedVersion != "v2" {
 		t.Errorf("expected api_version='v2' in schema_cache, found=%v version=%q err=%v", found, cachedVersion, err)
 	}
 
-	// Subsequent call to another method should directly call v2 (path ending in .json)
+	// Subsequent call on connOnPrem should directly call v2 (crm.item.get.json) in 1 request without trying /rest/api/
 	mu.Lock()
 	beforeLen := len(requestedPaths)
 	mu.Unlock()
 
-	_, err = rc.Call(ctx, conn.ID, "crm.another.method", nil)
+	_, err = crmSvc.GetItem(ctx, connOnPrem.ID, 2, 77)
 	if err != nil {
-		t.Fatalf("subsequent call failed: %v", err)
+		t.Fatalf("subsequent GetItem failed: %v", err)
 	}
 	mu.Lock()
 	lastPath := requestedPaths[len(requestedPaths)-1]
@@ -1462,14 +1515,60 @@ func TestRestClient_AutoFallbackToLegacyOn404OrMethodNotFound(t *testing.T) {
 	if afterLen-beforeLen != 1 {
 		t.Errorf("expected exactly 1 request for subsequent call, got %d", afterLen-beforeLen)
 	}
-	if !strings.HasSuffix(lastPath, ".json") || strings.Contains(lastPath, "/rest/api/") {
-		t.Errorf("expected direct Legacy REST call ending with .json, got: %s", lastPath)
+	if !strings.HasSuffix(lastPath, "crm.item.get.json") || strings.Contains(lastPath, "/rest/api/") {
+		t.Errorf("expected direct Legacy REST call to crm.item.get.json, got: %s", lastPath)
 	}
 
-	// 2. Explicit WithAPIVersion("v3") does NOT fallback on 404 and returns error
-	_, err = rc.Call(ctx, conn.ID, "crm.onpremise.html404", nil, bitrix.WithAPIVersion("v3"))
-	if err == nil {
-		t.Fatalf("expected error for explicit v3 on 404")
+	// 2. Partial REST 3.0 portal: crm.deal.aggregate returns UNKNOWNMETHOD -> falls back locally to crm.item.list.json WITHOUT caching api_version='v2'
+	connPartial, err := st.UpsertConnection(ctx, store.UpsertConnectionInput{
+		Domain:         "partialv3.example.com",
+		MemberID:       "member-partial-v3",
+		BitrixUserID:   "1",
+		ClientEndpoint: "https://partialv3.example.com/rest/",
+		AccessToken:    "token",
+		RefreshToken:   "refresh",
+		Scope:          "crm",
+		ExpiresAt:      time.Now().Add(time.Hour),
+		Mode:           config.ModeReadOnly,
+	})
+	if err != nil {
+		t.Fatalf("UpsertConnection failed: %v", err)
+	}
+
+	total, err := crmSvc.CountItems(ctx, bitrix.CountItemsInput{
+		ConnectionID: connPartial.ID,
+		EntityTypeID: 2,
+	})
+	if err != nil || total != 19 {
+		t.Fatalf("expected CountItems local fallback to return 19, got %d err=%v", total, err)
+	}
+	var cachedPartial string
+	foundPartial, _ := st.GetSchemaCache(ctx, connPartial.ID, "api_version", 900, &cachedPartial)
+	if foundPartial {
+		t.Errorf("expected local-only fallback on .aggregate NOT to cache api_version='v2', got %q", cachedPartial)
+	}
+
+	// Subsequent GetItem on connPartial still uses REST 3.0 /rest/api/crm.deal.get
+	v3Item, err := crmSvc.GetItem(ctx, connPartial.ID, 2, 88)
+	if err != nil {
+		t.Fatalf("GetItem on connPartial failed: %v", err)
+	}
+	if m, ok := v3Item.(map[string]any); !ok || m["title"] != "Still REST 3.0 Deal" {
+		t.Errorf("expected REST 3.0 deal on connPartial, got: %+v", v3Item)
+	}
+
+	// 3. Explicit BITRIX_API_VERSION=v3: legacy-only crm.type.list still uses /rest/crm.type.list.json, while 404 on v3 method returns error without fallback
+	cfgV3 := cfg
+	cfgV3.BitrixAPIVersion = config.APIVersionV3
+	rcV3 := bitrix.NewRestClient(cfgV3, tm, config.NewLogger(nil, "silent"), &http.Client{Transport: rt})
+	schemaV3 := bitrix.NewSchemaDiscovery(cfgV3, st, rcV3)
+	crmV3 := bitrix.NewCrmService(cfgV3, rcV3)
+
+	if _, err := schemaV3.ListEntityTypes(ctx, connPartial.ID, true); err != nil {
+		t.Fatalf("expected ListEntityTypes (crm.type.list) to route to legacy endpoint even in BITRIX_API_VERSION=v3, got err: %v", err)
+	}
+	if _, err := crmV3.GetItem(ctx, connOnPrem.ID, 2, 77); err == nil {
+		t.Fatalf("expected error in BITRIX_API_VERSION=v3 when /rest/api/crm.deal.get returns 404")
 	}
 }
 
@@ -1479,33 +1578,6 @@ func errorsAsAppError(err error, target **config.AppError) bool {
 
 func TestSchemaDiscovery_HybridREST3_QuoteAndDictionaries(t *testing.T) {
 	ctx := context.Background()
-
-	// 1. Check EntitySlug mappings and built-in Quote
-	for _, tc := range []struct {
-		id       int
-		wantSlug string
-		wantCats bool
-		wantStg  bool
-	}{
-		{1, "lead", false, true},
-		{2, "deal", true, true},
-		{3, "contact", false, false},
-		{4, "company", false, false},
-		{7, "quote", false, true},
-		{31, "smartinvoice", true, true},
-		{128, "smartprocess128", true, true},
-	} {
-		slug, err := bitrix.EntitySlug(tc.id)
-		if err != nil || slug != tc.wantSlug {
-			t.Errorf("EntitySlug(%d) = %q, want %q, err=%v", tc.id, slug, tc.wantSlug, err)
-		}
-		if bitrix.SupportsCategories(tc.id) != tc.wantCats {
-			t.Errorf("SupportsCategories(%d) = %v, want %v", tc.id, bitrix.SupportsCategories(tc.id), tc.wantCats)
-		}
-		if bitrix.SupportsStages(tc.id) != tc.wantStg {
-			t.Errorf("SupportsStages(%d) = %v, want %v", tc.id, bitrix.SupportsStages(tc.id), tc.wantStg)
-		}
-	}
 
 	var recordedRequests []struct {
 		Method string
@@ -1656,13 +1728,43 @@ func TestSchemaDiscovery_HybridREST3_QuoteAndDictionaries(t *testing.T) {
 	rc := bitrix.NewRestClient(cfg, tm, config.NewLogger(nil, "silent"), &http.Client{Transport: rt})
 	schema := bitrix.NewSchemaDiscovery(cfg, st, rc)
 
-	// 2. ListEntityTypes sends start: -1 to crm.type.list and returns 6 built-ins + 1 SPA
+	// 1. ListEntityTypes sends start: -1 to crm.type.list and returns 6 built-ins + 1 SPA with accurate capability flags
 	types, err := schema.ListEntityTypes(ctx, conn.ID, false)
 	if err != nil {
 		t.Fatalf("ListEntityTypes failed: %v", err)
 	}
 	if len(types) != 7 {
 		t.Fatalf("expected 7 entity types (6 built-in including Quote + 1 dynamic), got %d", len(types))
+	}
+	wantMeta := map[int]struct {
+		code string
+		slug string
+		cats bool
+		stgs bool
+	}{
+		1:   {"LEAD", "lead", false, true},
+		2:   {"DEAL", "deal", true, true},
+		3:   {"CONTACT", "contact", false, false},
+		4:   {"COMPANY", "company", false, false},
+		7:   {"QUOTE", "quote", false, true},
+		31:  {"SMART_INVOICE", "smartinvoice", true, true},
+		128: {"DYNAMIC_128", "smartprocess128", true, true},
+	}
+	for _, et := range types {
+		id, _ := et["entityTypeId"].(int)
+		if id == 0 {
+			if f, ok := et["entityTypeId"].(float64); ok {
+				id = int(f)
+			}
+		}
+		exp, ok := wantMeta[id]
+		if !ok {
+			t.Errorf("unexpected entityTypeId %d in ListEntityTypes: %+v", id, et)
+			continue
+		}
+		if et["code"] != exp.code || et["slug"] != exp.slug || et["supportsCategories"] != exp.cats || et["supportsStages"] != exp.stgs {
+			t.Errorf("entity %d metadata mismatch: got %+v, want %+v", id, et, exp)
+		}
 	}
 	mu.Lock()
 	firstReq := recordedRequests[0]
@@ -1767,51 +1869,7 @@ func TestSchemaDiscovery_HybridREST3_QuoteAndDictionaries(t *testing.T) {
 func TestCrmService_REST3_ReadEngine(t *testing.T) {
 	ctx := context.Background()
 
-	// 1. Test CuratedSelect and normalization
-	selDealEmpty := bitrix.CuratedSelect(2, nil)
-	if !slices.Contains(selDealEmpty, "id") || !slices.Contains(selDealEmpty, "stage.name") || !slices.Contains(selDealEmpty, "company.title") {
-		t.Errorf("expected relational fields in default Deal select, got: %v", selDealEmpty)
-	}
-
-	selCustom := bitrix.CuratedSelect(2, []string{"title", "stage.name", "ufCrmCustomCode"})
-	if selCustom[0] != "id" {
-		t.Errorf("expected 'id' injected as first field, got: %v", selCustom)
-	}
-	if !slices.Contains(selCustom, "UF_CRM_CUSTOMCODE") {
-		t.Errorf("expected ufCrmCustomCode normalized to UF_CRM_CUSTOMCODE, got: %v", selCustom)
-	}
-	if !slices.Contains(selCustom, "stage.name") {
-		t.Errorf("expected stage.name preserved in select, got: %v", selCustom)
-	}
-
-	// 2. Test TranslateFilter
-	legacyFilter := map[string]any{
-		"=STAGE_ID":     "NEW",
-		">=OPPORTUNITY": 1000,
-		"@ID":           []any{1, 2},
-	}
-	trans, hasSub := bitrix.TranslateFilter(legacyFilter)
-	if hasSub {
-		t.Errorf("expected hasSub=false for legacy filter without %%, got true")
-	}
-	transSlice, ok := trans.([]any)
-	if !ok || len(transSlice) != 3 {
-		t.Fatalf("expected 3 conditions in translated filter, got: %v", trans)
-	}
-
-	subFilter := map[string]any{"%TITLE": "Acme"}
-	_, hasSub2 := bitrix.TranslateFilter(subFilter)
-	if !hasSub2 {
-		t.Errorf("expected hasSub=true for %%TITLE filter")
-	}
-
-	likeFilter := []any{[]any{"title", "like", "%Acme%"}}
-	_, hasSub3 := bitrix.TranslateFilter(likeFilter)
-	if !hasSub3 {
-		t.Errorf("expected hasSub=true for like filter")
-	}
-
-	// 3. Set up mock HTTP transport for REST 3.0 calls
+	// 1. Set up mock HTTP transport for REST 3.0 calls
 	var recordedRequests []struct {
 		Method string
 		URL    string
@@ -1850,13 +1908,21 @@ func TestCrmService_REST3_ReadEngine(t *testing.T) {
 			// Check if this is a bulk GetItems call with filter id in [10, 20]
 			if fRaw, ok := bodyMap["filter"]; ok {
 				fStr := fmt.Sprintf("%v", fRaw)
-				if strings.Contains(fStr, "10") && strings.Contains(fStr, "20") {
+				if strings.Contains(fStr, "10") && strings.Contains(fStr, "20") && !strings.Contains(fStr, "300") {
 					return jsonResponse(200, map[string]any{
 						"result": map[string]any{
 							"items": []map[string]any{
 								{"id": 20, "title": "Deal 20"},
 								{"id": 10, "title": "Deal 10"},
 							},
+						},
+					}), nil
+				}
+				if strings.Contains(fStr, "99999") {
+					// Empty matching items
+					return jsonResponse(200, map[string]any{
+						"result": map[string]any{
+							"items": []map[string]any{},
 						},
 					}), nil
 				}
@@ -1950,11 +2016,12 @@ func TestCrmService_REST3_ReadEngine(t *testing.T) {
 	rc := bitrix.NewRestClient(cfg, tm, config.NewLogger(nil, "silent"), &http.Client{Transport: rt})
 	crm := bitrix.NewCrmService(cfg, rc)
 
-	// 4. SearchItems calls REST 3.0 crm.deal.list with curated select & single-call pagination
+	// 2. SearchItems calls REST 3.0 crm.deal.list with curated select & single-call pagination (page + limit)
 	searchRes, err := crm.SearchItems(ctx, bitrix.SearchItemsInput{
 		ConnectionID: conn.ID,
 		EntityTypeID: 2,
 		Limit:        500,
+		Page:         2,
 	})
 	if err != nil {
 		t.Fatalf("SearchItems failed: %v", err)
@@ -1978,48 +2045,78 @@ func TestCrmService_REST3_ReadEngine(t *testing.T) {
 	if !strings.Contains(lastSearchReq.URL, "/rest/api/crm.deal.list") {
 		t.Errorf("expected REST 3.0 crm.deal.list, got: %s", lastSearchReq.URL)
 	}
-	if pag, ok := lastSearchReq.Body["pagination"].(map[string]any); !ok || pag["limit"] != float64(500) && pag["limit"] != 500 {
-		t.Errorf("expected pagination limit 500, got: %v", lastSearchReq.Body["pagination"])
+	if pag, ok := lastSearchReq.Body["pagination"].(map[string]any); !ok || (pag["limit"] != float64(500) && pag["limit"] != 500) || (pag["page"] != float64(2) && pag["page"] != 2) {
+		t.Errorf("expected pagination limit 500 and page 2, got: %v", lastSearchReq.Body["pagination"])
 	}
-	if selList, ok := lastSearchReq.Body["select"].([]any); !ok || slices.Contains(selList, any("*")) {
-		t.Errorf("expected curated select list without wildcard, got: %v", lastSearchReq.Body["select"])
+	selList, ok := lastSearchReq.Body["select"].([]any)
+	if !ok || slices.Contains(selList, any("*")) || !slices.Contains(selList, any("stage.name")) || !slices.Contains(selList, any("company.title")) {
+		t.Errorf("expected curated select list with relational fields and without wildcard, got: %v", lastSearchReq.Body["select"])
 	}
 
-	// 5. SearchItems with substring filter falls back to legacy crm.item.list.json with start: -1
-	subRes, err := crm.SearchItems(ctx, bitrix.SearchItemsInput{
+	// 3. SearchItems with custom select normalizes ufCrm... -> UF_CRM_... and injects id, and translates logical group filter
+	_, err = crm.SearchItems(ctx, bitrix.SearchItemsInput{
 		ConnectionID: conn.ID,
 		EntityTypeID: 2,
-		Filter:       map[string]any{"%TITLE": "Substring"},
-		Limit:        50,
+		Select:       []string{"title", "stage.name", "ufCrmCustomCode"},
+		Filter: map[string]any{
+			"type":  "filter",
+			"logic": "or",
+			"conditions": []any{
+				[]any{"stageId", "=", "NEW"},
+				[]any{"opportunity", ">=", 1000},
+			},
+		},
+		Limit: 25,
 	})
 	if err != nil {
-		t.Fatalf("SearchItems with substring filter failed: %v", err)
-	}
-	if len(subRes.Items) != 1 || subRes.Items[0]["id"] != float64(999) && subRes.Items[0]["id"] != 999 {
-		t.Fatalf("unexpected items in substring searchRes: %+v", subRes.Items)
+		t.Fatalf("SearchItems with logical group filter failed: %v", err)
 	}
 	mu.Lock()
-	var lastLegacyReq struct {
-		Method string
-		URL    string
-		Body   map[string]any
-		Raw    string
-	}
-	for _, req := range recordedRequests {
-		if strings.Contains(req.URL, "crm.item.list.json") {
-			lastLegacyReq = req
-		}
-	}
+	lastSearchReq = recordedRequests[len(recordedRequests)-1]
 	mu.Unlock()
-	if !strings.Contains(lastLegacyReq.URL, "crm.item.list.json") {
-		t.Errorf("expected legacy crm.item.list.json fallback for substring match, got: %s", lastLegacyReq.URL)
+	customSel, _ := lastSearchReq.Body["select"].([]any)
+	if len(customSel) == 0 || customSel[0] != "id" || !slices.Contains(customSel, any("UF_CRM_CUSTOMCODE")) || !slices.Contains(customSel, any("stage.name")) {
+		t.Errorf("expected ['id', 'title', 'stage.name', 'UF_CRM_CUSTOMCODE'], got: %v", customSel)
 	}
-	if lastLegacyReq.Body["start"] != -1 && lastLegacyReq.Body["start"] != float64(-1) {
-		t.Errorf("expected start: -1 on legacy list query, got: %v", lastLegacyReq.Body["start"])
+	groupFilter, ok := lastSearchReq.Body["filter"].(map[string]any)
+	if !ok || groupFilter["type"] != "filter" || groupFilter["logic"] != "or" {
+		t.Errorf("expected logical filter group preserved as map in request body, got: %v", lastSearchReq.Body["filter"])
 	}
 
-	// 6. GetItem calls REST 3.0 crm.deal.get with explicit select
-	getItemRes, err := crm.GetItem(ctx, conn.ID, 2, 42)
+	// 4. SearchItems with substring filter (both legacy %TITLE map and REST 3.0 like slice) falls back to legacy crm.item.list.json with start: -1
+	for _, subFilter := range []any{
+		map[string]any{"%TITLE": "Substring"},
+		[]any{[]any{"title", "like", "%Substring%"}},
+	} {
+		subRes, err := crm.SearchItems(ctx, bitrix.SearchItemsInput{
+			ConnectionID: conn.ID,
+			EntityTypeID: 2,
+			Filter:       subFilter,
+			Limit:        50,
+		})
+		if err != nil {
+			t.Fatalf("SearchItems with substring filter %v failed: %v", subFilter, err)
+		}
+		if len(subRes.Items) != 1 || subRes.Items[0]["id"] != float64(999) && subRes.Items[0]["id"] != 999 {
+			t.Fatalf("unexpected items in substring searchRes: %+v", subRes.Items)
+		}
+		mu.Lock()
+		lastLegacyReq := recordedRequests[len(recordedRequests)-1]
+		mu.Unlock()
+		if !strings.Contains(lastLegacyReq.URL, "crm.item.list.json") {
+			t.Errorf("expected legacy crm.item.list.json fallback for substring match, got: %s", lastLegacyReq.URL)
+		}
+		if lastLegacyReq.Body["start"] != -1 && lastLegacyReq.Body["start"] != float64(-1) {
+			t.Errorf("expected start: -1 on legacy list query, got: %v", lastLegacyReq.Body["start"])
+		}
+		legacyFilterMap, ok := lastLegacyReq.Body["filter"].(map[string]any)
+		if !ok || (legacyFilterMap["%TITLE"] == nil && legacyFilterMap["%title"] == nil) {
+			t.Errorf("expected %%TITLE or %%title in legacy fallback filter, got: %v", lastLegacyReq.Body["filter"])
+		}
+	}
+
+	// 5. GetItem calls REST 3.0 crm.deal.get with explicit select (default and custom)
+	getItemRes, err := crm.GetItem(ctx, conn.ID, 2, 42, []string{"title", "stage.name", "ufCrmCustomCode"})
 	if err != nil {
 		t.Fatalf("GetItem failed: %v", err)
 	}
@@ -2043,17 +2140,35 @@ func TestCrmService_REST3_ReadEngine(t *testing.T) {
 	if !strings.Contains(lastGetReq.URL, "/rest/api/crm.deal.get") {
 		t.Errorf("expected REST 3.0 crm.deal.get, got: %s", lastGetReq.URL)
 	}
-	if selList, ok := lastGetReq.Body["select"].([]any); !ok || slices.Contains(selList, any("*")) {
-		t.Errorf("expected explicit select list for GetItem, got: %v", lastGetReq.Body["select"])
+	if selList, ok := lastGetReq.Body["select"].([]any); !ok || !slices.Contains(selList, any("UF_CRM_CUSTOMCODE")) || !slices.Contains(selList, any("stage.name")) {
+		t.Errorf("expected custom select list for GetItem, got: %v", lastGetReq.Body["select"])
 	}
 
-	// 7. GetItems calls REST 3.0 crm.deal.list with filter id in [10, 20] and preserves order
-	getItemsRes, err := crm.GetItems(ctx, conn.ID, 2, []int{10, 20})
+	// 6. GetItems calls REST 3.0 crm.deal.list with filter id in [10, 20] and returns slice ordered by requested IDs [10, 20]
+	getItemsRes, err := crm.GetItems(ctx, conn.ID, 2, []int{10, 20}, []string{"title", "stage.name"})
 	if err != nil {
 		t.Fatalf("GetItems failed: %v", err)
 	}
-	if getItemsRes["10"] == nil || getItemsRes["20"] == nil {
-		t.Fatalf("expected items 10 and 20 in GetItems result, got: %+v", getItemsRes)
+	if len(getItemsRes) != 2 {
+		t.Fatalf("expected 2 items in GetItems result, got: %+v", getItemsRes)
+	}
+	if (getItemsRes[0]["id"] != float64(10) && getItemsRes[0]["id"] != 10) || (getItemsRes[1]["id"] != float64(20) && getItemsRes[1]["id"] != 20) {
+		t.Errorf("expected GetItems to preserve requested order [10, 20], got: %+v", getItemsRes)
+	}
+
+	// GetItems with 0 matching items returns empty slice without error
+	emptyItemsRes, err := crm.GetItems(ctx, conn.ID, 2, []int{99999})
+	if err != nil || len(emptyItemsRes) != 0 {
+		t.Errorf("expected empty slice for 0 matching items, got %v err=%v", emptyItemsRes, err)
+	}
+
+	// GetItems in REST 3.0 mode supports > 250 IDs (up to 1000)
+	manyIDs := make([]int, 300)
+	for i := range manyIDs {
+		manyIDs[i] = i + 1
+	}
+	if _, err := crm.GetItems(ctx, conn.ID, 2, manyIDs); err != nil {
+		t.Errorf("expected GetItems in REST 3.0 mode to allow 300 IDs (up to 1000), got err: %v", err)
 	}
 
 	// 8. CountItems calls REST 3.0 crm.deal.aggregate

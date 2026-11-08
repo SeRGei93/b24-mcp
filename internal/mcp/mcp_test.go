@@ -726,10 +726,19 @@ func TestMCPServer_SchemaDiscoveryTools_QuoteAndDictionaries(t *testing.T) {
 func TestMCPServer_ReadEngineTools_REST3(t *testing.T) {
 	ctx := context.Background()
 
+	var lastListBody map[string]any
+	var lastGetBody map[string]any
+
 	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		path := r.URL.Path
+		var bodyMap map[string]any
+		if r.Body != nil {
+			b, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(b, &bodyMap)
+		}
 
 		if strings.HasSuffix(path, "/rest/api/crm.deal.list") {
+			lastListBody = bodyMap
 			return jsonResponse(200, map[string]any{
 				"result": map[string]any{
 					"items": []map[string]any{
@@ -741,6 +750,7 @@ func TestMCPServer_ReadEngineTools_REST3(t *testing.T) {
 			}), nil
 		}
 		if strings.HasSuffix(path, "/rest/api/crm.deal.get") {
+			lastGetBody = bodyMap
 			return jsonResponse(200, map[string]any{
 				"result": map[string]any{
 					"item": map[string]any{"id": 42, "title": "MCP Single Deal"},
@@ -828,14 +838,16 @@ func TestMCPServer_ReadEngineTools_REST3(t *testing.T) {
 		t.Fatalf("Initialize failed: %v", err)
 	}
 
-	// 1. bitrix_search_items
+	// 1. bitrix_search_items with REST 3.0 expression slice filter and page: 2
 	searchRes, err := inProc.CallTool(ctx, mcpproto.CallToolRequest{
 		Params: mcpproto.CallToolParams{
 			Name: "bitrix_search_items",
 			Arguments: map[string]any{
 				"connectionId": conn.ID,
 				"entityTypeId": 2,
+				"filter":       []any{[]any{"stageId", "=", "NEW"}},
 				"limit":        10,
+				"page":         2,
 			},
 		},
 	})
@@ -846,8 +858,14 @@ func TestMCPServer_ReadEngineTools_REST3(t *testing.T) {
 	if !strings.Contains(searchText, "MCP Deal 1") {
 		t.Errorf("expected MCP Deal 1 in search response: %s", searchText)
 	}
+	if pag, ok := lastListBody["pagination"].(map[string]any); !ok || (pag["page"] != float64(2) && pag["page"] != 2) {
+		t.Errorf("expected page: 2 in outbound search pagination, got: %v", lastListBody["pagination"])
+	}
+	if fSlice, ok := lastListBody["filter"].([]any); !ok || len(fSlice) != 1 {
+		t.Errorf("expected REST 3.0 expression slice filter forwarded, got: %v", lastListBody["filter"])
+	}
 
-	// 2. bitrix_get_item (single)
+	// 2. bitrix_get_item (single with custom select)
 	getItemRes, err := inProc.CallTool(ctx, mcpproto.CallToolRequest{
 		Params: mcpproto.CallToolParams{
 			Name: "bitrix_get_item",
@@ -855,6 +873,7 @@ func TestMCPServer_ReadEngineTools_REST3(t *testing.T) {
 				"connectionId": conn.ID,
 				"entityTypeId": 2,
 				"id":           42,
+				"select":       []any{"title", "stage.name"},
 			},
 		},
 	})
@@ -865,8 +884,11 @@ func TestMCPServer_ReadEngineTools_REST3(t *testing.T) {
 	if !strings.Contains(getItemText, "MCP Single Deal") {
 		t.Errorf("expected MCP Single Deal in get response: %s", getItemText)
 	}
+	if selSlice, ok := lastGetBody["select"].([]any); !ok || len(selSlice) != 3 || selSlice[0] != "id" {
+		t.Errorf("expected custom select ['id', 'title', 'stage.name'] forwarded to crm.deal.get, got: %v", lastGetBody["select"])
+	}
 
-	// 3. bitrix_get_item (multiple ids)
+	// 3. bitrix_get_item (multiple ids with custom select)
 	getItemsRes, err := inProc.CallTool(ctx, mcpproto.CallToolRequest{
 		Params: mcpproto.CallToolParams{
 			Name: "bitrix_get_item",
@@ -874,6 +896,7 @@ func TestMCPServer_ReadEngineTools_REST3(t *testing.T) {
 				"connectionId": conn.ID,
 				"entityTypeId": 2,
 				"ids":          []int{1, 2},
+				"select":       []any{"title", "stage.name"},
 			},
 		},
 	})
@@ -883,6 +906,9 @@ func TestMCPServer_ReadEngineTools_REST3(t *testing.T) {
 	getItemsText := getItemsRes.Content[0].(mcpproto.TextContent).Text
 	if !strings.Contains(getItemsText, "MCP Deal 1") {
 		t.Errorf("expected MCP Deal 1 in getItems response: %s", getItemsText)
+	}
+	if selSlice, ok := lastListBody["select"].([]any); !ok || len(selSlice) != 3 || selSlice[0] != "id" {
+		t.Errorf("expected custom select ['id', 'title', 'stage.name'] forwarded to bulk crm.deal.list, got: %v", lastListBody["select"])
 	}
 
 	// 4. bitrix_count_items

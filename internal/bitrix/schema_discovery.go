@@ -3,7 +3,6 @@ package bitrix
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strings"
 	"unicode"
@@ -21,61 +20,191 @@ type EntityType struct {
 	IsDynamic    bool   `json:"isDynamic"`
 }
 
-var BuiltInTypes = []EntityType{
-	{EntityTypeID: 1, Title: "Lead", IsDynamic: false},
-	{EntityTypeID: 2, Title: "Deal", IsDynamic: false},
-	{EntityTypeID: 3, Title: "Contact", IsDynamic: false},
-	{EntityTypeID: 4, Title: "Company", IsDynamic: false},
-	{EntityTypeID: 7, Title: "Quote", IsDynamic: false},
-	{EntityTypeID: 31, Title: "Invoice", IsDynamic: false},
+type entityMeta struct {
+	entityTypeID       int
+	title              string
+	code               string
+	slug               string
+	ownerTypeCode      string
+	supportsCategories bool
+	supportsStages     bool
+	defaultSelect      []string
+	stagePrefix        string
 }
 
-func EntitySlug(entityTypeID int) (string, error) {
-	switch entityTypeID {
-	case 1:
-		return "lead", nil
-	case 2:
-		return "deal", nil
-	case 3:
-		return "contact", nil
-	case 4:
-		return "company", nil
-	case 7:
-		return "quote", nil
-	case 31:
-		return "smartinvoice", nil
-	default:
-		if entityTypeID >= 128 {
-			return fmt.Sprintf("smartprocess%d", entityTypeID), nil
-		}
-		return "", config.NewAppError(fmt.Sprintf("Unsupported CRM entityTypeId: %d", entityTypeID), "INVALID_ENTITY_TYPE", 400)
+var (
+	builtInEntityMeta = []entityMeta{
+		{
+			entityTypeID:       1,
+			title:              "Lead",
+			code:               "LEAD",
+			slug:               "lead",
+			ownerTypeCode:      "L",
+			supportsCategories: false,
+			supportsStages:     true,
+			stagePrefix:        "STATUS",
+			defaultSelect: []string{
+				"id", "title", "name", "lastName", "companyTitle", "statusId", "stage.name",
+				"opportunity", "currencyId", "assignedById", "assignedBy.firstName", "assignedBy.lastName",
+				"createdTime", "updatedTime",
+			},
+		},
+		{
+			entityTypeID:       2,
+			title:              "Deal",
+			code:               "DEAL",
+			slug:               "deal",
+			ownerTypeCode:      "D",
+			supportsCategories: true,
+			supportsStages:     true,
+			stagePrefix:        "DEAL_STAGE",
+			defaultSelect: []string{
+				"id", "title", "stageId", "stage.name", "categoryId", "category.name",
+				"opportunity", "currencyId", "companyId", "company.title", "contactId", "contact.name",
+				"assignedById", "assignedBy.firstName", "assignedBy.lastName",
+				"begindate", "closedate", "createdTime", "updatedTime",
+			},
+		},
+		{
+			entityTypeID:       3,
+			title:              "Contact",
+			code:               "CONTACT",
+			slug:               "contact",
+			ownerTypeCode:      "C",
+			supportsCategories: false,
+			supportsStages:     false,
+			defaultSelect: []string{
+				"id", "name", "lastName", "secondName", "companyId", "company.title",
+				"typeId", "assignedById", "assignedBy.firstName", "assignedBy.lastName",
+				"createdTime", "updatedTime",
+			},
+		},
+		{
+			entityTypeID:       4,
+			title:              "Company",
+			code:               "COMPANY",
+			slug:               "company",
+			ownerTypeCode:      "CO",
+			supportsCategories: false,
+			supportsStages:     false,
+			defaultSelect: []string{
+				"id", "title", "companyType", "assignedById", "assignedBy.firstName", "assignedBy.lastName",
+				"createdTime", "updatedTime",
+			},
+		},
+		{
+			entityTypeID:       7,
+			title:              "Quote",
+			code:               "QUOTE",
+			slug:               "quote",
+			ownerTypeCode:      "Q",
+			supportsCategories: false,
+			supportsStages:     true,
+			stagePrefix:        "QUOTE_STATUS",
+			defaultSelect: []string{
+				"id", "title", "statusId", "stage.name",
+				"opportunity", "currencyId", "companyId", "company.title", "contactId", "contact.name",
+				"assignedById", "assignedBy.firstName", "assignedBy.lastName",
+				"begindate", "closedate", "createdTime", "updatedTime",
+			},
+		},
+		{
+			entityTypeID:       31,
+			title:              "Invoice",
+			code:               "SMART_INVOICE",
+			slug:               "smartinvoice",
+			ownerTypeCode:      "SI",
+			supportsCategories: true,
+			supportsStages:     true,
+			stagePrefix:        "SMART_INVOICE_STAGE",
+			defaultSelect: []string{
+				"id", "title", "stageId", "stage.name", "categoryId", "category.name",
+				"opportunity", "currencyId", "companyId", "company.title", "contactId", "contact.name",
+				"assignedById", "assignedBy.firstName", "assignedBy.lastName",
+				"begindate", "closedate", "createdTime", "updatedTime",
+			},
+		},
 	}
+
+	defaultDynamicSelect = []string{
+		"id", "title", "stageId", "stage.name", "categoryId", "category.name",
+		"opportunity", "currencyId", "companyId", "company.title", "contactId", "contact.name",
+		"assignedById", "assignedBy.firstName", "assignedBy.lastName",
+		"createdTime", "updatedTime",
+	}
+
+	BuiltInTypes = []EntityType{
+		{EntityTypeID: 1, Title: "Lead", IsDynamic: false},
+		{EntityTypeID: 2, Title: "Deal", IsDynamic: false},
+		{EntityTypeID: 3, Title: "Contact", IsDynamic: false},
+		{EntityTypeID: 4, Title: "Company", IsDynamic: false},
+		{EntityTypeID: 7, Title: "Quote", IsDynamic: false},
+		{EntityTypeID: 31, Title: "Invoice", IsDynamic: false},
+	}
+)
+
+func getEntityMeta(entityTypeID int) (entityMeta, bool) {
+	for _, m := range builtInEntityMeta {
+		if m.entityTypeID == entityTypeID {
+			return m, true
+		}
+	}
+	if entityTypeID >= 128 {
+		return entityMeta{
+			entityTypeID:       entityTypeID,
+			title:              fmt.Sprintf("Entity %d", entityTypeID),
+			code:               fmt.Sprintf("DYNAMIC_%d", entityTypeID),
+			slug:               fmt.Sprintf("smartprocess%d", entityTypeID),
+			ownerTypeCode:      fmt.Sprintf("T%x", entityTypeID),
+			supportsCategories: true,
+			supportsStages:     true,
+			stagePrefix:        fmt.Sprintf("DYNAMIC_%d_STAGE", entityTypeID),
+			defaultSelect:      defaultDynamicSelect,
+		}, true
+	}
+	return entityMeta{
+		entityTypeID:  entityTypeID,
+		code:          fmt.Sprintf("DYNAMIC_%d", entityTypeID),
+		ownerTypeCode: fmt.Sprintf("T%x", entityTypeID),
+		stagePrefix:   fmt.Sprintf("DYNAMIC_%d_STAGE", entityTypeID),
+		defaultSelect: defaultDynamicSelect,
+	}, false
 }
 
-func SupportsCategories(entityTypeID int) bool {
-	return entityTypeID == 2 || entityTypeID == 31 || entityTypeID >= 128
+func entitySlug(entityTypeID int) (string, error) {
+	if meta, ok := getEntityMeta(entityTypeID); ok {
+		return meta.slug, nil
+	}
+	return "", config.NewAppError(fmt.Sprintf("Unsupported CRM entityTypeId: %d", entityTypeID), "INVALID_ENTITY_TYPE", 400)
 }
 
-func SupportsStages(entityTypeID int) bool {
-	return entityTypeID == 1 || entityTypeID == 2 || entityTypeID == 7 || entityTypeID == 31 || entityTypeID >= 128
+func supportsCategories(entityTypeID int) bool {
+	meta, _ := getEntityMeta(entityTypeID)
+	return meta.supportsCategories
+}
+
+func supportsStages(entityTypeID int) bool {
+	meta, _ := getEntityMeta(entityTypeID)
+	return meta.supportsStages
 }
 
 func entityCode(entityTypeID int) string {
+	meta, _ := getEntityMeta(entityTypeID)
+	return meta.code
+}
+
+func stageEntityID(entityTypeID, categoryID int) string {
+	meta, _ := getEntityMeta(entityTypeID)
 	switch entityTypeID {
-	case 1:
-		return "LEAD"
+	case 1, 7:
+		return meta.stagePrefix
 	case 2:
-		return "DEAL"
-	case 3:
-		return "CONTACT"
-	case 4:
-		return "COMPANY"
-	case 7:
-		return "QUOTE"
-	case 31:
-		return "SMART_INVOICE"
+		if categoryID == 0 {
+			return meta.stagePrefix
+		}
+		return fmt.Sprintf("%s_%d", meta.stagePrefix, categoryID)
 	default:
-		return fmt.Sprintf("DYNAMIC_%d", entityTypeID)
+		return fmt.Sprintf("%s_%d", meta.stagePrefix, categoryID)
 	}
 }
 
@@ -91,20 +220,6 @@ func NewSchemaDiscovery(cfg *config.Config, st *store.Store, client *RestClient)
 		store:  st,
 		client: client,
 	}
-}
-
-func (s *SchemaDiscovery) isV2Mode(ctx context.Context, connectionID string) bool {
-	if s.cfg.BitrixAPIVersion == config.APIVersionV2 {
-		return true
-	}
-	if s.store != nil {
-		var cachedVersion string
-		found, err := s.store.GetSchemaCache(ctx, connectionID, "api_version", s.cfg.SchemaCacheTTLSeconds, &cachedVersion)
-		if err == nil && found && cachedVersion == config.APIVersionV2 {
-			return true
-		}
-	}
-	return false
 }
 
 func (s *SchemaDiscovery) ListEntityTypes(ctx context.Context, connectionID string, refresh bool) ([]map[string]any, error) {
@@ -149,13 +264,13 @@ func (s *SchemaDiscovery) ListEntityTypes(ctx context.Context, connectionID stri
 		normItem["entityTypeId"] = id
 		normItem["title"] = title
 		normItem["isDynamic"] = true
-		if slug, err := EntitySlug(id); err == nil {
+		if slug, err := entitySlug(id); err == nil {
 			normItem["slug"] = slug
 		}
-		normItem["supportsCategories"] = SupportsCategories(id)
-		normItem["supportsStages"] = SupportsStages(id)
+		normItem["supportsCategories"] = supportsCategories(id)
+		normItem["supportsStages"] = supportsStages(id)
 		if _, ok := normItem["code"]; !ok {
-			normItem["code"] = fmt.Sprintf("DYNAMIC_%d", id)
+			normItem["code"] = entityCode(id)
 		}
 		dynamic = append(dynamic, normItem)
 		existingIDs[id] = true
@@ -164,15 +279,15 @@ func (s *SchemaDiscovery) ListEntityTypes(ctx context.Context, connectionID stri
 	result := make([]map[string]any, 0, len(BuiltInTypes)+len(dynamic))
 	for _, bi := range BuiltInTypes {
 		if !existingIDs[bi.EntityTypeID] {
-			slug, _ := EntitySlug(bi.EntityTypeID)
+			slug, _ := entitySlug(bi.EntityTypeID)
 			result = append(result, map[string]any{
 				"entityTypeId":       bi.EntityTypeID,
 				"title":              bi.Title,
 				"isDynamic":          bi.IsDynamic,
 				"code":               entityCode(bi.EntityTypeID),
 				"slug":               slug,
-				"supportsCategories": SupportsCategories(bi.EntityTypeID),
-				"supportsStages":     SupportsStages(bi.EntityTypeID),
+				"supportsCategories": supportsCategories(bi.EntityTypeID),
+				"supportsStages":     supportsStages(bi.EntityTypeID),
 			})
 		}
 	}
@@ -210,19 +325,14 @@ func (s *SchemaDiscovery) Fields(ctx context.Context, connectionID string, entit
 	}
 
 	var fields map[string]any
-	slug, slugErr := EntitySlug(entityTypeID)
-	if slugErr == nil && !s.isV2Mode(ctx, connectionID) {
+	slug, slugErr := entitySlug(entityTypeID)
+	if slugErr == nil && !s.client.IsV2Mode(ctx, connectionID) {
 		method := fmt.Sprintf("crm.%s.fields", slug)
 		resp, err := s.client.Call(ctx, connectionID, method, map[string]any{})
 		if err == nil {
 			fields = extractFields(resp.Result)
-		} else {
-			var appErr *config.AppError
-			if errors.As(err, &appErr) && isVersionFallbackError(appErr) {
-				// fall back to legacy crm.item.fields
-			} else {
-				return nil, err
-			}
+		} else if !s.client.ShouldFallbackToV2(err) {
+			return nil, err
 		}
 	}
 
@@ -250,25 +360,20 @@ func (s *SchemaDiscovery) Categories(ctx context.Context, connectionID string, e
 		}
 	}
 
-	if !SupportsCategories(entityTypeID) {
+	if !supportsCategories(entityTypeID) {
 		_ = s.store.SetSchemaCache(ctx, connectionID, key, []map[string]any{})
 		return []map[string]any{}, nil
 	}
 
 	var cats []map[string]any
-	slug, slugErr := EntitySlug(entityTypeID)
-	if slugErr == nil && !s.isV2Mode(ctx, connectionID) && (entityTypeID == 2 || entityTypeID >= 128) {
+	slug, slugErr := entitySlug(entityTypeID)
+	if slugErr == nil && !s.client.IsV2Mode(ctx, connectionID) && (entityTypeID == 2 || entityTypeID >= 128) {
 		method := fmt.Sprintf("crm.%s.category.list", slug)
 		loaded, err := s.collect(ctx, connectionID, method, map[string]any{}, "items")
 		if err == nil {
 			cats = loaded
-		} else {
-			var appErr *config.AppError
-			if errors.As(err, &appErr) && isVersionFallbackError(appErr) {
-				// fall through to legacy
-			} else {
-				return nil, err
-			}
+		} else if !s.client.ShouldFallbackToV2(err) {
+			return nil, err
 		}
 	}
 
@@ -301,21 +406,16 @@ func (s *SchemaDiscovery) Stages(ctx context.Context, connectionID string, entit
 	}
 
 	var stages []map[string]any
-	slug, slugErr := EntitySlug(entityTypeID)
-	if slugErr == nil && !s.isV2Mode(ctx, connectionID) && (entityTypeID == 2 || entityTypeID >= 128) {
+	slug, slugErr := entitySlug(entityTypeID)
+	if slugErr == nil && !s.client.IsV2Mode(ctx, connectionID) && (entityTypeID == 2 || entityTypeID >= 128) {
 		method := fmt.Sprintf("crm.%s.category.stage.list", slug)
 		loaded, err := s.collect(ctx, connectionID, method, map[string]any{
 			"filter": []any{"categoryId", "=", categoryID},
 		}, "items")
 		if err == nil {
 			stages = loaded
-		} else {
-			var appErr *config.AppError
-			if errors.As(err, &appErr) && isVersionFallbackError(appErr) {
-				// fall through to legacy
-			} else {
-				return nil, err
-			}
+		} else if !s.client.ShouldFallbackToV2(err) {
+			return nil, err
 		}
 	}
 
@@ -337,6 +437,21 @@ func (s *SchemaDiscovery) Stages(ctx context.Context, connectionID string, entit
 
 	_ = s.store.SetSchemaCache(ctx, connectionID, key, stages)
 	return stages, nil
+}
+
+func buildLegacyStageBatchCommands(entityTypeID int, catIDs []int) []NamedBatchCommand {
+	commands := make([]NamedBatchCommand, 0, len(catIDs))
+	for _, cID := range catIDs {
+		commands = append(commands, NamedBatchCommand{
+			Key:    fmt.Sprintf("cat_%d", cID),
+			Method: "crm.status.list",
+			Params: map[string]any{
+				"filter": map[string]any{"ENTITY_ID": stageEntityID(entityTypeID, cID)},
+				"order":  map[string]any{"SORT": "ASC"},
+			},
+		})
+	}
+	return commands
 }
 
 func (s *SchemaDiscovery) Describe(
@@ -419,8 +534,8 @@ func (s *SchemaDiscovery) Describe(
 		}
 		stagesByCategory[cID] = loaded
 	} else if len(uncachedCatIDs) > 1 {
-		slug, slugErr := EntitySlug(entityTypeID)
-		useV3 := slugErr == nil && !s.isV2Mode(ctx, connectionID) && (entityTypeID == 2 || entityTypeID >= 128)
+		slug, slugErr := entitySlug(entityTypeID)
+		useV3 := slugErr == nil && !s.client.IsV2Mode(ctx, connectionID) && (entityTypeID == 2 || entityTypeID >= 128)
 
 		var commands []NamedBatchCommand
 		if useV3 {
@@ -434,36 +549,12 @@ func (s *SchemaDiscovery) Describe(
 				})
 			}
 		} else {
-			for _, cID := range uncachedCatIDs {
-				commands = append(commands, NamedBatchCommand{
-					Key:    fmt.Sprintf("cat_%d", cID),
-					Method: "crm.status.list",
-					Params: map[string]any{
-						"filter": map[string]any{"ENTITY_ID": stageEntityID(entityTypeID, cID)},
-						"order":  map[string]any{"SORT": "ASC"},
-					},
-				})
-			}
+			commands = buildLegacyStageBatchCommands(entityTypeID, uncachedCatIDs)
 		}
 
 		batchRes, batchErr := s.client.CallBatch(ctx, connectionID, commands, false)
-		if batchErr != nil && useV3 {
-			var appErr *config.AppError
-			if errors.As(batchErr, &appErr) && isVersionFallbackError(appErr) {
-				useV3 = false
-				var legacyCommands []NamedBatchCommand
-				for _, cID := range uncachedCatIDs {
-					legacyCommands = append(legacyCommands, NamedBatchCommand{
-						Key:    fmt.Sprintf("cat_%d", cID),
-						Method: "crm.status.list",
-						Params: map[string]any{
-							"filter": map[string]any{"ENTITY_ID": stageEntityID(entityTypeID, cID)},
-							"order":  map[string]any{"SORT": "ASC"},
-						},
-					})
-				}
-				batchRes, batchErr = s.client.CallBatch(ctx, connectionID, legacyCommands, false)
-			}
+		if batchErr != nil && useV3 && s.client.ShouldFallbackToV2(batchErr) {
+			batchRes, batchErr = s.client.CallBatch(ctx, connectionID, buildLegacyStageBatchCommands(entityTypeID, uncachedCatIDs), false)
 		}
 		if batchErr != nil {
 			return nil, batchErr
@@ -585,25 +676,6 @@ func (s *SchemaDiscovery) collect(
 	}
 	values, _, err := s.client.CollectPages(ctx, connectionID, method, params, 0, extract)
 	return values, err
-}
-
-func stageEntityID(entityTypeID, categoryID int) string {
-	if entityTypeID == 1 {
-		return "STATUS"
-	}
-	if entityTypeID == 2 {
-		if categoryID == 0 {
-			return "DEAL_STAGE"
-		}
-		return fmt.Sprintf("DEAL_STAGE_%d", categoryID)
-	}
-	if entityTypeID == 7 {
-		return "QUOTE_STATUS"
-	}
-	if entityTypeID == 31 {
-		return fmt.Sprintf("SMART_INVOICE_STAGE_%d", categoryID)
-	}
-	return fmt.Sprintf("DYNAMIC_%d_STAGE_%d", entityTypeID, categoryID)
 }
 
 func normalizeName(value string) string {

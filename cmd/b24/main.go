@@ -7,8 +7,10 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
+	_ "time/tzdata"
 
 	"github.com/SeRGei93/b24-mcp/internal/bitrix"
 	"github.com/SeRGei93/b24-mcp/internal/config"
@@ -19,11 +21,44 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 && isHealthcheckArg(os.Args[1]) {
+		if err := runHealthcheck(); err != nil {
+			os.Exit(1)
+		}
+		return
+	}
+
 	if err := run(); err != nil {
 		logger := config.StderrLogger("error")
 		logger.Error("Fatal startup error", map[string]any{"error": err.Error()})
 		os.Exit(1)
 	}
+}
+
+func isHealthcheckArg(arg string) bool {
+	switch strings.TrimSpace(arg) {
+	case "-healthcheck", "--healthcheck", "healthcheck":
+		return true
+	default:
+		return false
+	}
+}
+
+func runHealthcheck() error {
+	port := strings.TrimSpace(os.Getenv("PORT"))
+	if port == "" {
+		port = "3000"
+	}
+	client := &http.Client{Timeout: 4 * time.Second}
+	resp, err := client.Get("http://127.0.0.1:" + port + "/health")
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected health status: %d", resp.StatusCode)
+	}
+	return nil
 }
 
 func run() error {

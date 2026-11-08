@@ -44,6 +44,8 @@ jobs:
           context: .
           file: Dockerfile
           push: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
           tags: |
             ghcr.io/sergei93/b24-mcp:${{ github.sha }}
             ghcr.io/sergei93/b24-mcp:latest

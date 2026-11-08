@@ -753,7 +753,12 @@ func TestMCPServer_ReadEngineTools_REST3(t *testing.T) {
 			lastGetBody = bodyMap
 			return jsonResponse(200, map[string]any{
 				"result": map[string]any{
-					"item": map[string]any{"id": 42, "title": "MCP Single Deal"},
+					"item": map[string]any{
+						"id":        42,
+						"title":     "MCP Single Deal",
+						"contactId": 7,
+						"stage":     map[string]any{"name": "Формируется к отправке"},
+					},
 				},
 			}), nil
 		}
@@ -764,12 +769,56 @@ func TestMCPServer_ReadEngineTools_REST3(t *testing.T) {
 				},
 			}), nil
 		}
-		if strings.HasSuffix(path, "/rest/api/crm.productrow.list") {
+		if strings.HasSuffix(path, "/rest/api/crm.productrow.list") || strings.HasSuffix(path, "crm.item.productrow.list.json") {
 			return jsonResponse(200, map[string]any{
 				"result": map[string]any{
-					"items": []map[string]any{
-						{"id": 901, "ownerId": 1, "productName": "Cloud Hosting", "price": 49.99},
+					"productRows": []map[string]any{
+						{"id": 901, "ownerId": 1, "ownerType": "D", "productName": "Cloud Hosting", "price": 49.99, "quantity": 1},
 					},
+				},
+			}), nil
+		}
+		if strings.HasSuffix(path, "batch.json") {
+			return jsonResponse(200, map[string]any{
+				"result": map[string]any{
+					"result": map[string]any{
+						"1": map[string]any{
+							"productRows": []map[string]any{
+								{"id": 901, "ownerId": 1, "ownerType": "D", "productName": "Cloud Hosting", "price": 49.99, "quantity": 1},
+							},
+						},
+						"42": map[string]any{
+							"productRows": []map[string]any{
+								{"id": 902, "ownerId": 42, "ownerType": "D", "productName": "Товар в заказе 42", "price": 61.08, "quantity": 2},
+							},
+						},
+						"pay_42": []map[string]any{
+							{"id": 11, "accountNumber": "192522/1", "paid": "Y", "sum": 61.08, "currency": "BYN", "paySystemName": "QR-платежи «Оплати»"},
+						},
+						"deliv_42": []map[string]any{
+							{"id": 22, "accountNumber": "192522/2", "deducted": "N", "priceDelivery": 0, "currency": "BYN", "deliveryName": "пр. Независимости 95"},
+						},
+						"full_42": map[string]any{
+							"item": map[string]any{
+								"id":                   42,
+								"title":                "MCP Single Deal",
+								"ufCrm_DeliveryOption": "пр. Независимости 95",
+								"comments":             "Не перезванивать для подтверждения заказа",
+							},
+						},
+						"contact_7": map[string]any{
+							"item": map[string]any{
+								"id":       7,
+								"name":     "Маргарита",
+								"lastName": "Шевченко",
+								"fm": []map[string]any{
+									{"typeId": "PHONE", "value": "+375 29 210-97-95"},
+									{"typeId": "EMAIL", "value": "m.shevchenko.1099@gmail.com"},
+								},
+							},
+						},
+					},
+					"result_error": map[string]any{},
 				},
 			}), nil
 		}
@@ -886,6 +935,33 @@ func TestMCPServer_ReadEngineTools_REST3(t *testing.T) {
 	}
 	if selSlice, ok := lastGetBody["select"].([]any); !ok || len(selSlice) != 3 || selSlice[0] != "id" {
 		t.Errorf("expected custom select ['id', 'title', 'stage.name'] forwarded to crm.deal.get, got: %v", lastGetBody["select"])
+	}
+
+	// 2b. bitrix_get_item (single without select) returns full order details (productRows, payments, deliveries, custom fields, contact fm)
+	getFullOrderRes, err := inProc.CallTool(ctx, mcpproto.CallToolRequest{
+		Params: mcpproto.CallToolParams{
+			Name: "bitrix_get_item",
+			Arguments: map[string]any{
+				"connectionId": conn.ID,
+				"entityTypeId": 2,
+				"id":           42,
+			},
+		},
+	})
+	if err != nil || getFullOrderRes.IsError {
+		t.Fatalf("bitrix_get_item full order failed: %v, res: %+v", err, getFullOrderRes)
+	}
+	fullOrderText := getFullOrderRes.Content[0].(mcpproto.TextContent).Text
+	for _, expected := range []string{
+		"Товар в заказе 42",
+		"QR-платежи «Оплати»",
+		"пр. Независимости 95",
+		"ufCrm_DeliveryOption",
+		"+375 29 210-97-95",
+	} {
+		if !strings.Contains(fullOrderText, expected) {
+			t.Errorf("expected %q in full order response, got: %s", expected, fullOrderText)
+		}
 	}
 
 	// 3. bitrix_get_item (multiple ids with custom select)

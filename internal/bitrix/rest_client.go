@@ -41,8 +41,9 @@ type NamedBatchCommand struct {
 }
 
 type RequestOptions struct {
-	APIVersion     string
-	IdempotencyKey string
+	APIVersion        string
+	IdempotencyKey    string
+	IgnoreBatchErrors bool
 }
 
 type RequestOption func(*RequestOptions)
@@ -56,6 +57,12 @@ func WithAPIVersion(version string) RequestOption {
 func WithIdempotencyKey(key string) RequestOption {
 	return func(o *RequestOptions) {
 		o.IdempotencyKey = key
+	}
+}
+
+func WithIgnoreBatchErrors() RequestOption {
+	return func(o *RequestOptions) {
+		o.IgnoreBatchErrors = true
 	}
 }
 
@@ -362,7 +369,9 @@ func shouldCachePortalV2(method string, appErr *config.AppError) bool {
 	if appErr.Code == "HTTP_404" {
 		return true
 	}
-	if strings.HasSuffix(method, ".aggregate") || strings.HasSuffix(method, ".delete") {
+	if strings.HasSuffix(method, ".aggregate") ||
+		strings.HasSuffix(method, ".delete") ||
+		strings.HasPrefix(method, "crm.productrow.") {
 		return false
 	}
 	return isVersionFallbackError(appErr)
@@ -748,6 +757,9 @@ func (c *RestClient) callBatchV3(
 			for i, cmd := range chunk {
 				var itemResp BitrixResponse
 				if err := json.Unmarshal(resList[i], &itemResp); err == nil && itemResp.Error != "" {
+					if options.IgnoreBatchErrors {
+						continue
+					}
 					return nil, config.NewAppError(
 						fmt.Sprintf("Bitrix24 batch command '%s' failed (%s)", cmd.Key, itemResp.Error),
 						itemResp.Error,
@@ -759,8 +771,10 @@ func (c *RestClient) callBatchV3(
 		} else {
 			var batchPayload batchResultPayload
 			if err := json.Unmarshal(bitrixResp.Result, &batchPayload); err == nil {
-				if err := checkBatchResultErrors(batchPayload.ResultError); err != nil {
-					return nil, err
+				if !options.IgnoreBatchErrors {
+					if err := checkBatchResultErrors(batchPayload.ResultError); err != nil {
+						return nil, err
+					}
 				}
 				for _, cmd := range chunk {
 					if val, ok := batchPayload.Result[cmd.Key]; ok {
@@ -815,8 +829,10 @@ func (c *RestClient) callBatchV2(
 			return nil, err
 		}
 
-		if err := checkBatchResultErrors(batchPayload.ResultError); err != nil {
-			return nil, err
+		if !options.IgnoreBatchErrors {
+			if err := checkBatchResultErrors(batchPayload.ResultError); err != nil {
+				return nil, err
+			}
 		}
 
 		for _, cmd := range chunk {

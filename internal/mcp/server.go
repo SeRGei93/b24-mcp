@@ -274,7 +274,7 @@ func NewServer(
 	searchItemsTool := mcpproto.NewTool(
 		"bitrix_search_items",
 		mcpproto.WithTitleAnnotation("Search CRM items"),
-		mcpproto.WithDescription("Search leads, deals, contacts, companies, quotes, smart invoices, or SPA items with Bitrix filters and pagination. Set includeProductRows=true to fetch product rows for all matched items in one batch request."),
+		mcpproto.WithDescription("Search leads, deals, contacts, companies, quotes, smart invoices, or SPA items with Bitrix filters and pagination. Automatically includes productRows, payments, deliveries, and all custom fields by default."),
 		mcpproto.WithString("connectionId", mcpproto.Description("ID returned by bitrix_list_connections after OAuth authorization"), mcpproto.Required()),
 		mcpproto.WithInteger("entityTypeId", mcpproto.Description("Bitrix CRM entityTypeId (1 lead, 2 deal, 3 contact, 4 company, 7 quote, 31 smart invoice, or an SPA ID)"), mcpproto.Required()),
 		mcpproto.WithObject("filter", mcpproto.Description("Bitrix filter object or REST 3.0 filter expression array")),
@@ -282,7 +282,8 @@ func NewServer(
 		mcpproto.WithObject("order", mcpproto.Description("Order map (e.g. {'id': 'ASC'})")),
 		mcpproto.WithInteger("limit", mcpproto.Description("Maximum items to return (up to 1000)"), mcpproto.DefaultNumber(100)),
 		mcpproto.WithInteger("page", mcpproto.Description("Page number for pagination (1-based)"), mcpproto.DefaultNumber(1)),
-		mcpproto.WithBoolean("includeProductRows", mcpproto.Description("Automatically batch-fetch product rows for all returned items in one request"), mcpproto.DefaultBool(false)),
+		mcpproto.WithBoolean("includeDetails", mcpproto.Description("Automatically batch-fetch product rows, payments, deliveries, and full custom fields for returned items (default true)"), mcpproto.DefaultBool(true)),
+		mcpproto.WithBoolean("includeProductRows", mcpproto.Description("Alias for includeDetails (default true)"), mcpproto.DefaultBool(true)),
 		mcpproto.WithReadOnlyHintAnnotation(true),
 		mcpproto.WithDestructiveHintAnnotation(false),
 	)
@@ -317,17 +318,15 @@ func NewServer(
 				}
 			}
 
-			incRows, _ := args["includeProductRows"].(bool)
-
 			return crm.SearchItems(ctx, bitrix.SearchItemsInput{
-				ConnectionID:       connID,
-				EntityTypeID:       bitrix.ToInt(args["entityTypeId"]),
-				Filter:             filter,
-				Select:             sel,
-				Order:              order,
-				Limit:              limit,
-				Page:               page,
-				IncludeProductRows: incRows,
+				ConnectionID:   connID,
+				EntityTypeID:   bitrix.ToInt(args["entityTypeId"]),
+				Filter:         filter,
+				Select:         sel,
+				Order:          order,
+				Limit:          limit,
+				Page:           page,
+				IncludeDetails: extractIncludeDetails(args),
 			})
 		}), nil
 	})
@@ -372,12 +371,14 @@ func NewServer(
 	getItemTool := mcpproto.NewTool(
 		"bitrix_get_item",
 		mcpproto.WithTitleAnnotation("Get CRM item(s)"),
-		mcpproto.WithDescription("Get one CRM/SPA item by id, or up to 1000 items in a single call by supplying ids."),
+		mcpproto.WithDescription("Get one CRM/SPA item by id, or up to 1000 items in a single call by supplying ids. Automatically includes productRows, payments, deliveries, and all custom fields by default."),
 		mcpproto.WithString("connectionId", mcpproto.Description("ID returned by bitrix_list_connections after OAuth authorization"), mcpproto.Required()),
 		mcpproto.WithInteger("entityTypeId", mcpproto.Description("Bitrix CRM entityTypeId"), mcpproto.Required()),
 		mcpproto.WithInteger("id", mcpproto.Description("Single CRM item ID")),
 		mcpproto.WithArray("ids", mcpproto.Description("Multiple CRM item IDs (up to 1000) to fetch in one request")),
 		mcpproto.WithArray("select", mcpproto.Description("Fields to select (supports relational dot-notation such as stage.name, company.title)")),
+		mcpproto.WithBoolean("includeDetails", mcpproto.Description("Automatically include productRows, payments, deliveries, and full custom fields (default true)"), mcpproto.DefaultBool(true)),
+		mcpproto.WithBoolean("includeProductRows", mcpproto.Description("Alias for includeDetails (default true)"), mcpproto.DefaultBool(true)),
 		mcpproto.WithReadOnlyHintAnnotation(true),
 		mcpproto.WithDestructiveHintAnnotation(false),
 	)
@@ -391,30 +392,14 @@ func NewServer(
 				return nil, err
 			}
 			args := req.GetArguments()
-			typeID := bitrix.ToInt(args["entityTypeId"])
-			sel := extractStringSlice(args["select"])
-
-			var ids []int
-			if idsRaw, ok := args["ids"].([]any); ok {
-				for _, idVal := range idsRaw {
-					if id := bitrix.ToInt(idVal); id > 0 {
-						ids = append(ids, id)
-					}
-				}
-			}
-
-			if len(ids) > 0 {
-				return crm.GetItems(ctx, connID, typeID, ids, sel)
-			}
-
-			if idVal, ok := args["id"]; ok && idVal != nil {
-				singleID := bitrix.ToInt(idVal)
-				if singleID > 0 {
-					return crm.GetItem(ctx, connID, typeID, singleID, sel)
-				}
-			}
-
-			return nil, config.NewAppError("Supply id or ids", "MISSING_ITEM_ID", 400)
+			return crm.FetchItems(ctx, bitrix.GetItemInput{
+				ConnectionID:   connID,
+				EntityTypeID:   bitrix.ToInt(args["entityTypeId"]),
+				ID:             bitrix.ToInt(args["id"]),
+				IDs:            extractIntSlice(args["ids"]),
+				Select:         extractStringSlice(args["select"]),
+				IncludeDetails: extractIncludeDetails(args),
+			})
 		}), nil
 	})
 
@@ -744,6 +729,39 @@ func extractStringSlice(raw any) []string {
 	default:
 		return nil
 	}
+}
+
+func extractIntSlice(raw any) []int {
+	switch v := raw.(type) {
+	case []int:
+		var out []int
+		for _, id := range v {
+			if id > 0 {
+				out = append(out, id)
+			}
+		}
+		return out
+	case []any:
+		var out []int
+		for _, item := range v {
+			if id := bitrix.ToInt(item); id > 0 {
+				out = append(out, id)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func extractIncludeDetails(args map[string]any) bool {
+	if rawInc, ok := args["includeDetails"].(bool); ok {
+		return rawInc
+	}
+	if rawInc, ok := args["includeProductRows"].(bool); ok {
+		return rawInc
+	}
+	return true
 }
 
 func executeTool(work func() (any, error)) *mcpproto.CallToolResult {

@@ -31,6 +31,38 @@ func toOwnerTypeCode(entityTypeID int) string {
 	return meta.ownerTypeCode
 }
 
+func isWildcardSelect(userSelect []string) bool {
+	if len(userSelect) == 0 {
+		return true
+	}
+	for _, s := range userSelect {
+		if strings.TrimSpace(s) == "*" {
+			return true
+		}
+	}
+	return false
+}
+
+func extractItemID(item map[string]any) int {
+	if id := ToInt(item["id"]); id > 0 {
+		return id
+	}
+	return ToInt(item["ID"])
+}
+
+func extractContactID(item map[string]any) int {
+	if cID := ToInt(item["contactId"]); cID > 0 {
+		return cID
+	}
+	if cID := ToInt(item["CONTACT_ID"]); cID > 0 {
+		return cID
+	}
+	if cMap, ok := item["contact"].(map[string]any); ok {
+		return ToInt(cMap["id"])
+	}
+	return 0
+}
+
 func normalizeFieldName(field string) string {
 	m := ufRegex.FindStringSubmatch(field)
 	if len(m) > 1 {
@@ -81,14 +113,8 @@ func defaultSelectForEntity(entityTypeID int) []string {
 
 func curatedSelect(entityTypeID int, userSelect []string) []string {
 	def := defaultSelectForEntity(entityTypeID)
-	if len(userSelect) == 0 {
+	if isWildcardSelect(userSelect) {
 		return def
-	}
-
-	for _, s := range userSelect {
-		if strings.TrimSpace(s) == "*" {
-			return def
-		}
 	}
 
 	var result []string
@@ -362,7 +388,21 @@ type SearchItemsInput struct {
 	Order              map[string]string
 	Limit              int
 	Page               int
+	IncludeDetails     bool
 	IncludeProductRows bool
+}
+
+func (in SearchItemsInput) shouldEnrich() bool {
+	return in.IncludeDetails || in.IncludeProductRows
+}
+
+type GetItemInput struct {
+	ConnectionID   string
+	EntityTypeID   int
+	ID             int
+	IDs            []int
+	Select         []string
+	IncludeDetails bool
 }
 
 type SearchItemsResult struct {
@@ -455,8 +495,8 @@ func (s *CrmService) SearchItems(ctx context.Context, input SearchItemsInput) (*
 				if total == nil && resp.Total != nil {
 					total = resp.Total
 				}
-				if input.IncludeProductRows && len(sliced) > 0 {
-					s.enrichProductRows(ctx, input.ConnectionID, input.EntityTypeID, sliced)
+				if input.shouldEnrich() && len(sliced) > 0 {
+					sliced = s.enrichItems(ctx, input.ConnectionID, input.EntityTypeID, sliced, isWildcardSelect(input.Select))
 				}
 				truncated := len(pageObj.Items) > len(sliced) || (total != nil && *total > len(sliced))
 				return &SearchItemsResult{
@@ -473,7 +513,7 @@ func (s *CrmService) SearchItems(ctx context.Context, input SearchItemsInput) (*
 	// Legacy REST fallback
 	baseSelect := input.Select
 	if len(baseSelect) == 0 {
-		baseSelect = []string{"*"}
+		baseSelect = []string{"*", "UF_*"}
 	}
 	legacyFilter := toLegacyFilter(input.Filter)
 
@@ -503,8 +543,8 @@ func (s *CrmService) SearchItems(ctx context.Context, input SearchItemsInput) (*
 		sliced = sliced[:input.Limit]
 	}
 
-	if input.IncludeProductRows && len(sliced) > 0 {
-		s.enrichProductRows(ctx, input.ConnectionID, input.EntityTypeID, sliced)
+	if input.shouldEnrich() && len(sliced) > 0 {
+		sliced = s.enrichItems(ctx, input.ConnectionID, input.EntityTypeID, sliced, false)
 	}
 
 	truncated := len(items) > len(sliced) || (total != nil && *total > len(sliced))
@@ -516,36 +556,247 @@ func (s *CrmService) SearchItems(ctx context.Context, input SearchItemsInput) (*
 	}, nil
 }
 
-func (s *CrmService) enrichProductRows(ctx context.Context, connectionID string, entityTypeID int, items []map[string]any) {
-	var ownerIDs []int
+func cloneItemMap(src map[string]any) map[string]any {
+	dst := make(map[string]any, len(src)+4)
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
+func (s *CrmService) enrichItems(ctx context.Context, connectionID string, entityTypeID int, items []map[string]any, includeFullFields bool) []map[string]any {
+	var uniqueOwnerIDs []int
 	for _, item := range items {
-		id := ToInt(item["id"])
-		if id == 0 {
-			id = ToInt(item["ID"])
-		}
-		if id > 0 {
-			ownerIDs = append(ownerIDs, id)
+		if id := extractItemID(item); id > 0 && !slices.Contains(uniqueOwnerIDs, id) {
+			uniqueOwnerIDs = append(uniqueOwnerIDs, id)
 		}
 	}
-	if len(ownerIDs) == 0 {
-		return
+	if len(uniqueOwnerIDs) == 0 {
+		return items
 	}
-	rowsRes, err := s.listProductRowsForOwners(ctx, connectionID, ownerIDs, entityTypeID, "", nil, nil)
-	if err != nil || rowsRes.ByOwnerID == nil {
-		return
+
+	withProdRows := supportsProductRows(entityTypeID)
+	withOrderDetails := supportsOrderDetails(entityTypeID)
+	if !withProdRows && !withOrderDetails && !includeFullFields {
+		return items
 	}
+
+	enriched := make([]map[string]any, len(items))
 	for i, item := range items {
-		idStr := fmt.Sprintf("%v", item["id"])
-		if idStr == "" || idStr == "<nil>" {
-			idStr = fmt.Sprintf("%v", item["ID"])
-		}
-		prodRows := rowsRes.ByOwnerID[idStr]
-		if prodRows == nil {
-			prodRows = []map[string]any{}
-		}
-		item["productRows"] = prodRows
-		items[i] = item
+		enriched[i] = cloneItemMap(item)
 	}
+
+	if len(uniqueOwnerIDs) > BitrixBatchLimit {
+		if withProdRows {
+			rowsRes, err := s.listProductRowsForOwners(ctx, connectionID, uniqueOwnerIDs, entityTypeID, "", nil, nil)
+			if err == nil && rowsRes.ByOwnerID != nil {
+				for _, item := range enriched {
+					oID := extractItemID(item)
+					if oID <= 0 {
+						continue
+					}
+					prodRows := rowsRes.ByOwnerID[strconv.Itoa(oID)]
+					if prodRows == nil {
+						prodRows = []map[string]any{}
+					}
+					item["productRows"] = prodRows
+				}
+			}
+		}
+		return enriched
+	}
+
+	ownerType := toOwnerTypeCode(entityTypeID)
+	ord := map[string]string{"sort": "asc"}
+	var commands []NamedBatchCommand
+
+	var uniqueContactIDs []int
+	for _, item := range enriched {
+		if cID := extractContactID(item); cID > 0 && !slices.Contains(uniqueContactIDs, cID) {
+			uniqueContactIDs = append(uniqueContactIDs, cID)
+		}
+	}
+
+	for _, oID := range uniqueOwnerIDs {
+		if withProdRows {
+			commands = append(commands, NamedBatchCommand{
+				Key:    strconv.Itoa(oID),
+				Method: "crm.item.productrow.list",
+				Params: map[string]any{
+					"filter": buildProductRowFilter(ownerType, oID, nil),
+					"order":  ord,
+					"start":  0,
+				},
+			})
+		}
+		if withOrderDetails {
+			commands = append(commands,
+				NamedBatchCommand{
+					Key:    fmt.Sprintf("pay_%d", oID),
+					Method: "crm.item.payment.list",
+					Params: map[string]any{
+						"entityTypeId": entityTypeID,
+						"entityId":     oID,
+					},
+				},
+				NamedBatchCommand{
+					Key:    fmt.Sprintf("deliv_%d", oID),
+					Method: "crm.item.delivery.list",
+					Params: map[string]any{
+						"entityTypeId": entityTypeID,
+						"entityId":     oID,
+					},
+				},
+			)
+		}
+		if includeFullFields {
+			commands = append(commands, NamedBatchCommand{
+				Key:    fmt.Sprintf("full_%d", oID),
+				Method: "crm.item.get",
+				Params: map[string]any{
+					"entityTypeId": entityTypeID,
+					"id":           oID,
+				},
+			})
+		}
+	}
+
+	if withProdRows && len(uniqueOwnerIDs) <= BitrixBatchLimit/2 {
+		for _, cID := range uniqueContactIDs {
+			commands = append(commands, NamedBatchCommand{
+				Key:    fmt.Sprintf("contact_%d", cID),
+				Method: "crm.item.get",
+				Params: map[string]any{
+					"entityTypeId": EntityTypeContact,
+					"id":           cID,
+				},
+			})
+		}
+	}
+
+	if len(commands) == 0 {
+		return enriched
+	}
+
+	batchRes, err := s.client.CallBatch(ctx, connectionID, commands, false, WithIgnoreBatchErrors())
+	if err != nil {
+		return enriched
+	}
+
+	contactsByID := make(map[int]map[string]any, len(uniqueContactIDs))
+	for _, cID := range uniqueContactIDs {
+		if raw, ok := batchRes[fmt.Sprintf("contact_%d", cID)]; ok {
+			var parsed map[string]any
+			if err := json.Unmarshal(raw, &parsed); err == nil {
+				if cItem, ok := parsed["item"].(map[string]any); ok {
+					contactsByID[cID] = cItem
+				} else if len(parsed) > 0 {
+					contactsByID[cID] = parsed
+				}
+			}
+		}
+	}
+
+	for _, item := range enriched {
+		oID := extractItemID(item)
+		if oID <= 0 {
+			continue
+		}
+		idStr := strconv.Itoa(oID)
+
+		if includeFullFields {
+			if raw, ok := batchRes[fmt.Sprintf("full_%d", oID)]; ok {
+				var parsed map[string]any
+				if err := json.Unmarshal(raw, &parsed); err == nil {
+					fullItem := parsed
+					if inner, ok := parsed["item"].(map[string]any); ok {
+						fullItem = inner
+					}
+					for k, v := range fullItem {
+						if existing, exists := item[k]; !exists || existing == nil {
+							item[k] = v
+						}
+					}
+				}
+			}
+		}
+
+		if withProdRows {
+			var rowsList []map[string]any
+			if raw, ok := batchRes[idStr]; ok {
+				rowsList, _ = extractProductRows(raw)
+			}
+			if rowsList == nil {
+				rowsList = []map[string]any{}
+			}
+			item["productRows"] = rowsList
+		}
+
+		if withOrderDetails {
+			if raw, ok := batchRes[fmt.Sprintf("pay_%d", oID)]; ok {
+				if list, ok := extractObjectSlice(raw); ok {
+					item["payments"] = list
+				}
+			}
+			if raw, ok := batchRes[fmt.Sprintf("deliv_%d", oID)]; ok {
+				if list, ok := extractObjectSlice(raw); ok {
+					item["deliveries"] = list
+				}
+			}
+		}
+
+		if cID := extractContactID(item); cID > 0 {
+			if fullContact, ok := contactsByID[cID]; ok {
+				cMap, ok := item["contact"].(map[string]any)
+				if !ok || cMap == nil {
+					cMap = map[string]any{"id": cID}
+				} else {
+					cMap = cloneItemMap(cMap)
+				}
+				for _, field := range []string{"id", "name", "lastName", "secondName", "fm", "post", "typeId"} {
+					if val, exists := fullContact[field]; exists && val != nil {
+						if _, has := cMap[field]; !has || cMap[field] == nil {
+							cMap[field] = val
+						}
+					}
+				}
+				item["contact"] = cMap
+			}
+		}
+	}
+
+	return enriched
+}
+
+func (s *CrmService) FetchItems(ctx context.Context, input GetItemInput) (any, error) {
+	fullFields := isWildcardSelect(input.Select)
+
+	if len(input.IDs) > 0 {
+		items, err := s.GetItems(ctx, input.ConnectionID, input.EntityTypeID, input.IDs, input.Select)
+		if err != nil {
+			return nil, err
+		}
+		if input.IncludeDetails && len(items) > 0 {
+			items = s.enrichItems(ctx, input.ConnectionID, input.EntityTypeID, items, fullFields)
+		}
+		return items, nil
+	}
+
+	if input.ID > 0 {
+		itemRaw, err := s.GetItem(ctx, input.ConnectionID, input.EntityTypeID, input.ID, input.Select)
+		if err != nil {
+			return nil, err
+		}
+		if input.IncludeDetails {
+			if itemMap, ok := itemRaw.(map[string]any); ok {
+				enriched := s.enrichItems(ctx, input.ConnectionID, input.EntityTypeID, []map[string]any{itemMap}, fullFields)
+				return enriched[0], nil
+			}
+		}
+		return itemRaw, nil
+	}
+
+	return nil, config.NewAppError("Supply id or ids", "MISSING_ITEM_ID", 400)
 }
 
 func (s *CrmService) GetItem(ctx context.Context, connectionID string, entityTypeID int, id int, userSelect ...[]string) (any, error) {
@@ -630,11 +881,7 @@ func (s *CrmService) GetItems(ctx context.Context, connectionID string, entityTy
 			if jsonErr := json.Unmarshal(resp.Result, &pageObj); jsonErr == nil {
 				byID := make(map[int]map[string]any, len(pageObj.Items))
 				for _, item := range pageObj.Items {
-					itemID := ToInt(item["id"])
-					if itemID == 0 {
-						itemID = ToInt(item["ID"])
-					}
-					if itemID > 0 {
+					if itemID := extractItemID(item); itemID > 0 {
 						byID[itemID] = item
 					}
 				}
@@ -726,26 +973,75 @@ func (s *CrmService) CountItems(ctx context.Context, input CountItemsInput) (int
 	return extractCount(resp.Result), nil
 }
 
+func buildProductRowFilter(ownerType string, ownerID int, filter map[string]any) map[string]any {
+	pFilter := make(map[string]any, len(filter)+2)
+	for k, v := range filter {
+		pFilter[k] = v
+	}
+	pFilter["=ownerType"] = ownerType
+	pFilter["=ownerId"] = ownerID
+	return pFilter
+}
+
 func buildLegacyProductRowBatchCommands(uniqueOwnerIDs []int, ownerType string, filter map[string]any, ord map[string]string) []NamedBatchCommand {
 	commands := make([]NamedBatchCommand, 0, len(uniqueOwnerIDs))
 	for _, oID := range uniqueOwnerIDs {
-		pFilter := make(map[string]any, len(filter)+2)
-		for k, v := range filter {
-			pFilter[k] = v
-		}
-		pFilter["=ownerType"] = ownerType
-		pFilter["=ownerId"] = oID
 		commands = append(commands, NamedBatchCommand{
 			Key:    strconv.Itoa(oID),
 			Method: "crm.item.productrow.list",
 			Params: map[string]any{
-				"filter": pFilter,
+				"filter": buildProductRowFilter(ownerType, oID, filter),
 				"order":  ord,
 				"start":  0,
 			},
 		})
 	}
 	return commands
+}
+
+func extractProductRows(raw json.RawMessage) ([]map[string]any, bool) {
+	if len(raw) == 0 {
+		return nil, false
+	}
+	var parsed struct {
+		ProductRows []map[string]any `json:"productRows"`
+		Items       []map[string]any `json:"items"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err == nil {
+		if parsed.ProductRows != nil {
+			return parsed.ProductRows, true
+		}
+		if parsed.Items != nil {
+			return parsed.Items, true
+		}
+	}
+	var arr []map[string]any
+	if err := json.Unmarshal(raw, &arr); err == nil && arr != nil {
+		return arr, true
+	}
+	return nil, false
+}
+
+func extractObjectSlice(raw json.RawMessage) ([]map[string]any, bool) {
+	if len(raw) == 0 {
+		return nil, false
+	}
+	var arr []map[string]any
+	if err := json.Unmarshal(raw, &arr); err == nil && arr != nil {
+		return arr, true
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err == nil {
+		for _, key := range []string{"items", "payments", "deliveries", "productRows"} {
+			if subRaw, ok := obj[key]; ok {
+				var subArr []map[string]any
+				if err := json.Unmarshal(subRaw, &subArr); err == nil && subArr != nil {
+					return subArr, true
+				}
+			}
+		}
+	}
+	return nil, false
 }
 
 func (s *CrmService) listProductRowsForOwners(
@@ -775,39 +1071,67 @@ func (s *CrmService) listProductRowsForOwners(
 		}
 	}
 
-	// Single owner with REST 3.0
-	if !s.client.IsV2Mode(ctx, connectionID) && len(uniqueOwnerIDs) == 1 {
+	// Single owner: try REST 3.0 crm.productrow.list first, then fall back to crm.item.productrow.list
+	if len(uniqueOwnerIDs) == 1 {
 		oID := uniqueOwnerIDs[0]
-		resp, err := s.client.Call(ctx, connectionID, "crm.productrow.list", map[string]any{
-			"filter": []any{
-				[]any{"ownerType", "=", ownerType},
-				[]any{"ownerId", "=", oID},
-			},
-			"select":     productRowSel,
-			"order":      ord,
-			"pagination": map[string]any{"limit": 1000, "page": 1},
-		})
-		if err == nil {
-			var parsed struct {
-				Items []map[string]any `json:"items"`
+		if !s.client.IsV2Mode(ctx, connectionID) && len(filter) == 0 {
+			resp, err := s.client.Call(ctx, connectionID, "crm.productrow.list", map[string]any{
+				"filter": []any{
+					[]any{"ownerType", "=", ownerType},
+					[]any{"ownerId", "=", oID},
+				},
+				"select":     productRowSel,
+				"order":      ord,
+				"pagination": map[string]any{"limit": MaxSearchLimit, "page": 1},
+			})
+			if err == nil {
+				if rows, ok := extractProductRows(resp.Result); ok {
+					key := strconv.Itoa(oID)
+					byOwnerID := map[string][]map[string]any{key: rows}
+					count := 1
+					return &ListProductRowsResult{
+						ByOwnerID:   byOwnerID,
+						ProductRows: rows,
+						OwnersCount: &count,
+					}, nil
+				}
+			} else if !s.client.ShouldFallbackToV2(err) {
+				return nil, err
 			}
-			if jsonErr := json.Unmarshal(resp.Result, &parsed); jsonErr == nil && parsed.Items != nil {
-				key := strconv.Itoa(oID)
-				byOwnerID := map[string][]map[string]any{key: parsed.Items}
-				count := 1
-				return &ListProductRowsResult{
-					ByOwnerID:   byOwnerID,
-					ProductRows: parsed.Items,
-					OwnersCount: &count,
-				}, nil
-			}
-		} else if !s.client.ShouldFallbackToV2(err) {
+		}
+
+		baseParams := map[string]any{
+			"filter": buildProductRowFilter(ownerType, oID, filter),
+			"order":  ord,
+			"start":  0,
+		}
+		resp, err := s.client.Call(ctx, connectionID, "crm.item.productrow.list", baseParams)
+		if err != nil {
 			return nil, err
+		}
+		if rows, ok := extractProductRows(resp.Result); ok {
+			if resp.Next != nil && *resp.Next > 0 {
+				moreRows, _, pageErr := s.client.CollectPages(ctx, connectionID, "crm.item.productrow.list", baseParams, MaxSearchLimit, func(raw json.RawMessage) []map[string]any {
+					r, _ := extractProductRows(raw)
+					return r
+				})
+				if pageErr == nil && len(moreRows) > 0 {
+					rows = moreRows
+				}
+			}
+			key := strconv.Itoa(oID)
+			byOwnerID := map[string][]map[string]any{key: rows}
+			count := 1
+			return &ListProductRowsResult{
+				ByOwnerID:   byOwnerID,
+				ProductRows: rows,
+				OwnersCount: &count,
+			}, nil
 		}
 	}
 
-	// Multiple owners (or single owner fallback): batch
-	useV3 := !s.client.IsV2Mode(ctx, connectionID)
+	// Multiple owners (or single owner fallback): batch REST 3.0 crm.productrow.list with legacy fallback
+	useV3 := !s.client.IsV2Mode(ctx, connectionID) && len(filter) == 0
 	var commands []NamedBatchCommand
 	if useV3 {
 		commands = make([]NamedBatchCommand, 0, len(uniqueOwnerIDs))
@@ -822,7 +1146,7 @@ func (s *CrmService) listProductRowsForOwners(
 					},
 					"select":     productRowSel,
 					"order":      ord,
-					"pagination": map[string]any{"limit": 1000, "page": 1},
+					"pagination": map[string]any{"limit": MaxSearchLimit, "page": 1},
 				},
 			})
 		}
@@ -845,16 +1169,7 @@ func (s *CrmService) listProductRowsForOwners(
 		key := strconv.Itoa(oID)
 		var rowsList []map[string]any
 		if raw, ok := batchRes[key]; ok {
-			var parsed struct {
-				ProductRows []map[string]any `json:"productRows"`
-				Items       []map[string]any `json:"items"`
-			}
-			_ = json.Unmarshal(raw, &parsed)
-			if parsed.ProductRows != nil {
-				rowsList = parsed.ProductRows
-			} else if parsed.Items != nil {
-				rowsList = parsed.Items
-			}
+			rowsList, _ = extractProductRows(raw)
 		}
 		if rowsList == nil {
 			rowsList = []map[string]any{}
@@ -886,7 +1201,7 @@ func (s *CrmService) ListProductRows(ctx context.Context, input ListProductRowsI
 		return nil, config.NewAppError(fmt.Sprintf("limit cannot exceed %d", MaxSearchLimit), "INVALID_LIMIT", 400)
 	}
 
-	entityTypeID := 2
+	entityTypeID := EntityTypeDeal
 	if input.EntityTypeID != nil {
 		entityTypeID = *input.EntityTypeID
 	}

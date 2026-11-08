@@ -14,6 +14,16 @@ import (
 	"golang.org/x/text/unicode/norm"
 )
 
+const (
+	EntityTypeLead         = 1
+	EntityTypeDeal         = 2
+	EntityTypeContact      = 3
+	EntityTypeCompany      = 4
+	EntityTypeQuote        = 7
+	EntityTypeSmartInvoice = 31
+	EntityTypeDynamicMin   = 128
+)
+
 type EntityType struct {
 	EntityTypeID int    `json:"entityTypeId"`
 	Title        string `json:"title"`
@@ -21,28 +31,32 @@ type EntityType struct {
 }
 
 type entityMeta struct {
-	entityTypeID       int
-	title              string
-	code               string
-	slug               string
-	ownerTypeCode      string
-	supportsCategories bool
-	supportsStages     bool
-	defaultSelect      []string
-	stagePrefix        string
+	entityTypeID        int
+	title               string
+	code                string
+	slug                string
+	ownerTypeCode       string
+	supportsCategories  bool
+	supportsStages      bool
+	supportsProductRows bool
+	supportsOrder       bool
+	defaultSelect       []string
+	stagePrefix         string
 }
 
 var (
 	builtInEntityMeta = []entityMeta{
 		{
-			entityTypeID:       1,
-			title:              "Lead",
-			code:               "LEAD",
-			slug:               "lead",
-			ownerTypeCode:      "L",
-			supportsCategories: false,
-			supportsStages:     true,
-			stagePrefix:        "STATUS",
+			entityTypeID:        EntityTypeLead,
+			title:               "Lead",
+			code:                "LEAD",
+			slug:                "lead",
+			ownerTypeCode:       "L",
+			supportsCategories:  false,
+			supportsStages:      true,
+			supportsProductRows: true,
+			supportsOrder:       false,
+			stagePrefix:         "STATUS",
 			defaultSelect: []string{
 				"id", "title", "name", "lastName", "companyTitle", "statusId", "stage.name",
 				"opportunity", "currencyId", "assignedById", "assignedBy.firstName", "assignedBy.lastName",
@@ -50,14 +64,16 @@ var (
 			},
 		},
 		{
-			entityTypeID:       2,
-			title:              "Deal",
-			code:               "DEAL",
-			slug:               "deal",
-			ownerTypeCode:      "D",
-			supportsCategories: true,
-			supportsStages:     true,
-			stagePrefix:        "DEAL_STAGE",
+			entityTypeID:        EntityTypeDeal,
+			title:               "Deal",
+			code:                "DEAL",
+			slug:                "deal",
+			ownerTypeCode:       "D",
+			supportsCategories:  true,
+			supportsStages:      true,
+			supportsProductRows: true,
+			supportsOrder:       true,
+			stagePrefix:         "DEAL_STAGE",
 			defaultSelect: []string{
 				"id", "title", "stageId", "stage.name", "categoryId", "category.name",
 				"opportunity", "currencyId", "companyId", "company.title", "contactId", "contact.name",
@@ -66,13 +82,15 @@ var (
 			},
 		},
 		{
-			entityTypeID:       3,
-			title:              "Contact",
-			code:               "CONTACT",
-			slug:               "contact",
-			ownerTypeCode:      "C",
-			supportsCategories: false,
-			supportsStages:     false,
+			entityTypeID:        EntityTypeContact,
+			title:               "Contact",
+			code:                "CONTACT",
+			slug:                "contact",
+			ownerTypeCode:       "C",
+			supportsCategories:  false,
+			supportsStages:      false,
+			supportsProductRows: false,
+			supportsOrder:       false,
 			defaultSelect: []string{
 				"id", "name", "lastName", "secondName", "companyId", "company.title",
 				"typeId", "assignedById", "assignedBy.firstName", "assignedBy.lastName",
@@ -80,27 +98,31 @@ var (
 			},
 		},
 		{
-			entityTypeID:       4,
-			title:              "Company",
-			code:               "COMPANY",
-			slug:               "company",
-			ownerTypeCode:      "CO",
-			supportsCategories: false,
-			supportsStages:     false,
+			entityTypeID:        EntityTypeCompany,
+			title:               "Company",
+			code:                "COMPANY",
+			slug:                "company",
+			ownerTypeCode:       "CO",
+			supportsCategories:  false,
+			supportsStages:      false,
+			supportsProductRows: false,
+			supportsOrder:       false,
 			defaultSelect: []string{
 				"id", "title", "companyType", "assignedById", "assignedBy.firstName", "assignedBy.lastName",
 				"createdTime", "updatedTime",
 			},
 		},
 		{
-			entityTypeID:       7,
-			title:              "Quote",
-			code:               "QUOTE",
-			slug:               "quote",
-			ownerTypeCode:      "Q",
-			supportsCategories: false,
-			supportsStages:     true,
-			stagePrefix:        "QUOTE_STATUS",
+			entityTypeID:        EntityTypeQuote,
+			title:               "Quote",
+			code:                "QUOTE",
+			slug:                "quote",
+			ownerTypeCode:       "Q",
+			supportsCategories:  false,
+			supportsStages:      true,
+			supportsProductRows: true,
+			supportsOrder:       false,
+			stagePrefix:         "QUOTE_STATUS",
 			defaultSelect: []string{
 				"id", "title", "statusId", "stage.name",
 				"opportunity", "currencyId", "companyId", "company.title", "contactId", "contact.name",
@@ -109,14 +131,16 @@ var (
 			},
 		},
 		{
-			entityTypeID:       31,
-			title:              "Invoice",
-			code:               "SMART_INVOICE",
-			slug:               "smartinvoice",
-			ownerTypeCode:      "SI",
-			supportsCategories: true,
-			supportsStages:     true,
-			stagePrefix:        "SMART_INVOICE_STAGE",
+			entityTypeID:        EntityTypeSmartInvoice,
+			title:               "Invoice",
+			code:                "SMART_INVOICE",
+			slug:                "smartinvoice",
+			ownerTypeCode:       "SI",
+			supportsCategories:  true,
+			supportsStages:      true,
+			supportsProductRows: true,
+			supportsOrder:       true,
+			stagePrefix:         "SMART_INVOICE_STAGE",
 			defaultSelect: []string{
 				"id", "title", "stageId", "stage.name", "categoryId", "category.name",
 				"opportunity", "currencyId", "companyId", "company.title", "contactId", "contact.name",
@@ -134,12 +158,12 @@ var (
 	}
 
 	BuiltInTypes = []EntityType{
-		{EntityTypeID: 1, Title: "Lead", IsDynamic: false},
-		{EntityTypeID: 2, Title: "Deal", IsDynamic: false},
-		{EntityTypeID: 3, Title: "Contact", IsDynamic: false},
-		{EntityTypeID: 4, Title: "Company", IsDynamic: false},
-		{EntityTypeID: 7, Title: "Quote", IsDynamic: false},
-		{EntityTypeID: 31, Title: "Invoice", IsDynamic: false},
+		{EntityTypeID: EntityTypeLead, Title: "Lead", IsDynamic: false},
+		{EntityTypeID: EntityTypeDeal, Title: "Deal", IsDynamic: false},
+		{EntityTypeID: EntityTypeContact, Title: "Contact", IsDynamic: false},
+		{EntityTypeID: EntityTypeCompany, Title: "Company", IsDynamic: false},
+		{EntityTypeID: EntityTypeQuote, Title: "Quote", IsDynamic: false},
+		{EntityTypeID: EntityTypeSmartInvoice, Title: "Invoice", IsDynamic: false},
 	}
 )
 
@@ -149,17 +173,19 @@ func getEntityMeta(entityTypeID int) (entityMeta, bool) {
 			return m, true
 		}
 	}
-	if entityTypeID >= 128 {
+	if entityTypeID >= EntityTypeDynamicMin {
 		return entityMeta{
-			entityTypeID:       entityTypeID,
-			title:              fmt.Sprintf("Entity %d", entityTypeID),
-			code:               fmt.Sprintf("DYNAMIC_%d", entityTypeID),
-			slug:               fmt.Sprintf("smartprocess%d", entityTypeID),
-			ownerTypeCode:      fmt.Sprintf("T%x", entityTypeID),
-			supportsCategories: true,
-			supportsStages:     true,
-			stagePrefix:        fmt.Sprintf("DYNAMIC_%d_STAGE", entityTypeID),
-			defaultSelect:      defaultDynamicSelect,
+			entityTypeID:        entityTypeID,
+			title:               fmt.Sprintf("Entity %d", entityTypeID),
+			code:                fmt.Sprintf("DYNAMIC_%d", entityTypeID),
+			slug:                fmt.Sprintf("smartprocess%d", entityTypeID),
+			ownerTypeCode:       fmt.Sprintf("T%x", entityTypeID),
+			supportsCategories:  true,
+			supportsStages:      true,
+			supportsProductRows: true,
+			supportsOrder:       false,
+			stagePrefix:         fmt.Sprintf("DYNAMIC_%d_STAGE", entityTypeID),
+			defaultSelect:       defaultDynamicSelect,
 		}, true
 	}
 	return entityMeta{
@@ -186,6 +212,16 @@ func supportsCategories(entityTypeID int) bool {
 func supportsStages(entityTypeID int) bool {
 	meta, _ := getEntityMeta(entityTypeID)
 	return meta.supportsStages
+}
+
+func supportsProductRows(entityTypeID int) bool {
+	meta, _ := getEntityMeta(entityTypeID)
+	return meta.supportsProductRows
+}
+
+func supportsOrderDetails(entityTypeID int) bool {
+	meta, _ := getEntityMeta(entityTypeID)
+	return meta.supportsOrder
 }
 
 func entityCode(entityTypeID int) string {

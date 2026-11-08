@@ -1973,9 +1973,11 @@ func TestCrmService_REST3_ReadEngine(t *testing.T) {
 						{
 							"id":          101,
 							"ownerId":     1,
+							"ownerType":   "D",
 							"productId":   5,
 							"productName": "Widget Pro",
 							"price":       99.9,
+							"quantity":    2,
 						},
 					},
 				},

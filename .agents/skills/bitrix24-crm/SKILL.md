@@ -88,8 +88,13 @@ Instead of making extra `bitrix_get_item` or `bitrix_list_users` calls to resolv
   - Multi-fields on Contacts/Companies/Leads: explicitly include `PHONE`, `EMAIL`, `WEB`, `IM` in `select` when needed.
   - Marketing attribution fields: explicitly include `SOURCE_ID`, `SOURCE_DESCRIPTION`, `UTM_SOURCE`, `UTM_MEDIUM`, `UTM_CAMPAIGN`, `UTM_CONTENT`, `UTM_TERM` in `select`.
 
-### Bulk Fetch by IDs
+### Bulk Fetch by IDs & Complete Order Details
 - When fetching multiple known records, call `bitrix_get_item` once with `ids: [101, 102, 103]` (supports up to 1,000 IDs in REST 3.0 and preserves the requested ID order) instead of calling `bitrix_get_item` in a loop.
+- By default (`includeDetails: true`), both `bitrix_get_item` and `bitrix_search_items` automatically enrich order/CRM items in a single batch call with:
+  - `productRows` (`crm.item.productrow.list` with `=ownerType` and `=ownerId`),
+  - `payments` (`crm.item.payment.list` — actual payment status `paid: "Y"/"N"`, `datePaid`, `sum`, `paySystemName`),
+  - `deliveries` (`crm.item.delivery.list` — shipment status `deducted: "Y"/"N"`, `priceDelivery`, `deliveryName`),
+  - all custom `ufCrm_*` fields and linked `contact` details (`name`, `lastName`, `fm` phones/emails).
 
 ---
 

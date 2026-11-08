@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -740,6 +741,9 @@ func TestCrmService_SearchBatchAndProducts(t *testing.T) {
 				}), nil
 			}
 			return jsonResponse(200, map[string]any{"result": map[string]any{"result": map[string]any{}}}), nil
+
+		case strings.HasPrefix(r.URL.Path, "/rest/api/"):
+			return jsonResponse(404, map[string]any{"error": "BITRIX_REST_V3_EXCEPTION_UNKNOWNMETHOD"}), nil
 
 		default:
 			return jsonResponse(200, map[string]any{"result": map[string]any{}}), nil
@@ -1757,4 +1761,373 @@ func TestSchemaDiscovery_HybridREST3_QuoteAndDictionaries(t *testing.T) {
 		t.Errorf("incomplete Describe output: %+v", descDeal)
 	}
 }
+
+func TestCrmService_REST3_ReadEngine(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. Test CuratedSelect and normalization
+	selDealEmpty := bitrix.CuratedSelect(2, nil)
+	if !slices.Contains(selDealEmpty, "id") || !slices.Contains(selDealEmpty, "stage.name") || !slices.Contains(selDealEmpty, "company.title") {
+		t.Errorf("expected relational fields in default Deal select, got: %v", selDealEmpty)
+	}
+
+	selCustom := bitrix.CuratedSelect(2, []string{"title", "stage.name", "ufCrmCustomCode"})
+	if selCustom[0] != "id" {
+		t.Errorf("expected 'id' injected as first field, got: %v", selCustom)
+	}
+	if !slices.Contains(selCustom, "UF_CRM_CUSTOMCODE") {
+		t.Errorf("expected ufCrmCustomCode normalized to UF_CRM_CUSTOMCODE, got: %v", selCustom)
+	}
+	if !slices.Contains(selCustom, "stage.name") {
+		t.Errorf("expected stage.name preserved in select, got: %v", selCustom)
+	}
+
+	// 2. Test TranslateFilter
+	legacyFilter := map[string]any{
+		"=STAGE_ID":     "NEW",
+		">=OPPORTUNITY": 1000,
+		"@ID":           []any{1, 2},
+	}
+	trans, hasSub := bitrix.TranslateFilter(legacyFilter)
+	if hasSub {
+		t.Errorf("expected hasSub=false for legacy filter without %%, got true")
+	}
+	transSlice, ok := trans.([]any)
+	if !ok || len(transSlice) != 3 {
+		t.Fatalf("expected 3 conditions in translated filter, got: %v", trans)
+	}
+
+	subFilter := map[string]any{"%TITLE": "Acme"}
+	_, hasSub2 := bitrix.TranslateFilter(subFilter)
+	if !hasSub2 {
+		t.Errorf("expected hasSub=true for %%TITLE filter")
+	}
+
+	likeFilter := []any{[]any{"title", "like", "%Acme%"}}
+	_, hasSub3 := bitrix.TranslateFilter(likeFilter)
+	if !hasSub3 {
+		t.Errorf("expected hasSub=true for like filter")
+	}
+
+	// 3. Set up mock HTTP transport for REST 3.0 calls
+	var recordedRequests []struct {
+		Method string
+		URL    string
+		Body   map[string]any
+		Raw    string
+	}
+	var mu sync.Mutex
+
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		var bodyMap map[string]any
+		var rawBody string
+		if r.Body != nil {
+			b, _ := io.ReadAll(r.Body)
+			rawBody = string(b)
+			_ = json.Unmarshal(b, &bodyMap)
+		}
+
+		mu.Lock()
+		recordedRequests = append(recordedRequests, struct {
+			Method string
+			URL    string
+			Body   map[string]any
+			Raw    string
+		}{
+			Method: r.Method,
+			URL:    r.URL.String(),
+			Body:   bodyMap,
+			Raw:    rawBody,
+		})
+		mu.Unlock()
+
+		path := r.URL.Path
+
+		// REST 3.0 crm.deal.list
+		if strings.HasSuffix(path, "/rest/api/crm.deal.list") {
+			// Check if this is a bulk GetItems call with filter id in [10, 20]
+			if fRaw, ok := bodyMap["filter"]; ok {
+				fStr := fmt.Sprintf("%v", fRaw)
+				if strings.Contains(fStr, "10") && strings.Contains(fStr, "20") {
+					return jsonResponse(200, map[string]any{
+						"result": map[string]any{
+							"items": []map[string]any{
+								{"id": 20, "title": "Deal 20"},
+								{"id": 10, "title": "Deal 10"},
+							},
+						},
+					}), nil
+				}
+			}
+			return jsonResponse(200, map[string]any{
+				"result": map[string]any{
+					"items": []map[string]any{
+						{
+							"id":       1,
+							"title":    "Deal 1",
+							"stage":    map[string]any{"name": "New Stage"},
+							"category": map[string]any{"name": "General"},
+							"company":  map[string]any{"title": "Acme Corp"},
+						},
+					},
+				},
+				"total": 1,
+			}), nil
+		}
+
+		// REST 3.0 crm.deal.get
+		if strings.HasSuffix(path, "/rest/api/crm.deal.get") {
+			return jsonResponse(200, map[string]any{
+				"result": map[string]any{
+					"item": map[string]any{
+						"id":    42,
+						"title": "Single Deal 42",
+						"stage": map[string]any{"name": "In Progress"},
+					},
+				},
+			}), nil
+		}
+
+		// REST 3.0 crm.deal.aggregate
+		if strings.HasSuffix(path, "/rest/api/crm.deal.aggregate") {
+			return jsonResponse(200, map[string]any{
+				"result": map[string]any{
+					"count": map[string]any{"id": 150},
+				},
+			}), nil
+		}
+
+		// REST 3.0 crm.productrow.list
+		if strings.HasSuffix(path, "/rest/api/crm.productrow.list") {
+			return jsonResponse(200, map[string]any{
+				"result": map[string]any{
+					"items": []map[string]any{
+						{
+							"id":          101,
+							"ownerId":     1,
+							"productId":   5,
+							"productName": "Widget Pro",
+							"price":       99.9,
+						},
+					},
+				},
+			}), nil
+		}
+
+		// Legacy /rest/crm.item.list.json fallback
+		if strings.HasSuffix(path, "crm.item.list.json") {
+			return jsonResponse(200, map[string]any{
+				"result": map[string]any{
+					"items": []map[string]any{
+						{"id": 999, "title": "Substring Matched Item"},
+					},
+				},
+				"total": 1,
+			}), nil
+		}
+
+		return jsonResponse(200, map[string]any{"result": true}), nil
+	})
+
+	cfg, st, _, tm := newTestEnv(t, "", "client-id", rt)
+	conn, err := st.UpsertConnection(ctx, store.UpsertConnectionInput{
+		Domain:         "example.bitrix24.com",
+		MemberID:       "member-crm-rest3",
+		BitrixUserID:   "1",
+		ClientEndpoint: "https://example.bitrix24.com/rest/",
+		AccessToken:    "acc",
+		RefreshToken:   "ref",
+		Scope:          "crm",
+		ExpiresAt:      time.Now().Add(time.Hour),
+		Mode:           config.ModeReadOnly,
+	})
+	if err != nil {
+		t.Fatalf("UpsertConnection failed: %v", err)
+	}
+
+	rc := bitrix.NewRestClient(cfg, tm, config.NewLogger(nil, "silent"), &http.Client{Transport: rt})
+	crm := bitrix.NewCrmService(cfg, rc)
+
+	// 4. SearchItems calls REST 3.0 crm.deal.list with curated select & single-call pagination
+	searchRes, err := crm.SearchItems(ctx, bitrix.SearchItemsInput{
+		ConnectionID: conn.ID,
+		EntityTypeID: 2,
+		Limit:        500,
+	})
+	if err != nil {
+		t.Fatalf("SearchItems failed: %v", err)
+	}
+	if len(searchRes.Items) != 1 || searchRes.Items[0]["id"] != float64(1) && searchRes.Items[0]["id"] != 1 {
+		t.Fatalf("unexpected items in searchRes: %+v", searchRes.Items)
+	}
+	mu.Lock()
+	var lastSearchReq struct {
+		Method string
+		URL    string
+		Body   map[string]any
+		Raw    string
+	}
+	for _, req := range recordedRequests {
+		if strings.Contains(req.URL, "crm.deal.list") {
+			lastSearchReq = req
+		}
+	}
+	mu.Unlock()
+	if !strings.Contains(lastSearchReq.URL, "/rest/api/crm.deal.list") {
+		t.Errorf("expected REST 3.0 crm.deal.list, got: %s", lastSearchReq.URL)
+	}
+	if pag, ok := lastSearchReq.Body["pagination"].(map[string]any); !ok || pag["limit"] != float64(500) && pag["limit"] != 500 {
+		t.Errorf("expected pagination limit 500, got: %v", lastSearchReq.Body["pagination"])
+	}
+	if selList, ok := lastSearchReq.Body["select"].([]any); !ok || slices.Contains(selList, any("*")) {
+		t.Errorf("expected curated select list without wildcard, got: %v", lastSearchReq.Body["select"])
+	}
+
+	// 5. SearchItems with substring filter falls back to legacy crm.item.list.json with start: -1
+	subRes, err := crm.SearchItems(ctx, bitrix.SearchItemsInput{
+		ConnectionID: conn.ID,
+		EntityTypeID: 2,
+		Filter:       map[string]any{"%TITLE": "Substring"},
+		Limit:        50,
+	})
+	if err != nil {
+		t.Fatalf("SearchItems with substring filter failed: %v", err)
+	}
+	if len(subRes.Items) != 1 || subRes.Items[0]["id"] != float64(999) && subRes.Items[0]["id"] != 999 {
+		t.Fatalf("unexpected items in substring searchRes: %+v", subRes.Items)
+	}
+	mu.Lock()
+	var lastLegacyReq struct {
+		Method string
+		URL    string
+		Body   map[string]any
+		Raw    string
+	}
+	for _, req := range recordedRequests {
+		if strings.Contains(req.URL, "crm.item.list.json") {
+			lastLegacyReq = req
+		}
+	}
+	mu.Unlock()
+	if !strings.Contains(lastLegacyReq.URL, "crm.item.list.json") {
+		t.Errorf("expected legacy crm.item.list.json fallback for substring match, got: %s", lastLegacyReq.URL)
+	}
+	if lastLegacyReq.Body["start"] != -1 && lastLegacyReq.Body["start"] != float64(-1) {
+		t.Errorf("expected start: -1 on legacy list query, got: %v", lastLegacyReq.Body["start"])
+	}
+
+	// 6. GetItem calls REST 3.0 crm.deal.get with explicit select
+	getItemRes, err := crm.GetItem(ctx, conn.ID, 2, 42)
+	if err != nil {
+		t.Fatalf("GetItem failed: %v", err)
+	}
+	getItemMap, ok := getItemRes.(map[string]any)
+	if !ok || (getItemMap["id"] != float64(42) && getItemMap["id"] != 42) {
+		t.Fatalf("unexpected GetItem result: %+v", getItemRes)
+	}
+	mu.Lock()
+	var lastGetReq struct {
+		Method string
+		URL    string
+		Body   map[string]any
+		Raw    string
+	}
+	for _, req := range recordedRequests {
+		if strings.Contains(req.URL, "crm.deal.get") {
+			lastGetReq = req
+		}
+	}
+	mu.Unlock()
+	if !strings.Contains(lastGetReq.URL, "/rest/api/crm.deal.get") {
+		t.Errorf("expected REST 3.0 crm.deal.get, got: %s", lastGetReq.URL)
+	}
+	if selList, ok := lastGetReq.Body["select"].([]any); !ok || slices.Contains(selList, any("*")) {
+		t.Errorf("expected explicit select list for GetItem, got: %v", lastGetReq.Body["select"])
+	}
+
+	// 7. GetItems calls REST 3.0 crm.deal.list with filter id in [10, 20] and preserves order
+	getItemsRes, err := crm.GetItems(ctx, conn.ID, 2, []int{10, 20})
+	if err != nil {
+		t.Fatalf("GetItems failed: %v", err)
+	}
+	if getItemsRes["10"] == nil || getItemsRes["20"] == nil {
+		t.Fatalf("expected items 10 and 20 in GetItems result, got: %+v", getItemsRes)
+	}
+
+	// 8. CountItems calls REST 3.0 crm.deal.aggregate
+	countRes, err := crm.CountItems(ctx, bitrix.CountItemsInput{
+		ConnectionID: conn.ID,
+		EntityTypeID: 2,
+		Filter:       map[string]any{"=STAGE_ID": "NEW"},
+	})
+	if err != nil {
+		t.Fatalf("CountItems failed: %v", err)
+	}
+	if countRes != 150 {
+		t.Errorf("expected count 150, got: %d", countRes)
+	}
+	mu.Lock()
+	var lastAggReq struct {
+		Method string
+		URL    string
+		Body   map[string]any
+		Raw    string
+	}
+	for _, req := range recordedRequests {
+		if strings.Contains(req.URL, "crm.deal.aggregate") {
+			lastAggReq = req
+		}
+	}
+	mu.Unlock()
+	if !strings.Contains(lastAggReq.URL, "/rest/api/crm.deal.aggregate") {
+		t.Errorf("expected REST 3.0 crm.deal.aggregate, got: %s", lastAggReq.URL)
+	}
+
+	// 9. CountItems with substring filter falls back to legacy crm.item.list.json total
+	countSubRes, err := crm.CountItems(ctx, bitrix.CountItemsInput{
+		ConnectionID: conn.ID,
+		EntityTypeID: 2,
+		Filter:       map[string]any{"%TITLE": "Substring"},
+	})
+	if err != nil {
+		t.Fatalf("CountItems with substring filter failed: %v", err)
+	}
+	if countSubRes != 1 {
+		t.Errorf("expected legacy fallback count 1, got: %d", countSubRes)
+	}
+
+	// 10. ListProductRows calls REST 3.0 crm.productrow.list with explicit select & limit 1000
+	oID := 1
+	prodRowsRes, err := crm.ListProductRows(ctx, bitrix.ListProductRowsInput{
+		ConnectionID: conn.ID,
+		OwnerID:      &oID,
+		EntityTypeID: &oID,
+	})
+	if err != nil {
+		t.Fatalf("ListProductRows failed: %v", err)
+	}
+	if len(prodRowsRes.ProductRows) != 1 || (prodRowsRes.ProductRows[0]["id"] != float64(101) && prodRowsRes.ProductRows[0]["id"] != 101) {
+		t.Fatalf("unexpected ProductRows result: %+v", prodRowsRes.ProductRows)
+	}
+	mu.Lock()
+	var lastProdReq struct {
+		Method string
+		URL    string
+		Body   map[string]any
+		Raw    string
+	}
+	for _, req := range recordedRequests {
+		if strings.Contains(req.URL, "crm.productrow.list") {
+			lastProdReq = req
+		}
+	}
+	mu.Unlock()
+	if !strings.Contains(lastProdReq.URL, "/rest/api/crm.productrow.list") {
+		t.Errorf("expected REST 3.0 crm.productrow.list, got: %s", lastProdReq.URL)
+	}
+	if pag, ok := lastProdReq.Body["pagination"].(map[string]any); !ok || pag["limit"] != float64(1000) && pag["limit"] != 1000 {
+		t.Errorf("expected pagination limit 1000 on productrow.list, got: %v", lastProdReq.Body["pagination"])
+	}
+}
+
 

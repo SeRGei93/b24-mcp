@@ -84,8 +84,8 @@ func TestMCPServer_ListConnectionsAndIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListTools failed: %v", err)
 	}
-	if len(toolsRes.Tools) != 18 {
-		t.Fatalf("expected all 18 MCP tools to be registered, got %d", len(toolsRes.Tools))
+	if len(toolsRes.Tools) != 19 {
+		t.Fatalf("expected all 19 MCP tools to be registered, got %d", len(toolsRes.Tools))
 	}
 	foundList := false
 	for _, tool := range toolsRes.Tools {
@@ -688,5 +688,204 @@ func TestMCPServer_SchemaDiscoveryTools_QuoteAndDictionaries(t *testing.T) {
 	})
 	if err != nil || refRes.IsError {
 		t.Fatalf("bitrix_refresh_schema_cache failed: %v, res: %+v", err, refRes)
+	}
+}
+
+func TestMCPServer_ReadEngineTools_REST3(t *testing.T) {
+	ctx := context.Background()
+
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		path := r.URL.Path
+
+		if strings.HasSuffix(path, "/rest/api/crm.deal.list") {
+			return jsonResponse(200, map[string]any{
+				"result": map[string]any{
+					"items": []map[string]any{
+						{"id": 1, "title": "MCP Deal 1", "stage": map[string]any{"name": "Initial"}},
+						{"id": 2, "title": "MCP Deal 2", "stage": map[string]any{"name": "Won"}},
+					},
+				},
+				"total": 2,
+			}), nil
+		}
+		if strings.HasSuffix(path, "/rest/api/crm.deal.get") {
+			return jsonResponse(200, map[string]any{
+				"result": map[string]any{
+					"item": map[string]any{"id": 42, "title": "MCP Single Deal"},
+				},
+			}), nil
+		}
+		if strings.HasSuffix(path, "/rest/api/crm.deal.aggregate") {
+			return jsonResponse(200, map[string]any{
+				"result": map[string]any{
+					"count": map[string]any{"id": 42},
+				},
+			}), nil
+		}
+		if strings.HasSuffix(path, "/rest/api/crm.productrow.list") {
+			return jsonResponse(200, map[string]any{
+				"result": map[string]any{
+					"items": []map[string]any{
+						{"id": 901, "ownerId": 1, "productName": "Cloud Hosting", "price": 49.99},
+					},
+				},
+			}), nil
+		}
+		return jsonResponse(200, map[string]any{"result": map[string]any{}}), nil
+	})
+
+	cfg, err := config.Load(map[string]string{
+		"APP_URL":              "https://mcp.example.com",
+		"DATABASE_PATH":        ":memory:",
+		"BITRIX_CLIENT_ID":     "client-id",
+		"BITRIX_CLIENT_SECRET": "client-secret",
+		"MCP_AUTH_TOKEN":       strings.Repeat("c", 32),
+		"TOKEN_ENCRYPTION_KEY": testMCPKeyHex,
+	})
+	if err != nil {
+		t.Fatalf("failed to load config: %v", err)
+	}
+
+	st, err := store.NewStore(cfg.DatabasePath, cfg.TokenEncryptionKey)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+	if err := st.Migrate(ctx, nil); err != nil {
+		t.Fatalf("migrate failed: %v", err)
+	}
+
+	conn, err := st.UpsertConnection(ctx, store.UpsertConnectionInput{
+		Domain:         "example.bitrix24.com",
+		MemberID:       "member-read-mcp",
+		BitrixUserID:   "1",
+		ClientEndpoint: "https://example.bitrix24.com/rest/",
+		AccessToken:    "acc",
+		RefreshToken:   "ref",
+		Scope:          "crm",
+		ExpiresAt:      time.Now().Add(time.Hour),
+		Mode:           config.ModeReadOnly,
+	})
+	if err != nil {
+		t.Fatalf("UpsertConnection failed: %v", err)
+	}
+
+	httpClient := &http.Client{Transport: rt, Timeout: 2 * time.Second}
+	oauth := bitrix.NewOAuthService(cfg, st, httpClient)
+	tokens := bitrix.NewTokenManager(st, oauth, nil)
+	rc := bitrix.NewRestClient(cfg, tokens, nil, httpClient)
+	schema := bitrix.NewSchemaDiscovery(cfg, st, rc)
+	crmSvc := bitrix.NewCrmService(cfg, rc)
+	guard := bitrix.NewPolicyGuard()
+	ops := bitrix.NewOperationService(cfg, st, guard, rc)
+
+	srv := mcp.NewServer(st, schema, crmSvc, ops, "")
+	inProc, err := client.NewInProcessClient(srv)
+	if err != nil {
+		t.Fatalf("NewInProcessClient failed: %v", err)
+	}
+	defer inProc.Close()
+	if err := inProc.Start(ctx); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	initReq := mcpproto.InitializeRequest{}
+	initReq.Params.ProtocolVersion = mcpproto.LATEST_PROTOCOL_VERSION
+	initReq.Params.ClientInfo = mcpproto.Implementation{Name: "read-test-client", Version: "1.0.0"}
+	if _, err := inProc.Initialize(ctx, initReq); err != nil {
+		t.Fatalf("Initialize failed: %v", err)
+	}
+
+	// 1. bitrix_search_items
+	searchRes, err := inProc.CallTool(ctx, mcpproto.CallToolRequest{
+		Params: mcpproto.CallToolParams{
+			Name: "bitrix_search_items",
+			Arguments: map[string]any{
+				"connectionId": conn.ID,
+				"entityTypeId": 2,
+				"limit":        10,
+			},
+		},
+	})
+	if err != nil || searchRes.IsError {
+		t.Fatalf("bitrix_search_items failed: %v, res: %+v", err, searchRes)
+	}
+	searchText := searchRes.Content[0].(mcpproto.TextContent).Text
+	if !strings.Contains(searchText, "MCP Deal 1") {
+		t.Errorf("expected MCP Deal 1 in search response: %s", searchText)
+	}
+
+	// 2. bitrix_get_item (single)
+	getItemRes, err := inProc.CallTool(ctx, mcpproto.CallToolRequest{
+		Params: mcpproto.CallToolParams{
+			Name: "bitrix_get_item",
+			Arguments: map[string]any{
+				"connectionId": conn.ID,
+				"entityTypeId": 2,
+				"id":           42,
+			},
+		},
+	})
+	if err != nil || getItemRes.IsError {
+		t.Fatalf("bitrix_get_item single failed: %v, res: %+v", err, getItemRes)
+	}
+	getItemText := getItemRes.Content[0].(mcpproto.TextContent).Text
+	if !strings.Contains(getItemText, "MCP Single Deal") {
+		t.Errorf("expected MCP Single Deal in get response: %s", getItemText)
+	}
+
+	// 3. bitrix_get_item (multiple ids)
+	getItemsRes, err := inProc.CallTool(ctx, mcpproto.CallToolRequest{
+		Params: mcpproto.CallToolParams{
+			Name: "bitrix_get_item",
+			Arguments: map[string]any{
+				"connectionId": conn.ID,
+				"entityTypeId": 2,
+				"ids":          []int{1, 2},
+			},
+		},
+	})
+	if err != nil || getItemsRes.IsError {
+		t.Fatalf("bitrix_get_item multiple failed: %v, res: %+v", err, getItemsRes)
+	}
+	getItemsText := getItemsRes.Content[0].(mcpproto.TextContent).Text
+	if !strings.Contains(getItemsText, "MCP Deal 1") {
+		t.Errorf("expected MCP Deal 1 in getItems response: %s", getItemsText)
+	}
+
+	// 4. bitrix_count_items
+	countRes, err := inProc.CallTool(ctx, mcpproto.CallToolRequest{
+		Params: mcpproto.CallToolParams{
+			Name: "bitrix_count_items",
+			Arguments: map[string]any{
+				"connectionId": conn.ID,
+				"entityTypeId": 2,
+			},
+		},
+	})
+	if err != nil || countRes.IsError {
+		t.Fatalf("bitrix_count_items failed: %v, res: %+v", err, countRes)
+	}
+	countText := countRes.Content[0].(mcpproto.TextContent).Text
+	if !strings.Contains(countText, "42") {
+		t.Errorf("expected count 42 in count response: %s", countText)
+	}
+
+	// 5. bitrix_list_product_rows
+	prodRes, err := inProc.CallTool(ctx, mcpproto.CallToolRequest{
+		Params: mcpproto.CallToolParams{
+			Name: "bitrix_list_product_rows",
+			Arguments: map[string]any{
+				"connectionId": conn.ID,
+				"dealId":       1,
+			},
+		},
+	})
+	if err != nil || prodRes.IsError {
+		t.Fatalf("bitrix_list_product_rows failed: %v, res: %+v", err, prodRes)
+	}
+	prodText := prodRes.Content[0].(mcpproto.TextContent).Text
+	if !strings.Contains(prodText, "Cloud Hosting") {
+		t.Errorf("expected Cloud Hosting in product rows response: %s", prodText)
 	}
 }

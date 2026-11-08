@@ -333,7 +333,43 @@ func NewServer(
 		}), nil
 	})
 
-	// 10. bitrix_get_item
+	// 10. bitrix_count_items
+	countItemsTool := mcpproto.NewTool(
+		"bitrix_count_items",
+		mcpproto.WithTitleAnnotation("Count CRM items"),
+		mcpproto.WithDescription("Get the total count of CRM items matching an optional filter. Uses REST 3.0 aggregate when available, with automatic legacy fallback."),
+		mcpproto.WithString("connectionId", mcpproto.Description("ID returned by bitrix_list_connections after OAuth authorization"), mcpproto.Required()),
+		mcpproto.WithInteger("entityTypeId", mcpproto.Description("Bitrix CRM entityTypeId (1 lead, 2 deal, 3 contact, 4 company, 7 quote, 31 smart invoice, or SPA ID)"), mcpproto.Required()),
+		mcpproto.WithObject("filter", mcpproto.Description("Bitrix filter object or REST 3.0 filter expression array")),
+		mcpproto.WithReadOnlyHintAnnotation(true),
+		mcpproto.WithDestructiveHintAnnotation(false),
+	)
+	srv.AddTool(countItemsTool, func(ctx context.Context, req mcpproto.CallToolRequest) (*mcpproto.CallToolResult, error) {
+		return executeTool(func() (any, error) {
+			if crm == nil {
+				return nil, config.NewAppError("CRM service is unavailable", "SERVICE_UNAVAILABLE", 503)
+			}
+			connID, err := connFor(req.GetString("connectionId", ""))
+			if err != nil {
+				return nil, err
+			}
+			args := req.GetArguments()
+			filter := args["filter"]
+			typeID := bitrix.ToInt(args["entityTypeId"])
+
+			count, err := crm.CountItems(ctx, bitrix.CountItemsInput{
+				ConnectionID: connID,
+				EntityTypeID: typeID,
+				Filter:       filter,
+			})
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{"count": count}, nil
+		}), nil
+	})
+
+	// 11. bitrix_get_item
 	getItemTool := mcpproto.NewTool(
 		"bitrix_get_item",
 		mcpproto.WithTitleAnnotation("Get CRM item(s)"),

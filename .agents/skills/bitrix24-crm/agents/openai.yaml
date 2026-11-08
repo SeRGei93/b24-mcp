@@ -1,0 +1,3 @@
+interface:
+  display_name: "Bitrix24 CRM Operations"
+  short_description: "Search, inspect, and safely mutate Bitrix24 CRM entities via MCP"

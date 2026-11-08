@@ -81,6 +81,41 @@ BITRIX_MCP_DEFAULT_MODE=write_with_confirmation
 
 ## Подключение MCP-клиентов
 
+### OpenCode
+
+Добавьте в `~/.config/opencode/opencode.json` (или локальный `opencode.json`):
+
+**Через статический токен (`MCP_AUTH_TOKEN`):**
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "bitrix24": {
+      "type": "remote",
+      "url": "https://your-server.example.com/mcp",
+      "oauth": false,
+      "headers": {
+        "Authorization": "Bearer {env:MCP_AUTH_TOKEN}"
+      }
+    }
+  }
+}
+```
+
+**Через браузерный MCP OAuth 2.1 (индивидуальный вход сотрудника в Битрикс24):**
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "bitrix24": {
+      "type": "remote",
+      "url": "https://your-server.example.com/mcp"
+    }
+  }
+}
+```
+Затем выполните в терминале `opencode mcp auth bitrix24` для прохождения авторизации в браузере.
+
 ### Claude Code
 
 Через HTTP-транспорт со статическим Bearer-токеном:
@@ -125,6 +160,15 @@ claude mcp add --transport http bitrix24 https://your-server.example.com/mcp \
   }
 }
 ```
+
+---
+
+## Готовые AI-скиллы (`SKILL.md`)
+
+В репозитории в папке [`.agents/skills/`](.agents/skills/) находятся два специализированных скилла для AI-агентов (OpenCode, Claude Code, Cursor, Antigravity):
+
+- **[`bitrix24-crm`](.agents/skills/bitrix24-crm/SKILL.md)** — операционная работа с CRM и смарт-процессами: таблица `entityTypeId`, правило Discovery-First (`bitrix_describe_entity` перед фильтрацией по стадиям и `UF_CRM_*`), реляционные dot-notation поля REST 3.0 без лишних N+1 запросов, шпаргалка по сложным фильтрам и строгий регламент двухшаговых мутаций (`prepare_*` → превью пользователю → `confirm_operation`).
+- **[`bitrix24-analytics`](.agents/skills/bitrix24-analytics/SKILL.md)** — аналитика воронки продаж и аудит CRM: быстрые подсчёты через `bitrix_count_items` (`crm.<slug>.aggregate`), расчёт конверсии по стадиям, отчёты по эффективности менеджеров, товарная аналитика (`bitrix_list_product_rows`) и поиск «зависших» сделок.
 
 ---
 

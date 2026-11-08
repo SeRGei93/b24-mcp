@@ -475,3 +475,218 @@ func TestMCPServer_AllToolsExecution(t *testing.T) {
 		t.Errorf("expected CONNECTION_ACCESS_DENIED error code, got: %s", badText)
 	}
 }
+
+func TestMCPServer_SchemaDiscoveryTools_QuoteAndDictionaries(t *testing.T) {
+	ctx := context.Background()
+
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		path := r.URL.Path
+		var bodyMap map[string]any
+		if r.Body != nil {
+			b, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(b, &bodyMap)
+		}
+
+		if strings.HasSuffix(path, "crm.type.list.json") {
+			return jsonResponse(200, map[string]any{
+				"result": map[string]any{
+					"types": []map[string]any{
+						{"entityTypeId": 128, "title": "Customer SPA"},
+					},
+				},
+			}), nil
+		}
+		if strings.HasSuffix(path, "/rest/api/crm.quote.fields") {
+			return jsonResponse(200, map[string]any{
+				"result": map[string]any{
+					"fields": map[string]any{
+						"TITLE": map[string]any{"type": "string", "title": "Quote Title"},
+					},
+				},
+			}), nil
+		}
+		if strings.HasSuffix(path, "crm.status.list.json") {
+			return jsonResponse(200, map[string]any{
+				"result": []map[string]any{
+					{"STATUS_ID": "DRAFT", "NAME": "Draft Quote"},
+				},
+			}), nil
+		}
+		return jsonResponse(200, map[string]any{"result": map[string]any{}}), nil
+	})
+
+	cfg, err := config.Load(map[string]string{
+		"APP_URL":              "https://mcp.example.com",
+		"DATABASE_PATH":        ":memory:",
+		"BITRIX_CLIENT_ID":     "client-id",
+		"BITRIX_CLIENT_SECRET": "client-secret",
+		"MCP_AUTH_TOKEN":       strings.Repeat("b", 32),
+		"TOKEN_ENCRYPTION_KEY": testMCPKeyHex,
+	})
+	if err != nil {
+		t.Fatalf("failed to load config: %v", err)
+	}
+
+	st, err := store.NewStore(cfg.DatabasePath, cfg.TokenEncryptionKey)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+	if err := st.Migrate(ctx, nil); err != nil {
+		t.Fatalf("migrate failed: %v", err)
+	}
+
+	conn, err := st.UpsertConnection(ctx, store.UpsertConnectionInput{
+		Domain:         "example.bitrix24.com",
+		MemberID:       "member-quote-mcp",
+		BitrixUserID:   "1",
+		ClientEndpoint: "https://example.bitrix24.com/rest/",
+		AccessToken:    "acc",
+		RefreshToken:   "ref",
+		Scope:          "crm",
+		ExpiresAt:      time.Now().Add(time.Hour),
+		Mode:           config.ModeReadOnly,
+	})
+	if err != nil {
+		t.Fatalf("UpsertConnection failed: %v", err)
+	}
+
+	httpClient := &http.Client{Transport: rt, Timeout: 2 * time.Second}
+	oauth := bitrix.NewOAuthService(cfg, st, httpClient)
+	tokens := bitrix.NewTokenManager(st, oauth, nil)
+	rc := bitrix.NewRestClient(cfg, tokens, nil, httpClient)
+	schema := bitrix.NewSchemaDiscovery(cfg, st, rc)
+	crmSvc := bitrix.NewCrmService(cfg, rc)
+	guard := bitrix.NewPolicyGuard()
+	ops := bitrix.NewOperationService(cfg, st, guard, rc)
+
+	srv := mcp.NewServer(st, schema, crmSvc, ops, "")
+	inProc, err := client.NewInProcessClient(srv)
+	if err != nil {
+		t.Fatalf("NewInProcessClient failed: %v", err)
+	}
+	defer inProc.Close()
+	if err := inProc.Start(ctx); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	initReq := mcpproto.InitializeRequest{}
+	initReq.Params.ProtocolVersion = mcpproto.LATEST_PROTOCOL_VERSION
+	initReq.Params.ClientInfo = mcpproto.Implementation{Name: "quote-test-client", Version: "1.0.0"}
+	if _, err := inProc.Initialize(ctx, initReq); err != nil {
+		t.Fatalf("Initialize failed: %v", err)
+	}
+
+	// 1. bitrix_list_crm_entities
+	listEntRes, err := inProc.CallTool(ctx, mcpproto.CallToolRequest{
+		Params: mcpproto.CallToolParams{
+			Name:      "bitrix_list_crm_entities",
+			Arguments: map[string]any{"connectionId": conn.ID},
+		},
+	})
+	if err != nil || listEntRes.IsError {
+		t.Fatalf("bitrix_list_crm_entities failed: %v, res: %+v", err, listEntRes)
+	}
+	listEntText := listEntRes.Content[0].(mcpproto.TextContent).Text
+	if !strings.Contains(listEntText, "Quote") || !strings.Contains(listEntText, "QUOTE") {
+		t.Errorf("expected Quote entity in bitrix_list_crm_entities: %s", listEntText)
+	}
+
+	// 2. bitrix_list_fields for Quote (entityTypeId 7)
+	fieldsRes, err := inProc.CallTool(ctx, mcpproto.CallToolRequest{
+		Params: mcpproto.CallToolParams{
+			Name: "bitrix_list_fields",
+			Arguments: map[string]any{
+				"connectionId": conn.ID,
+				"entityTypeId": 7,
+			},
+		},
+	})
+	if err != nil || fieldsRes.IsError {
+		t.Fatalf("bitrix_list_fields failed: %v, res: %+v", err, fieldsRes)
+	}
+	fieldsText := fieldsRes.Content[0].(mcpproto.TextContent).Text
+	if !strings.Contains(fieldsText, "TITLE") {
+		t.Errorf("expected TITLE in quote fields: %s", fieldsText)
+	}
+
+	// 3. bitrix_list_categories for Quote (entityTypeId 7) -> empty without error
+	catsRes, err := inProc.CallTool(ctx, mcpproto.CallToolRequest{
+		Params: mcpproto.CallToolParams{
+			Name: "bitrix_list_categories",
+			Arguments: map[string]any{
+				"connectionId": conn.ID,
+				"entityTypeId": 7,
+			},
+		},
+	})
+	if err != nil || catsRes.IsError {
+		t.Fatalf("bitrix_list_categories failed: %v, res: %+v", err, catsRes)
+	}
+	catsText := catsRes.Content[0].(mcpproto.TextContent).Text
+	if strings.TrimSpace(catsText) != "[]" && strings.TrimSpace(catsText) != `{"categories":[]}` {
+		t.Errorf("expected empty categories for quote: %s", catsText)
+	}
+
+	// 4. bitrix_list_stages for Quote (entityTypeId 7)
+	stagesRes, err := inProc.CallTool(ctx, mcpproto.CallToolRequest{
+		Params: mcpproto.CallToolParams{
+			Name: "bitrix_list_stages",
+			Arguments: map[string]any{
+				"connectionId": conn.ID,
+				"entityTypeId": 7,
+			},
+		},
+	})
+	if err != nil || stagesRes.IsError {
+		t.Fatalf("bitrix_list_stages failed: %v, res: %+v", err, stagesRes)
+	}
+	stagesText := stagesRes.Content[0].(mcpproto.TextContent).Text
+	if !strings.Contains(stagesText, "DRAFT") {
+		t.Errorf("expected DRAFT in quote stages: %s", stagesText)
+	}
+
+	// 5. bitrix_describe_entity for Quote (entityTypeId 7)
+	descRes, err := inProc.CallTool(ctx, mcpproto.CallToolRequest{
+		Params: mcpproto.CallToolParams{
+			Name: "bitrix_describe_entity",
+			Arguments: map[string]any{
+				"connectionId": conn.ID,
+				"entityTypeId": 7,
+			},
+		},
+	})
+	if err != nil || descRes.IsError {
+		t.Fatalf("bitrix_describe_entity failed: %v, res: %+v", err, descRes)
+	}
+	descText := descRes.Content[0].(mcpproto.TextContent).Text
+	if !strings.Contains(descText, "Quote") || !strings.Contains(descText, "TITLE") {
+		t.Errorf("expected Quote and TITLE in describe output: %s", descText)
+	}
+
+	// 6. bitrix_discover_portal
+	discRes, err := inProc.CallTool(ctx, mcpproto.CallToolRequest{
+		Params: mcpproto.CallToolParams{
+			Name:      "bitrix_discover_portal",
+			Arguments: map[string]any{"connectionId": conn.ID},
+		},
+	})
+	if err != nil || discRes.IsError {
+		t.Fatalf("bitrix_discover_portal failed: %v, res: %+v", err, discRes)
+	}
+	discText := discRes.Content[0].(mcpproto.TextContent).Text
+	if !strings.Contains(discText, "Customer SPA") {
+		t.Errorf("expected Customer SPA in discover portal: %s", discText)
+	}
+
+	// 7. bitrix_refresh_schema_cache
+	refRes, err := inProc.CallTool(ctx, mcpproto.CallToolRequest{
+		Params: mcpproto.CallToolParams{
+			Name:      "bitrix_refresh_schema_cache",
+			Arguments: map[string]any{"connectionId": conn.ID},
+		},
+	})
+	if err != nil || refRes.IsError {
+		t.Fatalf("bitrix_refresh_schema_cache failed: %v, res: %+v", err, refRes)
+	}
+}

@@ -844,6 +844,9 @@ func (c *RestClient) CollectPages(
 	total := firstResp.Total
 
 	if firstResp.Next != nil && c.cfg.BitrixMaxPages > 1 && (limit <= 0 || len(values) < limit) {
+		if startVal, ok := params["start"]; ok && ToInt(startVal) < 0 {
+			return values, total, nil
+		}
 		if total != nil && *total > len(values) {
 			targetCount := *total
 			if limit > 0 && limit < targetCount {
@@ -901,7 +904,11 @@ func clonePageParams(params map[string]any, start int) map[string]any {
 	for k, v := range params {
 		pageParams[k] = v
 	}
-	pageParams["start"] = start
+	if existingStart, ok := params["start"]; ok && ToInt(existingStart) < 0 {
+		pageParams["start"] = existingStart
+	} else {
+		pageParams["start"] = start
+	}
 	return pageParams
 }
 

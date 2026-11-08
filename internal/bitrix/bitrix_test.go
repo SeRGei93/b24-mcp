@@ -590,6 +590,8 @@ func TestSchemaDiscovery_CachingAndDescribeBatchStages(t *testing.T) {
 					"result_error": []any{},
 				},
 			}), nil
+		case strings.HasPrefix(r.URL.Path, "/rest/api/"):
+			return jsonResponse(404, map[string]any{"error": "BITRIX_REST_V3_EXCEPTION_UNKNOWNMETHOD"}), nil
 		default:
 			return jsonResponse(200, map[string]any{"result": []any{}}), nil
 		}
@@ -617,11 +619,11 @@ func TestSchemaDiscovery_CachingAndDescribeBatchStages(t *testing.T) {
 
 	// 1. ListEntityTypes merges built-in + dynamic and caches result
 	types1, err := schema.ListEntityTypes(ctx, conn.ID, false)
-	if err != nil || len(types1) != 6 {
-		t.Fatalf("expected 6 entity types (5 built-in + 1 dynamic), got %d err=%v", len(types1), err)
+	if err != nil || len(types1) != 7 {
+		t.Fatalf("expected 7 entity types (6 built-in + 1 dynamic), got %d err=%v", len(types1), err)
 	}
 	types2, err := schema.ListEntityTypes(ctx, conn.ID, false)
-	if err != nil || len(types2) != 6 || typeCalls.Load() != 1 {
+	if err != nil || len(types2) != 7 || typeCalls.Load() != 1 {
 		t.Fatalf("expected cached ListEntityTypes (1 HTTP call), got calls=%d err=%v", typeCalls.Load(), err)
 	}
 
@@ -1468,3 +1470,291 @@ func TestRestClient_AutoFallbackToLegacyOn404OrMethodNotFound(t *testing.T) {
 func errorsAsAppError(err error, target **config.AppError) bool {
 	return errors.As(err, target)
 }
+
+func TestSchemaDiscovery_HybridREST3_QuoteAndDictionaries(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. Check EntitySlug mappings and built-in Quote
+	for _, tc := range []struct {
+		id       int
+		wantSlug string
+		wantCats bool
+		wantStg  bool
+	}{
+		{1, "lead", false, true},
+		{2, "deal", true, true},
+		{3, "contact", false, false},
+		{4, "company", false, false},
+		{7, "quote", false, true},
+		{31, "smartinvoice", true, true},
+		{128, "smartprocess128", true, true},
+	} {
+		slug, err := bitrix.EntitySlug(tc.id)
+		if err != nil || slug != tc.wantSlug {
+			t.Errorf("EntitySlug(%d) = %q, want %q, err=%v", tc.id, slug, tc.wantSlug, err)
+		}
+		if bitrix.SupportsCategories(tc.id) != tc.wantCats {
+			t.Errorf("SupportsCategories(%d) = %v, want %v", tc.id, bitrix.SupportsCategories(tc.id), tc.wantCats)
+		}
+		if bitrix.SupportsStages(tc.id) != tc.wantStg {
+			t.Errorf("SupportsStages(%d) = %v, want %v", tc.id, bitrix.SupportsStages(tc.id), tc.wantStg)
+		}
+	}
+
+	var recordedRequests []struct {
+		Method string
+		URL    string
+		Body   map[string]any
+		Raw    string
+	}
+	var mu sync.Mutex
+
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		var bodyMap map[string]any
+		var rawBody string
+		if r.Body != nil {
+			b, _ := io.ReadAll(r.Body)
+			rawBody = string(b)
+			_ = json.Unmarshal(b, &bodyMap)
+		}
+
+		mu.Lock()
+		recordedRequests = append(recordedRequests, struct {
+			Method string
+			URL    string
+			Body   map[string]any
+			Raw    string
+		}{
+			Method: r.Method,
+			URL:    r.URL.String(),
+			Body:   bodyMap,
+			Raw:    rawBody,
+		})
+		mu.Unlock()
+
+		path := r.URL.Path
+
+		// crm.type.list -> returns dynamic SPA 128
+		if strings.HasSuffix(path, "crm.type.list.json") {
+			return jsonResponse(200, map[string]any{
+				"result": map[string]any{
+					"types": []map[string]any{
+						{"entityTypeId": 128, "title": "Customer Request SPA"},
+					},
+				},
+			}), nil
+		}
+
+		// REST 3.0 crm.deal.fields
+		if strings.HasSuffix(path, "/rest/api/crm.deal.fields") {
+			return jsonResponse(200, map[string]any{
+				"result": map[string]any{
+					"fields": map[string]any{
+						"TITLE": map[string]any{"type": "string", "title": "Deal Title"},
+					},
+				},
+			}), nil
+		}
+
+		// REST 3.0 crm.quote.fields
+		if strings.HasSuffix(path, "/rest/api/crm.quote.fields") {
+			return jsonResponse(200, map[string]any{
+				"result": map[string]any{
+					"fields": map[string]any{
+						"TITLE": map[string]any{"type": "string", "title": "Quote Title"},
+					},
+				},
+			}), nil
+		}
+
+		// REST 3.0 crm.deal.category.list
+		if strings.HasSuffix(path, "/rest/api/crm.deal.category.list") {
+			return jsonResponse(200, map[string]any{
+				"result": map[string]any{
+					"items": []map[string]any{
+						{"id": 0, "name": "General Deals"},
+						{"id": 3, "name": "VIP Deals"},
+					},
+				},
+			}), nil
+		}
+
+		// Legacy /rest/crm.category.list for Smart Invoice 31
+		if strings.HasSuffix(path, "crm.category.list.json") {
+			return jsonResponse(200, map[string]any{
+				"result": map[string]any{
+					"categories": []map[string]any{
+						{"id": 10, "name": "Invoice Funnel 1"},
+					},
+				},
+			}), nil
+		}
+
+		// REST 3.0 crm.deal.category.stage.list with flat filter ["categoryId", "=", 0]
+		if strings.HasSuffix(path, "/rest/api/crm.deal.category.stage.list") {
+			return jsonResponse(200, map[string]any{
+				"result": map[string]any{
+					"items": []map[string]any{
+						{"statusId": "NEW", "name": "Initial Stage"},
+					},
+				},
+			}), nil
+		}
+
+		// Legacy /rest/crm.status.list for Quote (QUOTE_STATUS) and Lead (STATUS)
+		if strings.HasSuffix(path, "crm.status.list.json") {
+			entityID := ""
+			if f, ok := bodyMap["filter"].(map[string]any); ok {
+				entityID, _ = f["ENTITY_ID"].(string)
+			}
+			return jsonResponse(200, map[string]any{
+				"result": []map[string]any{
+					{"STATUS_ID": entityID + "_1", "NAME": "Stage 1 for " + entityID},
+				},
+			}), nil
+		}
+
+		// REST 3.0 /rest/api/batch for Describe uncached categories
+		if strings.Contains(path, "/rest/api/batch") {
+			return jsonResponse(200, map[string]any{
+				"result": []any{
+					map[string]any{
+						"items": []map[string]any{{"statusId": "NEW", "name": "New"}},
+					},
+					map[string]any{
+						"items": []map[string]any{{"statusId": "C3:NEW", "name": "VIP New"}},
+					},
+				},
+			}), nil
+		}
+
+		return jsonResponse(200, map[string]any{"result": true}), nil
+	})
+
+	cfg, st, _, tm := newTestEnv(t, "", "client-id", rt)
+	conn, err := st.UpsertConnection(ctx, store.UpsertConnectionInput{
+		Domain:         "example.bitrix24.com",
+		MemberID:       "member-schema-hybrid",
+		BitrixUserID:   "1",
+		ClientEndpoint: "https://example.bitrix24.com/rest/",
+		AccessToken:    "acc",
+		RefreshToken:   "ref",
+		Scope:          "crm",
+		ExpiresAt:      time.Now().Add(time.Hour),
+		Mode:           config.ModeReadOnly,
+	})
+	if err != nil {
+		t.Fatalf("UpsertConnection failed: %v", err)
+	}
+
+	rc := bitrix.NewRestClient(cfg, tm, config.NewLogger(nil, "silent"), &http.Client{Transport: rt})
+	schema := bitrix.NewSchemaDiscovery(cfg, st, rc)
+
+	// 2. ListEntityTypes sends start: -1 to crm.type.list and returns 6 built-ins + 1 SPA
+	types, err := schema.ListEntityTypes(ctx, conn.ID, false)
+	if err != nil {
+		t.Fatalf("ListEntityTypes failed: %v", err)
+	}
+	if len(types) != 7 {
+		t.Fatalf("expected 7 entity types (6 built-in including Quote + 1 dynamic), got %d", len(types))
+	}
+	mu.Lock()
+	firstReq := recordedRequests[0]
+	mu.Unlock()
+	if firstReq.Body["start"] != -1 && firstReq.Body["start"] != float64(-1) {
+		t.Errorf("expected start: -1 in crm.type.list request, got: %v", firstReq.Body["start"])
+	}
+
+	// 3. ListFields for Deal (2) calls REST 3.0 crm.deal.fields
+	fieldsDeal, err := schema.Fields(ctx, conn.ID, 2, false)
+	if err != nil {
+		t.Fatalf("Fields(2) failed: %v", err)
+	}
+	if fieldsDeal["TITLE"] == nil {
+		t.Errorf("expected TITLE field in fieldsDeal: %+v", fieldsDeal)
+	}
+
+	// 4. ListFields for Quote (7) calls REST 3.0 crm.quote.fields
+	fieldsQuote, err := schema.Fields(ctx, conn.ID, 7, false)
+	if err != nil {
+		t.Fatalf("Fields(7) failed: %v", err)
+	}
+	if fieldsQuote["TITLE"] == nil {
+		t.Errorf("expected TITLE field in fieldsQuote: %+v", fieldsQuote)
+	}
+
+	// 5. ListCategories:
+	// Category-less entities (1 Lead, 3 Contact, 4 Company, 7 Quote) make 0 network requests
+	mu.Lock()
+	reqsBefore := len(recordedRequests)
+	mu.Unlock()
+	for _, catLessID := range []int{1, 3, 4, 7} {
+		cats, err := schema.Categories(ctx, conn.ID, catLessID, false)
+		if err != nil || len(cats) != 0 {
+			t.Errorf("expected empty categories without error for %d, got %v err=%v", catLessID, cats, err)
+		}
+	}
+	mu.Lock()
+	reqsAfter := len(recordedRequests)
+	mu.Unlock()
+	if reqsAfter != reqsBefore {
+		t.Errorf("expected 0 HTTP requests for category-less entities, made %d", reqsAfter-reqsBefore)
+	}
+
+	// Deals (2) calls REST 3.0 crm.deal.category.list
+	catsDeal, err := schema.Categories(ctx, conn.ID, 2, false)
+	if err != nil || len(catsDeal) != 2 {
+		t.Fatalf("expected 2 deal categories, got %d err=%v", len(catsDeal), err)
+	}
+
+	// Smart Invoices (31) calls legacy crm.category.list
+	catsInvoice, err := schema.Categories(ctx, conn.ID, 31, false)
+	if err != nil || len(catsInvoice) != 1 {
+		t.Fatalf("expected 1 invoice category via legacy endpoint, got %d err=%v", len(catsInvoice), err)
+	}
+
+	// 6. ListStages:
+	// Deals (2) calls REST 3.0 crm.deal.category.stage.list with flat 3-element filter ["categoryId", "=", 0]
+	stagesDeal, err := schema.Stages(ctx, conn.ID, 2, 0, false)
+	if err != nil || len(stagesDeal) != 1 {
+		t.Fatalf("expected 1 deal stage, got %d err=%v", len(stagesDeal), err)
+	}
+	mu.Lock()
+	var lastStageReq struct {
+		Method string
+		URL    string
+		Body   map[string]any
+		Raw    string
+	}
+	for _, r := range recordedRequests {
+		if strings.Contains(r.URL, "crm.deal.category.stage.list") {
+			lastStageReq = r
+		}
+	}
+	mu.Unlock()
+	if filterSlice, ok := lastStageReq.Body["filter"].([]any); !ok || len(filterSlice) != 3 || filterSlice[0] != "categoryId" || filterSlice[1] != "=" {
+		t.Errorf("expected flat 3-element filter [categoryId, =, X], got: %v (raw: %s)", lastStageReq.Body["filter"], lastStageReq.Raw)
+	}
+
+	// Quotes (7) calls legacy crm.status.list with ENTITY_ID: QUOTE_STATUS
+	stagesQuote, err := schema.Stages(ctx, conn.ID, 7, 0, false)
+	if err != nil || len(stagesQuote) != 1 {
+		t.Fatalf("expected 1 quote stage, got %d err=%v", len(stagesQuote), err)
+	}
+
+	// Leads (1) calls legacy crm.status.list with ENTITY_ID: STATUS
+	stagesLead, err := schema.Stages(ctx, conn.ID, 1, 0, false)
+	if err != nil || len(stagesLead) != 1 {
+		t.Fatalf("expected 1 lead stage, got %d err=%v", len(stagesLead), err)
+	}
+
+	// 7. Describe for Deals batches uncached categories via /rest/api/batch
+	descDeal, err := schema.Describe(ctx, conn.ID, 2, nil, true)
+	if err != nil {
+		t.Fatalf("Describe(2) failed: %v", err)
+	}
+	if descDeal["entity"] == nil || descDeal["fields"] == nil || descDeal["categories"] == nil || descDeal["stages"] == nil {
+		t.Errorf("incomplete Describe output: %+v", descDeal)
+	}
+}
+

@@ -3,6 +3,7 @@ package bitrix_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -69,9 +70,9 @@ func newTestEnv(t *testing.T, portalDomain, clientID string, rt http.RoundTrippe
 
 func TestNormalizePortalDomain(t *testing.T) {
 	cases := map[string]string{
-		"Example.BITRIX24.com":         "example.bitrix24.com",
+		"Example.BITRIX24.com":          "example.bitrix24.com",
 		"https://example.bitrix24.com/": "example.bitrix24.com",
-		"example.bitrix24.com.br":      "example.bitrix24.com.br",
+		"example.bitrix24.com.br":       "example.bitrix24.com.br",
 	}
 	for input, want := range cases {
 		got, err := bitrix.NormalizePortalDomain(input, nil)
@@ -960,4 +961,510 @@ func TestOperationService_TwoStepLifecycleAndPolicyGuard(t *testing.T) {
 	}
 }
 
+func TestRestClient_REST3AndLegacyRouting_OAuthAndWebhook(t *testing.T) {
+	ctx := context.Background()
 
+	var recordedRequests []struct {
+		URL    string
+		Auth   any
+		IsJSON bool
+		Raw    string
+	}
+	var mu sync.Mutex
+
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		bodyBytes, _ := io.ReadAll(r.Body)
+		var bodyMap map[string]any
+		isJSON := json.Unmarshal(bodyBytes, &bodyMap) == nil
+
+		mu.Lock()
+		recordedRequests = append(recordedRequests, struct {
+			URL    string
+			Auth   any
+			IsJSON bool
+			Raw    string
+		}{
+			URL:    r.URL.String(),
+			Auth:   bodyMap["auth"],
+			IsJSON: isJSON,
+			Raw:    string(bodyBytes),
+		})
+		mu.Unlock()
+
+		if strings.Contains(r.URL.Path, "batch") {
+			if strings.Contains(r.URL.Path, "/rest/api") {
+				// REST 3.0 batch response: json array
+				return jsonResponse(200, map[string]any{
+					"result": []any{
+						map[string]any{"id": 1, "title": "Deal 1"},
+					},
+				}), nil
+			}
+			// Legacy batch response: map
+			return jsonResponse(200, map[string]any{
+				"result": map[string]any{
+					"result": map[string]any{
+						"cmd0": map[string]any{"id": 1, "title": "Deal 1"},
+					},
+					"result_error": []any{},
+				},
+			}), nil
+		}
+
+		return jsonResponse(200, map[string]any{
+			"result": map[string]any{"item": map[string]any{"id": 10}},
+		}), nil
+	})
+
+	cfg, st, _, tm := newTestEnv(t, "", "client-id", rt)
+	rc := bitrix.NewRestClient(cfg, tm, config.NewLogger(nil, "silent"), &http.Client{Transport: rt})
+
+	// 1. OAuth Connection
+	oauthConn, err := st.UpsertConnection(ctx, store.UpsertConnectionInput{
+		Domain:         "example.bitrix24.com",
+		MemberID:       "member-oauth",
+		BitrixUserID:   "1",
+		ClientEndpoint: "https://example.bitrix24.com/rest/",
+		AccessToken:    "oauth-secret",
+		RefreshToken:   "oauth-refresh",
+		Scope:          "crm",
+		ExpiresAt:      time.Now().Add(time.Hour),
+		Mode:           config.ModeReadOnly,
+	})
+	if err != nil {
+		t.Fatalf("UpsertConnection failed: %v", err)
+	}
+
+	// OAuth v3 single call
+	_, err = rc.Call(ctx, oauthConn.ID, "crm.deal.get", map[string]any{"id": 10}, bitrix.WithAPIVersion("v3"))
+	if err != nil {
+		t.Fatalf("OAuth v3 Call failed: %v", err)
+	}
+	// OAuth v2 single call
+	_, err = rc.Call(ctx, oauthConn.ID, "crm.deal.get", map[string]any{"id": 10}, bitrix.WithAPIVersion("v2"))
+	if err != nil {
+		t.Fatalf("OAuth v2 Call failed: %v", err)
+	}
+	// OAuth v3 batch
+	_, err = rc.CallBatch(ctx, oauthConn.ID, []bitrix.NamedBatchCommand{
+		{Key: "cmd0", Method: "crm.deal.get", Params: map[string]any{"id": 1}},
+	}, false, bitrix.WithAPIVersion("v3"))
+	if err != nil {
+		t.Fatalf("OAuth v3 CallBatch failed: %v", err)
+	}
+	// OAuth v2 batch
+	_, err = rc.CallBatch(ctx, oauthConn.ID, []bitrix.NamedBatchCommand{
+		{Key: "cmd0", Method: "crm.deal.get", Params: map[string]any{"id": 1}},
+	}, false, bitrix.WithAPIVersion("v2"))
+	if err != nil {
+		t.Fatalf("OAuth v2 CallBatch failed: %v", err)
+	}
+
+	// 2. Webhook Connection
+	whCfg := &config.Config{
+		BitrixWebhookURL: "https://example.bitrix24.com/rest/42/webhook-secret-code/",
+		DefaultMode:      config.ModeReadOnly,
+	}
+	whConn, err := st.EnsureWebhookConnection(ctx, whCfg)
+	if err != nil {
+		t.Fatalf("EnsureWebhookConnection failed: %v", err)
+	}
+
+	// Webhook v3 single call
+	_, err = rc.Call(ctx, whConn.ID, "crm.deal.get", map[string]any{"id": 10}, bitrix.WithAPIVersion("v3"))
+	if err != nil {
+		t.Fatalf("Webhook v3 Call failed: %v", err)
+	}
+	// Webhook v2 single call
+	_, err = rc.Call(ctx, whConn.ID, "crm.deal.get", map[string]any{"id": 10}, bitrix.WithAPIVersion("v2"))
+	if err != nil {
+		t.Fatalf("Webhook v2 Call failed: %v", err)
+	}
+	// Webhook v3 batch
+	_, err = rc.CallBatch(ctx, whConn.ID, []bitrix.NamedBatchCommand{
+		{Key: "cmd0", Method: "crm.deal.get", Params: map[string]any{"id": 1}},
+	}, false, bitrix.WithAPIVersion("v3"))
+	if err != nil {
+		t.Fatalf("Webhook v3 CallBatch failed: %v", err)
+	}
+	// Webhook v2 batch
+	_, err = rc.CallBatch(ctx, whConn.ID, []bitrix.NamedBatchCommand{
+		{Key: "cmd0", Method: "crm.deal.get", Params: map[string]any{"id": 1}},
+	}, false, bitrix.WithAPIVersion("v2"))
+	if err != nil {
+		t.Fatalf("Webhook v2 CallBatch failed: %v", err)
+	}
+
+	mu.Lock()
+	reqs := recordedRequests
+	mu.Unlock()
+
+	if len(reqs) != 8 {
+		t.Fatalf("expected 8 recorded requests, got %d", len(reqs))
+	}
+
+	// Check 0: OAuth v3 single
+	if reqs[0].URL != "https://example.bitrix24.com/rest/api/crm.deal.get" {
+		t.Errorf("OAuth v3 single URL mismatch: %s", reqs[0].URL)
+	}
+	if reqs[0].Auth != "oauth-secret" {
+		t.Errorf("OAuth v3 single expected auth in body, got: %v", reqs[0].Auth)
+	}
+
+	// Check 1: OAuth v2 single
+	if reqs[1].URL != "https://example.bitrix24.com/rest/crm.deal.get.json" {
+		t.Errorf("OAuth v2 single URL mismatch: %s", reqs[1].URL)
+	}
+	if reqs[1].Auth != "oauth-secret" {
+		t.Errorf("OAuth v2 single expected auth in body, got: %v", reqs[1].Auth)
+	}
+
+	// Check 2: OAuth v3 batch -> /rest/api/batch?auth=... with native JSON array
+	if !strings.HasPrefix(reqs[2].URL, "https://example.bitrix24.com/rest/api/batch") {
+		t.Errorf("OAuth v3 batch URL mismatch: %s", reqs[2].URL)
+	}
+	if !strings.HasPrefix(strings.TrimSpace(reqs[2].Raw), "[") {
+		t.Errorf("OAuth v3 batch expected JSON array body, got: %s", reqs[2].Raw)
+	}
+
+	// Check 3: OAuth v2 batch -> /rest/batch.json
+	if reqs[3].URL != "https://example.bitrix24.com/rest/batch.json" {
+		t.Errorf("OAuth v2 batch URL mismatch: %s", reqs[3].URL)
+	}
+	if reqs[3].Auth != "oauth-secret" {
+		t.Errorf("OAuth v2 batch expected auth in body, got: %v", reqs[3].Auth)
+	}
+
+	// Check 4: Webhook v3 single -> /rest/api/42/webhook-secret-code/crm.deal.get (no auth)
+	if reqs[4].URL != "https://example.bitrix24.com/rest/api/42/webhook-secret-code/crm.deal.get" {
+		t.Errorf("Webhook v3 single URL mismatch: %s", reqs[4].URL)
+	}
+	if reqs[4].Auth != nil {
+		t.Errorf("Webhook v3 single must NOT contain auth in body, got: %v", reqs[4].Auth)
+	}
+
+	// Check 5: Webhook v2 single -> /rest/42/webhook-secret-code/crm.deal.get.json (no auth)
+	if reqs[5].URL != "https://example.bitrix24.com/rest/42/webhook-secret-code/crm.deal.get.json" {
+		t.Errorf("Webhook v2 single URL mismatch: %s", reqs[5].URL)
+	}
+	if reqs[5].Auth != nil {
+		t.Errorf("Webhook v2 single must NOT contain auth in body, got: %v", reqs[5].Auth)
+	}
+
+	// Check 6: Webhook v3 batch -> /rest/api/42/webhook-secret-code/batch
+	if reqs[6].URL != "https://example.bitrix24.com/rest/api/42/webhook-secret-code/batch" {
+		t.Errorf("Webhook v3 batch URL mismatch: %s", reqs[6].URL)
+	}
+	if !strings.HasPrefix(strings.TrimSpace(reqs[6].Raw), "[") {
+		t.Errorf("Webhook v3 batch expected JSON array body, got: %s", reqs[6].Raw)
+	}
+
+	// Check 7: Webhook v2 batch -> /rest/42/webhook-secret-code/batch.json
+	if reqs[7].URL != "https://example.bitrix24.com/rest/42/webhook-secret-code/batch.json" {
+		t.Errorf("Webhook v2 batch URL mismatch: %s", reqs[7].URL)
+	}
+	if reqs[7].Auth != nil {
+		t.Errorf("Webhook v2 batch must NOT contain auth in body, got: %v", reqs[7].Auth)
+	}
+}
+
+func TestRestClient_PolymorphicErrorsAndValidation(t *testing.T) {
+	ctx := context.Background()
+
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		var bodyBytes []byte
+		if r.Body != nil {
+			bodyBytes, _ = io.ReadAll(r.Body)
+		}
+		var bodyMap map[string]any
+		_ = json.Unmarshal(bodyBytes, &bodyMap)
+
+		if strings.Contains(r.URL.Path, "legacy_err") {
+			return jsonResponse(400, map[string]any{
+				"error":             "ERROR_LEGACY",
+				"error_description": "Legacy error description",
+			}), nil
+		}
+		if strings.Contains(r.URL.Path, "rest3_validation") {
+			return jsonResponse(400, map[string]any{
+				"error": map[string]any{
+					"code":    "BITRIX_REST_V3_EXCEPTION_VALIDATION_REQUESTVALIDATIONEXCEPTION",
+					"message": "Validation failed",
+					"validation": []any{
+						map[string]any{"field": "title", "message": "Title is required"},
+					},
+				},
+				"time": map[string]any{
+					"duration": 0.05,
+				},
+			}), nil
+		}
+		if strings.Contains(r.URL.Path, "rest3_expired") {
+			if bodyMap["auth"] == "refreshed-secret" {
+				return jsonResponse(200, map[string]any{"result": true}), nil
+			}
+			return jsonResponse(401, map[string]any{
+				"error": map[string]any{
+					"code":    "expired_token",
+					"message": "Token expired in REST 3.0",
+				},
+			}), nil
+		}
+		if r.URL.Hostname() == "oauth.bitrix.info" {
+			return jsonResponse(200, map[string]any{
+				"access_token":    "refreshed-secret",
+				"refresh_token":   "refreshed-refresh",
+				"expires_in":      3600,
+				"scope":           "crm",
+				"domain":          "example.bitrix24.com",
+				"member_id":       "member-err",
+				"user_id":         "1",
+				"client_endpoint": "https://example.bitrix24.com/rest/",
+			}), nil
+		}
+		return jsonResponse(200, map[string]any{"result": true}), nil
+	})
+
+	cfg, st, _, tm := newTestEnv(t, "", "client-id", rt)
+	rc := bitrix.NewRestClient(cfg, tm, config.NewLogger(nil, "silent"), &http.Client{Transport: rt})
+
+	conn, err := st.UpsertConnection(ctx, store.UpsertConnectionInput{
+		Domain:         "example.bitrix24.com",
+		MemberID:       "member-err",
+		BitrixUserID:   "1",
+		ClientEndpoint: "https://example.bitrix24.com/rest/",
+		AccessToken:    "old-secret",
+		RefreshToken:   "old-refresh",
+		Scope:          "crm",
+		ExpiresAt:      time.Now().Add(time.Hour),
+		Mode:           config.ModeReadOnly,
+	})
+	if err != nil {
+		t.Fatalf("UpsertConnection failed: %v", err)
+	}
+
+	// 1. Legacy error string decoded
+	_, err = rc.Call(ctx, conn.ID, "legacy_err", nil)
+	if err == nil {
+		t.Fatalf("expected error for legacy_err")
+	}
+	var appErr *config.AppError
+	if !errorsAsAppError(err, &appErr) {
+		t.Fatalf("expected *config.AppError, got %T: %v", err, err)
+	}
+	if appErr.Code != "ERROR_LEGACY" {
+		t.Errorf("expected code 'ERROR_LEGACY', got %q", appErr.Code)
+	}
+
+	// 2. REST 3.0 nested error with validation items decoded
+	_, err = rc.Call(ctx, conn.ID, "rest3_validation", nil)
+	if err == nil {
+		t.Fatalf("expected error for rest3_validation")
+	}
+	if !errorsAsAppError(err, &appErr) {
+		t.Fatalf("expected *config.AppError, got %T: %v", err, err)
+	}
+	if appErr.Code != "BITRIX_REST_V3_EXCEPTION_VALIDATION_REQUESTVALIDATIONEXCEPTION" {
+		t.Errorf("expected REST 3.0 code, got %q", appErr.Code)
+	}
+	if !strings.Contains(appErr.Message, "title: Title is required") {
+		t.Errorf("expected validation field details in message, got %q", appErr.Message)
+	}
+	if len(appErr.Validation) != 1 || appErr.Validation[0].Field != "title" {
+		t.Errorf("expected validation slice on AppError, got %+v", appErr.Validation)
+	}
+
+	// 3. REST 3.0 nested expired_token triggers singleflight OAuth token refresh
+	_, err = rc.Call(ctx, conn.ID, "rest3_expired", nil)
+	if err != nil {
+		t.Fatalf("expected successful call after token refresh, got: %v", err)
+	}
+	updatedConn, err := st.GetConnection(ctx, conn.ID)
+	if err != nil || updatedConn.AccessToken != "refreshed-secret" {
+		t.Errorf("expected access token to be refreshed to 'refreshed-secret', got %+v err=%v", updatedConn, err)
+	}
+}
+
+func TestRestClient_TelemetryTime_OperatingResetAt_AndIdempotencyKey(t *testing.T) {
+	ctx := context.Background()
+
+	var requestCount atomic.Int32
+	var idempotencyHeaders []string
+	var mu sync.Mutex
+
+	nowSec := time.Now().Unix()
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		mu.Lock()
+		idempotencyHeaders = append(idempotencyHeaders, r.Header.Get("Idempotency-Key"))
+		mu.Unlock()
+
+		cnt := requestCount.Add(1)
+		if cnt == 1 {
+			// First attempt: return 429 with operating_reset_at in time block
+			resp := jsonResponse(429, map[string]any{
+				"error": "OPERATION_TIME_LIMIT",
+				"time": map[string]any{
+					"duration":           0.5,
+					"operating":          360.5,
+					"operating_reset_at": nowSec + 1,
+				},
+			})
+			return resp, nil
+		}
+		// Second attempt succeeds
+		return jsonResponse(200, map[string]any{
+			"result": map[string]any{"id": 42},
+			"time": map[string]any{
+				"duration":           0.08,
+				"operating":          10.2,
+				"operating_reset_at": nowSec + 600,
+			},
+		}), nil
+	})
+
+	cfg, st, _, tm := newTestEnv(t, "", "client-id", rt)
+	rc := bitrix.NewRestClient(cfg, tm, config.NewLogger(nil, "silent"), &http.Client{Transport: rt})
+
+	conn, err := st.UpsertConnection(ctx, store.UpsertConnectionInput{
+		Domain:         "example.bitrix24.com",
+		MemberID:       "member-time",
+		BitrixUserID:   "1",
+		ClientEndpoint: "https://example.bitrix24.com/rest/",
+		AccessToken:    "secret",
+		RefreshToken:   "refresh",
+		Scope:          "crm",
+		ExpiresAt:      time.Now().Add(time.Hour),
+		Mode:           config.ModeReadOnly,
+	})
+	if err != nil {
+		t.Fatalf("UpsertConnection failed: %v", err)
+	}
+
+	start := time.Now()
+	resp, err := rc.Call(ctx, conn.ID, "crm.deal.get", map[string]any{"id": 42}, bitrix.WithIdempotencyKey("uuid-idem-123"))
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("rc.Call failed: %v", err)
+	}
+	if resp == nil || resp.Time == nil {
+		t.Fatalf("expected non-nil resp and resp.Time")
+	}
+	if resp.Time.OperatingResetAt != nowSec+600 {
+		t.Errorf("expected OperatingResetAt %d, got %d", nowSec+600, resp.Time.OperatingResetAt)
+	}
+	if elapsed < 500*time.Millisecond {
+		t.Errorf("expected backoff waiting for operating_reset_at, elapsed: %v", elapsed)
+	}
+
+	mu.Lock()
+	headers := idempotencyHeaders
+	mu.Unlock()
+	if len(headers) != 2 {
+		t.Fatalf("expected 2 requests, got %d", len(headers))
+	}
+	for i, h := range headers {
+		if h != "uuid-idem-123" {
+			t.Errorf("attempt %d missing or wrong Idempotency-Key: %q", i, h)
+		}
+	}
+}
+
+func TestRestClient_AutoFallbackToLegacyOn404OrMethodNotFound(t *testing.T) {
+	ctx := context.Background()
+
+	var requestedPaths []string
+	var mu sync.Mutex
+
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		mu.Lock()
+		requestedPaths = append(requestedPaths, r.URL.Path)
+		mu.Unlock()
+
+		if strings.Contains(r.URL.Path, "/rest/api/crm.onpremise.html404") {
+			// Older On-Premise returning non-JSON HTML 404
+			return &http.Response{
+				StatusCode: 404,
+				Header:     http.Header{"Content-Type": []string{"text/html; charset=UTF-8"}},
+				Body:       io.NopCloser(strings.NewReader("<!DOCTYPE html><html><head><title>404 Not Found</title></head><body><h1>404 Not Found</h1></body></html>")),
+			}, nil
+		}
+		if strings.Contains(r.URL.Path, "/rest/api/crm.unknown.method") {
+			return jsonResponse(404, map[string]any{
+				"error": map[string]any{
+					"code":    "BITRIX_REST_V3_EXCEPTION_UNKNOWNMETHOD",
+					"message": "Method not found in REST 3.0",
+				},
+			}), nil
+		}
+		// Legacy fallback endpoint succeeds
+		return jsonResponse(200, map[string]any{
+			"result": map[string]any{"fallback": true},
+		}), nil
+	})
+
+	cfg, st, _, tm := newTestEnv(t, "", "client-id", rt)
+	rc := bitrix.NewRestClient(cfg, tm, config.NewLogger(nil, "silent"), &http.Client{Transport: rt})
+
+	conn, err := st.UpsertConnection(ctx, store.UpsertConnectionInput{
+		Domain:         "onpremise.example.com",
+		MemberID:       "member-onprem",
+		BitrixUserID:   "1",
+		ClientEndpoint: "https://onpremise.example.com/rest/",
+		AccessToken:    "token",
+		RefreshToken:   "refresh",
+		Scope:          "crm",
+		ExpiresAt:      time.Now().Add(time.Hour),
+		Mode:           config.ModeReadOnly,
+	})
+	if err != nil {
+		t.Fatalf("UpsertConnection failed: %v", err)
+	}
+
+	// 1. auto mode: REST 3.0 returns HTML 404 -> caches v2 in schema_cache and seamlessly executes legacy v2
+	resp, err := rc.Call(ctx, conn.ID, "crm.onpremise.html404", nil)
+	if err != nil {
+		t.Fatalf("expected seamless fallback to v2, got error: %v", err)
+	}
+	if !strings.Contains(string(resp.Result), `"fallback":true`) {
+		t.Errorf("expected fallback result, got: %s", string(resp.Result))
+	}
+
+	// Verify schema_cache cached "v2"
+	var cachedVersion string
+	found, err := st.GetSchemaCache(ctx, conn.ID, "api_version", 900, &cachedVersion)
+	if err != nil || !found || cachedVersion != "v2" {
+		t.Errorf("expected api_version='v2' in schema_cache, found=%v version=%q err=%v", found, cachedVersion, err)
+	}
+
+	// Subsequent call to another method should directly call v2 (path ending in .json)
+	mu.Lock()
+	beforeLen := len(requestedPaths)
+	mu.Unlock()
+
+	_, err = rc.Call(ctx, conn.ID, "crm.another.method", nil)
+	if err != nil {
+		t.Fatalf("subsequent call failed: %v", err)
+	}
+	mu.Lock()
+	lastPath := requestedPaths[len(requestedPaths)-1]
+	afterLen := len(requestedPaths)
+	mu.Unlock()
+
+	if afterLen-beforeLen != 1 {
+		t.Errorf("expected exactly 1 request for subsequent call, got %d", afterLen-beforeLen)
+	}
+	if !strings.HasSuffix(lastPath, ".json") || strings.Contains(lastPath, "/rest/api/") {
+		t.Errorf("expected direct Legacy REST call ending with .json, got: %s", lastPath)
+	}
+
+	// 2. Explicit WithAPIVersion("v3") does NOT fallback on 404 and returns error
+	_, err = rc.Call(ctx, conn.ID, "crm.onpremise.html404", nil, bitrix.WithAPIVersion("v3"))
+	if err == nil {
+		t.Fatalf("expected error for explicit v3 on 404")
+	}
+}
+
+func errorsAsAppError(err error, target **config.AppError) bool {
+	return errors.As(err, target)
+}

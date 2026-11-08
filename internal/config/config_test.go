@@ -190,8 +190,8 @@ func TestLogger_RedactsSecrets(t *testing.T) {
 		"code_verifier":      "secret-verifier",
 		"token":              "secret-token",
 		"nested": map[string]any{
-			"accessToken":  "nested-secret",
-			"safe_field":   "visible-value",
+			"accessToken": "nested-secret",
+			"safe_field":  "visible-value",
 		},
 	})
 
@@ -230,3 +230,85 @@ func TestIsValidBearerToken(t *testing.T) {
 	}
 }
 
+func TestLoad_WebhookOAuthAndAPIVersion(t *testing.T) {
+	// 1. Safe defaults for OAuth URL and API Version
+	base := baseEnv("https://mcp.example.com")
+	cfg, err := config.Load(base)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.BitrixOAuthURL != "https://oauth.bitrix.info/oauth/token" {
+		t.Errorf("expected default OAuth URL, got %q", cfg.BitrixOAuthURL)
+	}
+	if cfg.BitrixAPIVersion != "auto" {
+		t.Errorf("expected default API version 'auto', got %q", cfg.BitrixAPIVersion)
+	}
+
+	// 2. Webhook URL relaxes APP_URL, BITRIX_CLIENT_ID, BITRIX_CLIENT_SECRET
+	webhookEnv := map[string]string{
+		"DATABASE_PATH":        ":memory:",
+		"BITRIX_WEBHOOK_URL":   "https://my-portal.bitrix24.com/rest/1/abc123xyz456/",
+		"MCP_AUTH_TOKEN":       strings.Repeat("a", 32),
+		"TOKEN_ENCRYPTION_KEY": base["TOKEN_ENCRYPTION_KEY"],
+	}
+	wCfg, err := config.Load(webhookEnv)
+	if err != nil {
+		t.Fatalf("expected valid load with webhook URL only: %v", err)
+	}
+	if wCfg.BitrixWebhookURL != "https://my-portal.bitrix24.com/rest/1/abc123xyz456" {
+		t.Errorf("expected normalized webhook URL, got %q", wCfg.BitrixWebhookURL)
+	}
+	if wCfg.BitrixClientID != "" || wCfg.BitrixClientSecret != "" {
+		t.Errorf("expected empty client credentials in webhook mode")
+	}
+
+	// 3. Custom OAuth URL and API version
+	customEnv := baseEnv("https://mcp.example.com")
+	customEnv["BITRIX_OAUTH_URL"] = "https://oauth.bitrix24.tech/oauth/token"
+	customEnv["BITRIX_API_VERSION"] = "v3"
+	cCfg, err := config.Load(customEnv)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cCfg.BitrixOAuthURL != "https://oauth.bitrix24.tech/oauth/token" {
+		t.Errorf("expected custom OAuth URL, got %q", cCfg.BitrixOAuthURL)
+	}
+	if cCfg.BitrixAPIVersion != "v3" {
+		t.Errorf("expected API version 'v3', got %q", cCfg.BitrixAPIVersion)
+	}
+
+	// 4. Invalid API version rejected
+	badVersionEnv := baseEnv("https://mcp.example.com")
+	badVersionEnv["BITRIX_API_VERSION"] = "invalid_version"
+	if _, err := config.Load(badVersionEnv); err == nil || !strings.Contains(err.Error(), "BITRIX_API_VERSION") {
+		t.Errorf("expected BITRIX_API_VERSION validation error, got: %v", err)
+	}
+
+	// 5. Invalid Webhook URLs
+	badWebhooks := []string{
+		"http://insecure.example.com/rest/1/code",         // insecure non-loopback
+		"https://portal.bitrix24.com/other/1/code",        // missing /rest/
+		"https://portal.bitrix24.com/rest/notdigits/code", // user id not digits
+		"https://portal.bitrix24.com/rest/1",              // missing webhook code
+	}
+	for _, badWH := range badWebhooks {
+		env := map[string]string{
+			"DATABASE_PATH":        ":memory:",
+			"BITRIX_WEBHOOK_URL":   badWH,
+			"MCP_AUTH_TOKEN":       strings.Repeat("a", 32),
+			"TOKEN_ENCRYPTION_KEY": base["TOKEN_ENCRYPTION_KEY"],
+		}
+		if _, err := config.Load(env); err == nil || !strings.Contains(err.Error(), "BITRIX_WEBHOOK_URL") {
+			t.Errorf("expected BITRIX_WEBHOOK_URL error for %q, got: %v", badWH, err)
+		}
+	}
+
+	// 6. Webhook URL parser helper
+	parsedDomain, parsedUserID, parsedCode, err := config.ParseWebhookURL("https://my-portal.bitrix24.com/rest/42/secret-token-123/")
+	if err != nil {
+		t.Fatalf("ParseWebhookURL failed: %v", err)
+	}
+	if parsedDomain != "my-portal.bitrix24.com" || parsedUserID != "42" || parsedCode != "secret-token-123" {
+		t.Errorf("unexpected parsed webhook parts: domain=%s user=%s code=%s", parsedDomain, parsedUserID, parsedCode)
+	}
+}

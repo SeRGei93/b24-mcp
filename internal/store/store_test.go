@@ -510,6 +510,89 @@ func TestStore_PendingOperationsAndAuditLogs(t *testing.T) {
 	}
 }
 
+func TestStore_EnsureWebhookConnectionAndIsWebhook(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.NewStore(":memory:", testKeyHex)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer st.Close()
+	if err := st.Migrate(ctx, nil); err != nil {
+		t.Fatalf("failed to migrate store: %v", err)
+	}
 
+	cfg := &config.Config{
+		BitrixWebhookURL:   "https://webhook-portal.bitrix24.com/rest/7/secret-hook-code/",
+		BitrixPortalDomain: "webhook-portal.bitrix24.com",
+		DefaultMode:        config.ModeWriteWithConfirmation,
+		AdminToolsEnabled:  true,
+	}
 
+	// 1. First seeding creates the connection
+	conn, err := st.EnsureWebhookConnection(ctx, cfg)
+	if err != nil {
+		t.Fatalf("EnsureWebhookConnection failed: %v", err)
+	}
+	if conn == nil {
+		t.Fatalf("expected non-nil connection")
+	}
+	if !conn.IsWebhook() {
+		t.Errorf("expected conn.IsWebhook() to be true")
+	}
+	if conn.Domain != "webhook-portal.bitrix24.com" {
+		t.Errorf("expected domain 'webhook-portal.bitrix24.com', got %q", conn.Domain)
+	}
+	if conn.BitrixUserID != "7" {
+		t.Errorf("expected BitrixUserID '7', got %q", conn.BitrixUserID)
+	}
+	if conn.Mode != config.ModeWriteWithConfirmation {
+		t.Errorf("expected mode %q, got %q", config.ModeWriteWithConfirmation, conn.Mode)
+	}
+	if !conn.AdminToolsEnabled {
+		t.Errorf("expected AdminToolsEnabled true")
+	}
+	if conn.Status != store.StatusActive {
+		t.Errorf("expected status 'active', got %q", conn.Status)
+	}
+	if conn.AccessToken != "secret-hook-code" {
+		t.Errorf("expected AccessToken 'secret-hook-code', got %q", conn.AccessToken)
+	}
 
+	// 2. Second seeding is idempotent and updates if config changes
+	cfg.DefaultMode = config.ModeReadOnly
+	updatedConn, err := st.EnsureWebhookConnection(ctx, cfg)
+	if err != nil {
+		t.Fatalf("EnsureWebhookConnection second call failed: %v", err)
+	}
+	if updatedConn.ID != conn.ID {
+		t.Errorf("expected same connection ID, got %s vs %s", updatedConn.ID, conn.ID)
+	}
+	if updatedConn.Mode != config.ModeReadOnly {
+		t.Errorf("expected updated mode %q, got %q", config.ModeReadOnly, updatedConn.Mode)
+	}
+
+	// 3. Regular OAuth connection returns IsWebhook() == false
+	oauthConn, err := st.UpsertConnection(ctx, store.UpsertConnectionInput{
+		Domain:         "oauth-portal.bitrix24.com",
+		MemberID:       "oauth-member-1",
+		BitrixUserID:   "1",
+		ClientEndpoint: "https://oauth-portal.bitrix24.com/rest/",
+		AccessToken:    "token",
+		RefreshToken:   "refresh",
+		ExpiresAt:      time.Now().Add(time.Hour),
+		Mode:           config.ModeReadOnly,
+	})
+	if err != nil {
+		t.Fatalf("UpsertConnection failed: %v", err)
+	}
+	if oauthConn.IsWebhook() {
+		t.Errorf("expected oauthConn.IsWebhook() to be false")
+	}
+
+	// 4. EnsureWebhookConnection with empty webhook URL returns nil, nil
+	noHookCfg := &config.Config{}
+	none, err := st.EnsureWebhookConnection(ctx, noHookCfg)
+	if err != nil || none != nil {
+		t.Fatalf("expected nil, nil for empty webhook URL, got %+v err=%v", none, err)
+	}
+}

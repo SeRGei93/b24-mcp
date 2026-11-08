@@ -475,4 +475,3 @@ func TestMCPServer_AllToolsExecution(t *testing.T) {
 		t.Errorf("expected CONNECTION_ACCESS_DENIED error code, got: %s", badText)
 	}
 }
-

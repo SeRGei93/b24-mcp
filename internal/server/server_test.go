@@ -658,4 +658,3 @@ func TestServer_RateLimiterPerIPAndTrustProxy(t *testing.T) {
 		t.Fatalf("expected 201 for distinct X-Forwarded-For client when TRUST_PROXY=true, got %d", secondForwardedRec.Code)
 	}
 }
-

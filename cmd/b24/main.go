@@ -46,6 +46,10 @@ func run() error {
 		return err
 	}
 
+	if _, err := st.EnsureWebhookConnection(ctx, cfg); err != nil {
+		return err
+	}
+
 	oauth := bitrix.NewOAuthService(cfg, st, nil)
 	tokens := bitrix.NewTokenManager(st, oauth, logger)
 	rc := bitrix.NewRestClient(cfg, tokens, logger, oauth.HTTPClient())

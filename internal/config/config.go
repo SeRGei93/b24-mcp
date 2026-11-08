@@ -24,6 +24,11 @@ type ConnectionMode string
 const (
 	ModeReadOnly              ConnectionMode = "read_only"
 	ModeWriteWithConfirmation ConnectionMode = "write_with_confirmation"
+
+	DefaultBitrixOAuthURL = "https://oauth.bitrix.info/oauth/token"
+	APIVersionAuto        = "auto"
+	APIVersionV3          = "v3"
+	APIVersionV2          = "v2"
 )
 
 func ParseConnectionMode(raw string) (ConnectionMode, error) {
@@ -49,6 +54,9 @@ type Config struct {
 	BitrixClientID                 string
 	BitrixClientSecret             string
 	BitrixPortalDomain             string
+	BitrixWebhookURL               string
+	BitrixOAuthURL                 string
+	BitrixAPIVersion               string
 	DefaultMode                    ConnectionMode
 	AdminToolsEnabled              bool
 	McpAuthToken                   string
@@ -100,6 +108,29 @@ func NormalizeSqlitePath(raw string) string {
 	return trimmed
 }
 
+var webhookPattern = regexp.MustCompile(`^/rest/([0-9]+)/([a-zA-Z0-9_\-]+)/?$`)
+
+func ParseWebhookURL(raw string) (domain string, userID string, webhookCode string, err error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", "", "", errors.New("webhook URL is required")
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil || parsed.Host == "" {
+		return "", "", "", errors.New("invalid webhook URL")
+	}
+	hostname := parsed.Hostname()
+	isLoopback := hostname == "localhost" || hostname == "127.0.0.1" || hostname == "::1"
+	if parsed.Scheme != "https" && !(parsed.Scheme == "http" && isLoopback) {
+		return "", "", "", errors.New("webhook URL must use HTTPS except on localhost or a loopback address")
+	}
+	matches := webhookPattern.FindStringSubmatch(parsed.Path)
+	if len(matches) != 3 {
+		return "", "", "", errors.New("webhook URL must match format https://<domain>/rest/<user_id>/<webhook_code>[/]")
+	}
+	return parsed.Host, matches[1], matches[2], nil
+}
+
 func LoadFromOS() (*Config, error) {
 	env := make(map[string]string)
 	loadDotEnv(".env", env)
@@ -141,10 +172,30 @@ func Load(env map[string]string) (*Config, error) {
 	host := getDefault(env, "HOST", "0.0.0.0")
 	port := parseIntInRange(env, "PORT", 3000, 1, 65535, &issues)
 
+	rawWebhookURL := strings.TrimSpace(env["BITRIX_WEBHOOK_URL"])
+	var bitrixWebhookURL string
+	if rawWebhookURL != "" {
+		domain, userID, code, err := ParseWebhookURL(rawWebhookURL)
+		if err != nil {
+			issues = append(issues, fmt.Sprintf("BITRIX_WEBHOOK_URL: %s", err.Error()))
+		} else {
+			scheme := "https"
+			if strings.HasPrefix(rawWebhookURL, "http://") {
+				scheme = "http"
+			}
+			bitrixWebhookURL = fmt.Sprintf("%s://%s/rest/%s/%s", scheme, domain, userID, code)
+		}
+	}
+
 	rawAppURL := strings.TrimSpace(env["APP_URL"])
-	appURL, err := validateAppURL(rawAppURL)
-	if err != nil {
-		issues = append(issues, fmt.Sprintf("APP_URL: %s", err.Error()))
+	var appURL string
+	if rawAppURL != "" || bitrixWebhookURL == "" {
+		validAppURL, err := validateAppURL(rawAppURL)
+		if err != nil {
+			issues = append(issues, fmt.Sprintf("APP_URL: %s", err.Error()))
+		} else {
+			appURL = validAppURL
+		}
 	}
 
 	dbRaw := strings.TrimSpace(env["DATABASE_PATH"])
@@ -157,12 +208,33 @@ func Load(env map[string]string) (*Config, error) {
 	databasePath := NormalizeSqlitePath(dbRaw)
 
 	bitrixClientID := strings.TrimSpace(env["BITRIX_CLIENT_ID"])
-	if bitrixClientID == "" {
+	if bitrixClientID == "" && bitrixWebhookURL == "" {
 		issues = append(issues, "BITRIX_CLIENT_ID: required")
 	}
 	bitrixClientSecret := strings.TrimSpace(env["BITRIX_CLIENT_SECRET"])
-	if bitrixClientSecret == "" {
+	if bitrixClientSecret == "" && bitrixWebhookURL == "" {
 		issues = append(issues, "BITRIX_CLIENT_SECRET: required")
+	}
+
+	bitrixOAuthURL := strings.TrimSpace(env["BITRIX_OAUTH_URL"])
+	if bitrixOAuthURL == "" {
+		bitrixOAuthURL = DefaultBitrixOAuthURL
+	} else {
+		parsedOAuth, err := url.Parse(bitrixOAuthURL)
+		if err != nil || parsedOAuth.Scheme == "" || parsedOAuth.Host == "" {
+			issues = append(issues, "BITRIX_OAUTH_URL: must be a valid URL")
+		}
+	}
+
+	bitrixAPIVersion := strings.TrimSpace(env["BITRIX_API_VERSION"])
+	if bitrixAPIVersion == "" {
+		bitrixAPIVersion = APIVersionAuto
+	} else {
+		switch bitrixAPIVersion {
+		case APIVersionAuto, APIVersionV3, APIVersionV2:
+		default:
+			issues = append(issues, "BITRIX_API_VERSION: must be 'auto', 'v3', or 'v2'")
+		}
 	}
 
 	bitrixPortalDomain := strings.TrimSpace(env["BITRIX_PORTAL_DOMAIN"])
@@ -223,6 +295,9 @@ func Load(env map[string]string) (*Config, error) {
 		BitrixClientID:                 bitrixClientID,
 		BitrixClientSecret:             bitrixClientSecret,
 		BitrixPortalDomain:             bitrixPortalDomain,
+		BitrixWebhookURL:               bitrixWebhookURL,
+		BitrixOAuthURL:                 bitrixOAuthURL,
+		BitrixAPIVersion:               bitrixAPIVersion,
 		DefaultMode:                    defaultMode,
 		AdminToolsEnabled:              adminToolsEnabled,
 		McpAuthToken:                   mcpAuthToken,
@@ -448,11 +523,17 @@ func IsValidSecret(supplied, expected string) bool {
 	return subtle.ConstantTimeCompare([]byte(supplied), []byte(expected)) == 1
 }
 
+type BitrixValidationError struct {
+	Field   string `json:"field"`
+	Message string `json:"message"`
+}
+
 type AppError struct {
 	Message    string
 	Code       string
 	StatusCode int
 	OAuthCode  string
+	Validation []BitrixValidationError
 	Cause      error
 }
 
@@ -493,4 +574,3 @@ func SafeErrorMessage(err error) string {
 	}
 	return "An unexpected internal error occurred"
 }
-

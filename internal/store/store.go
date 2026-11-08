@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -179,6 +180,24 @@ func (c Connection) ToPublic() PublicConnection {
 		CreatedAt:         c.CreatedAt.UTC().Format(isoTimeFormat),
 		UpdatedAt:         c.UpdatedAt.UTC().Format(isoTimeFormat),
 	}
+}
+
+func (c *Connection) IsWebhook() bool {
+	if c == nil {
+		return false
+	}
+	if strings.HasPrefix(c.MemberID, "webhook") {
+		return true
+	}
+	if u, err := url.Parse(c.ClientEndpoint); err == nil {
+		parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+		for i := 0; i+2 < len(parts); i++ {
+			if parts[i] == "rest" && parts[i+1] != "api" && parts[i+1] != "" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 type UpsertConnectionInput struct {
@@ -455,9 +474,12 @@ func (s *Store) UpsertConnection(ctx context.Context, input UpsertConnectionInpu
 	if err != nil {
 		return nil, err
 	}
-	encRefresh, err := s.cipher.Encrypt(input.RefreshToken)
-	if err != nil {
-		return nil, err
+	var encRefresh string
+	if input.RefreshToken != "" {
+		encRefresh, err = s.cipher.Encrypt(input.RefreshToken)
+		if err != nil {
+			return nil, err
+		}
 	}
 	now := time.Now().UTC().Format(isoTimeFormat)
 	adminInt := 0
@@ -509,14 +531,49 @@ func (s *Store) UpsertConnection(ctx context.Context, input UpsertConnectionInpu
 	return conn, err
 }
 
+func (s *Store) EnsureWebhookConnection(ctx context.Context, cfg *config.Config) (*Connection, error) {
+	if cfg == nil || strings.TrimSpace(cfg.BitrixWebhookURL) == "" {
+		return nil, nil
+	}
+	domain, userID, code, err := config.ParseWebhookURL(cfg.BitrixWebhookURL)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.BitrixPortalDomain != "" && !strings.EqualFold(cfg.BitrixPortalDomain, domain) {
+		domain = cfg.BitrixPortalDomain
+	}
+
+	scheme := "https"
+	if strings.HasPrefix(cfg.BitrixWebhookURL, "http://") {
+		scheme = "http"
+	}
+	clientEndpoint := fmt.Sprintf("%s://%s/rest/%s/%s/", scheme, domain, userID, code)
+
+	return s.UpsertConnection(ctx, UpsertConnectionInput{
+		Domain:            domain,
+		MemberID:          "webhook:" + domain,
+		BitrixUserID:      userID,
+		ClientEndpoint:    clientEndpoint,
+		AccessToken:       code,
+		RefreshToken:      "",
+		Scope:             "all",
+		ExpiresAt:         time.Now().Add(100 * 365 * 24 * time.Hour),
+		Mode:              cfg.DefaultMode,
+		AdminToolsEnabled: cfg.AdminToolsEnabled,
+	})
+}
+
 func (s *Store) UpdateConnectionTokens(ctx context.Context, id string, input UpdateTokensInput) (*Connection, error) {
 	encAccess, err := s.cipher.Encrypt(input.AccessToken)
 	if err != nil {
 		return nil, err
 	}
-	encRefresh, err := s.cipher.Encrypt(input.RefreshToken)
-	if err != nil {
-		return nil, err
+	var encRefresh string
+	if input.RefreshToken != "" {
+		encRefresh, err = s.cipher.Encrypt(input.RefreshToken)
+		if err != nil {
+			return nil, err
+		}
 	}
 	now := time.Now().UTC().Format(isoTimeFormat)
 
@@ -829,10 +886,10 @@ func (s *Store) expireStalePendingOperations(ctx context.Context) error {
 
 func scanPendingOperation(scanner rowScanner) (*PendingOperation, error) {
 	var (
-		op                                                     PendingOperation
-		opTypeStr, statusStr                                   string
-		resultJSON, errorMsg, confirmedStr, completedStr      sql.NullString
-		createdStr, expiresStr                                 string
+		op                                               PendingOperation
+		opTypeStr, statusStr                             string
+		resultJSON, errorMsg, confirmedStr, completedStr sql.NullString
+		createdStr, expiresStr                           string
 	)
 	err := scanner.Scan(
 		&op.ID,
@@ -881,7 +938,6 @@ func scanPendingOperation(scanner rowScanner) (*PendingOperation, error) {
 	return &op, nil
 }
 
-
 func (s *Store) RegisterOAuthClient(ctx context.Context, client McpOAuthClient) error {
 	if err := s.cleanupExpiredOAuth(ctx); err != nil {
 		return err
@@ -926,8 +982,8 @@ func (s *Store) RegisterOAuthClient(ctx context.Context, client McpOAuthClient) 
 
 func (s *Store) GetOAuthClient(ctx context.Context, clientID string) (*McpOAuthClient, error) {
 	var (
-		c                                                            McpOAuthClient
-		redirectsRaw, grantsRaw, responsesRaw, createdStr            string
+		c                                                           McpOAuthClient
+		redirectsRaw, grantsRaw, responsesRaw, createdStr           string
 		clientName, clientURI, logoURI, softwareID, softwareVersion sql.NullString
 	)
 	err := s.db.QueryRowContext(ctx, `
@@ -1342,13 +1398,19 @@ func (s *Store) scanConnection(scanner rowScanner) (*Connection, error) {
 	if err != nil {
 		return nil, err
 	}
-	access, err := s.cipher.Decrypt(encAccess)
-	if err != nil {
-		return nil, err
+	var access string
+	if encAccess != "" {
+		access, err = s.cipher.Decrypt(encAccess)
+		if err != nil {
+			return nil, err
+		}
 	}
-	refresh, err := s.cipher.Decrypt(encRefresh)
-	if err != nil {
-		return nil, err
+	var refresh string
+	if encRefresh != "" {
+		refresh, err = s.cipher.Decrypt(encRefresh)
+		if err != nil {
+			return nil, err
+		}
 	}
 	c.AccessToken = access
 	c.RefreshToken = refresh

@@ -517,7 +517,14 @@ func (s *OAuthService) postTokenCheck(ctx context.Context, targetURL, accessToke
 }
 
 func (s *OAuthService) exchangeToken(ctx context.Context, params map[string]string) (*OAuthTokenResponse, error) {
-	u, _ := url.Parse("https://oauth.bitrix.info/oauth/token/")
+	tokenURL := s.cfg.BitrixOAuthURL
+	if tokenURL == "" {
+		tokenURL = config.DefaultBitrixOAuthURL
+	}
+	if !strings.HasSuffix(tokenURL, "/") {
+		tokenURL += "/"
+	}
+	u, _ := url.Parse(tokenURL)
 	q := u.Query()
 	for k, v := range params {
 		q.Set(k, v)
@@ -592,7 +599,17 @@ func NewTokenManager(st *store.Store, oauth *OAuthService, logger *config.Logger
 	}
 }
 
+func (tm *TokenManager) Store() *store.Store {
+	if tm == nil {
+		return nil
+	}
+	return tm.store
+}
+
 func isTokenReusable(conn *store.Connection, forceRefresh bool, staleAccessToken string) bool {
+	if conn != nil && conn.IsWebhook() {
+		return true
+	}
 	if forceRefresh && staleAccessToken != "" && conn.AccessToken != staleAccessToken {
 		return true
 	}
@@ -606,6 +623,9 @@ func (tm *TokenManager) Get(ctx context.Context, connectionID string, forceRefre
 	}
 	if conn.Status != store.StatusActive {
 		return nil, config.NewPolicyError(fmt.Sprintf("Connection '%s' is %s", connectionID, conn.Status))
+	}
+	if conn.IsWebhook() {
+		return &ConnectionWithToken{Connection: conn, AccessToken: conn.AccessToken}, nil
 	}
 	if isTokenReusable(conn, forceRefresh, staleAccessToken) {
 		return &ConnectionWithToken{Connection: conn, AccessToken: conn.AccessToken}, nil

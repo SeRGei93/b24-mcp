@@ -591,7 +591,7 @@ func TestSchemaDiscovery_CachingAndDescribeBatchStages(t *testing.T) {
 					"result_error": []any{},
 				},
 			}), nil
-		case strings.HasPrefix(r.URL.Path, "/rest/api/"):
+		case strings.HasPrefix(r.URL.Path, "/rest/api/"), strings.Contains(r.URL.Path, "crm.deal."):
 			return jsonResponse(404, map[string]any{"error": "BITRIX_REST_V3_EXCEPTION_UNKNOWNMETHOD"}), nil
 		default:
 			return jsonResponse(200, map[string]any{"result": []any{}}), nil
@@ -742,7 +742,7 @@ func TestCrmService_SearchBatchAndProducts(t *testing.T) {
 			}
 			return jsonResponse(200, map[string]any{"result": map[string]any{"result": map[string]any{}}}), nil
 
-		case strings.HasPrefix(r.URL.Path, "/rest/api/"):
+		case strings.HasPrefix(r.URL.Path, "/rest/api/"), strings.Contains(r.URL.Path, "crm.deal."):
 			return jsonResponse(404, map[string]any{"error": "BITRIX_REST_V3_EXCEPTION_UNKNOWNMETHOD"}), nil
 
 		default:
@@ -856,6 +856,8 @@ func TestOperationService_TwoStepLifecycleAndPolicyGuard(t *testing.T) {
 			executedMethod = "crm.item.update"
 			_ = json.Unmarshal(bodyBytes, &executedParams)
 			return jsonResponse(200, map[string]any{"result": true}), nil
+		case strings.HasPrefix(r.URL.Path, "/rest/api/"), strings.Contains(r.URL.Path, "crm.deal."):
+			return jsonResponse(404, map[string]any{"error": "BITRIX_REST_V3_EXCEPTION_UNKNOWNMETHOD"}), nil
 		default:
 			return jsonResponse(200, map[string]any{"result": true}), nil
 		}
@@ -2129,5 +2131,189 @@ func TestCrmService_REST3_ReadEngine(t *testing.T) {
 		t.Errorf("expected pagination limit 1000 on productrow.list, got: %v", lastProdReq.Body["pagination"])
 	}
 }
+
+func TestOperationService_REST3_IdempotentWrites(t *testing.T) {
+	ctx := context.Background()
+
+	var recordedRequests []struct {
+		Method         string
+		URL            string
+		IdempotencyKey string
+		Body           map[string]any
+		Raw            string
+	}
+	var mu sync.Mutex
+
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		var bodyMap map[string]any
+		var rawBody string
+		if r.Body != nil {
+			b, _ := io.ReadAll(r.Body)
+			rawBody = string(b)
+			_ = json.Unmarshal(b, &bodyMap)
+		}
+
+		mu.Lock()
+		recordedRequests = append(recordedRequests, struct {
+			Method         string
+			URL            string
+			IdempotencyKey string
+			Body           map[string]any
+			Raw            string
+		}{
+			Method:         r.Method,
+			URL:            r.URL.String(),
+			IdempotencyKey: r.Header.Get("Idempotency-Key"),
+			Body:           bodyMap,
+			Raw:            rawBody,
+		})
+		mu.Unlock()
+
+		path := r.URL.Path
+
+		if strings.HasSuffix(path, "/rest/api/crm.deal.add") {
+			return jsonResponse(200, map[string]any{"result": map[string]any{"id": 100}}), nil
+		}
+		if strings.HasSuffix(path, "/rest/api/crm.deal.update") {
+			return jsonResponse(200, map[string]any{"result": true}), nil
+		}
+		if strings.HasSuffix(path, "/rest/api/crm.deal.delete") {
+			return jsonResponse(200, map[string]any{"result": true}), nil
+		}
+		if strings.HasSuffix(path, "crm.item.delete.json") {
+			return jsonResponse(200, map[string]any{"result": true}), nil
+		}
+
+		return jsonResponse(200, map[string]any{"result": true}), nil
+	})
+
+	cfg, st, _, tm := newTestEnv(t, "", "client-id", rt)
+	conn, err := st.UpsertConnection(ctx, store.UpsertConnectionInput{
+		Domain:         "example.bitrix24.com",
+		MemberID:       "member-ops-rest3",
+		BitrixUserID:   "1",
+		ClientEndpoint: "https://example.bitrix24.com/rest/",
+		AccessToken:    "acc",
+		RefreshToken:   "ref",
+		Scope:          "crm",
+		ExpiresAt:      time.Now().Add(time.Hour),
+		Mode:           config.ModeWriteWithConfirmation,
+	})
+	if err != nil {
+		t.Fatalf("UpsertConnection failed: %v", err)
+	}
+
+	httpClient := &http.Client{Transport: rt, Timeout: 2 * time.Second}
+	rc := bitrix.NewRestClient(cfg, tm, config.NewLogger(nil, "silent"), httpClient)
+	guard := bitrix.NewPolicyGuard()
+	opSvc := bitrix.NewOperationService(cfg, st, guard, rc)
+
+	// 1. PrepareCreate with ufCrmCustomField -> normalized to UF_CRM_CUSTOMFIELD
+	createPrep, err := opSvc.PrepareCreate(ctx, conn.ID, 2, map[string]any{
+		"title":            "REST 3.0 Deal",
+		"ufCrmCustomField": "custom value",
+	})
+	if err != nil {
+		t.Fatalf("PrepareCreate failed: %v", err)
+	}
+	createOpID := createPrep["operation_id"].(string)
+
+	confirmCreate, err := opSvc.Confirm(ctx, createOpID, "")
+	if err != nil {
+		t.Fatalf("Confirm create failed: %v", err)
+	}
+	if confirmCreate["status"] != "completed" {
+		t.Fatalf("expected completed create status: %+v", confirmCreate)
+	}
+
+	mu.Lock()
+	var lastReq = recordedRequests[len(recordedRequests)-1]
+	mu.Unlock()
+	if !strings.Contains(lastReq.URL, "/rest/api/crm.deal.add") {
+		t.Errorf("expected REST 3.0 crm.deal.add, got: %s", lastReq.URL)
+	}
+	if lastReq.IdempotencyKey != createOpID {
+		t.Errorf("expected Idempotency-Key header %q, got: %q", createOpID, lastReq.IdempotencyKey)
+	}
+	fieldsMap, _ := lastReq.Body["fields"].(map[string]any)
+	if fieldsMap["UF_CRM_CUSTOMFIELD"] != "custom value" {
+		t.Errorf("expected UF_CRM_CUSTOMFIELD in write body, got: %+v", fieldsMap)
+	}
+
+	// 2. PrepareUpdate -> Confirm executes crm.deal.update with Idempotency-Key
+	updatePrep, err := opSvc.PrepareUpdate(ctx, conn.ID, 2, 10, map[string]any{
+		"title": "Updated Title",
+	})
+	if err != nil {
+		t.Fatalf("PrepareUpdate failed: %v", err)
+	}
+	updateOpID := updatePrep["operation_id"].(string)
+
+	_, err = opSvc.Confirm(ctx, updateOpID, "")
+	if err != nil {
+		t.Fatalf("Confirm update failed: %v", err)
+	}
+
+	mu.Lock()
+	lastReq = recordedRequests[len(recordedRequests)-1]
+	mu.Unlock()
+	if !strings.Contains(lastReq.URL, "/rest/api/crm.deal.update") {
+		t.Errorf("expected REST 3.0 crm.deal.update, got: %s", lastReq.URL)
+	}
+	if lastReq.IdempotencyKey != updateOpID {
+		t.Errorf("expected Idempotency-Key header %q, got: %q", updateOpID, lastReq.IdempotencyKey)
+	}
+	if lastReq.Body["id"] != float64(10) && lastReq.Body["id"] != 10 {
+		t.Errorf("expected id: 10 in update body, got: %v", lastReq.Body["id"])
+	}
+
+	// 3. PrepareMove -> Confirm executes crm.deal.update with stageId
+	movePrep, err := opSvc.PrepareMove(ctx, conn.ID, 2, 10, "WON")
+	if err != nil {
+		t.Fatalf("PrepareMove failed: %v", err)
+	}
+	moveOpID := movePrep["operation_id"].(string)
+
+	_, err = opSvc.Confirm(ctx, moveOpID, "")
+	if err != nil {
+		t.Fatalf("Confirm move failed: %v", err)
+	}
+
+	mu.Lock()
+	lastReq = recordedRequests[len(recordedRequests)-1]
+	mu.Unlock()
+	if !strings.Contains(lastReq.URL, "/rest/api/crm.deal.update") {
+		t.Errorf("expected REST 3.0 crm.deal.update for stage move, got: %s", lastReq.URL)
+	}
+	if lastReq.IdempotencyKey != moveOpID {
+		t.Errorf("expected Idempotency-Key header %q, got: %q", moveOpID, lastReq.IdempotencyKey)
+	}
+
+	// 4. PrepareDelete -> Confirm executes crm.deal.delete with Idempotency-Key
+	deletePrep, err := opSvc.PrepareDelete(ctx, conn.ID, 2, 10)
+	if err != nil {
+		t.Fatalf("PrepareDelete failed: %v", err)
+	}
+	deleteOpID := deletePrep["operation_id"].(string)
+
+	_, err = opSvc.Confirm(ctx, deleteOpID, "")
+	if err != nil {
+		t.Fatalf("Confirm delete failed: %v", err)
+	}
+
+	mu.Lock()
+	lastReq = recordedRequests[len(recordedRequests)-1]
+	mu.Unlock()
+	if !strings.Contains(lastReq.URL, "/rest/api/crm.deal.delete") {
+		t.Errorf("expected REST 3.0 crm.deal.delete, got: %s", lastReq.URL)
+	}
+	if lastReq.IdempotencyKey != deleteOpID {
+		t.Errorf("expected Idempotency-Key header %q, got: %q", deleteOpID, lastReq.IdempotencyKey)
+	}
+	if lastReq.Body["id"] != float64(10) && lastReq.Body["id"] != 10 {
+		t.Errorf("expected id: 10 in delete body, got: %v", lastReq.Body["id"])
+	}
+}
+
 
 

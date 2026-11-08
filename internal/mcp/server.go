@@ -627,7 +627,34 @@ func NewServer(
 		}), nil
 	})
 
-	// 16. bitrix_confirm_operation
+	// 16. bitrix_prepare_delete_item
+	prepareDeleteTool := mcpproto.NewTool(
+		"bitrix_prepare_delete_item",
+		mcpproto.WithTitleAnnotation("Prepare CRM item deletion"),
+		mcpproto.WithDescription("Prepare, but do not execute, an item deletion. Returns an operation ID requiring explicit confirmation."),
+		mcpproto.WithString("connectionId", mcpproto.Description("ID returned by bitrix_list_connections after OAuth authorization"), mcpproto.Required()),
+		mcpproto.WithInteger("entityTypeId", mcpproto.Description("Bitrix CRM entityTypeId"), mcpproto.Required()),
+		mcpproto.WithInteger("id", mcpproto.Description("CRM item ID to delete"), mcpproto.Required()),
+		mcpproto.WithReadOnlyHintAnnotation(false),
+		mcpproto.WithDestructiveHintAnnotation(true),
+	)
+	srv.AddTool(prepareDeleteTool, func(ctx context.Context, req mcpproto.CallToolRequest) (*mcpproto.CallToolResult, error) {
+		return executeTool(func() (any, error) {
+			if ops == nil {
+				return nil, config.NewAppError("Operation service is unavailable", "SERVICE_UNAVAILABLE", 503)
+			}
+			connID, err := connFor(req.GetString("connectionId", ""))
+			if err != nil {
+				return nil, err
+			}
+			args := req.GetArguments()
+			typeID := bitrix.ToInt(args["entityTypeId"])
+			id := bitrix.ToInt(args["id"])
+			return ops.PrepareDelete(ctx, connID, typeID, id)
+		}), nil
+	})
+
+	// 17. bitrix_confirm_operation
 	confirmTool := mcpproto.NewTool(
 		"bitrix_confirm_operation",
 		mcpproto.WithTitleAnnotation("Confirm pending operation"),

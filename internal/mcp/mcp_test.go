@@ -84,8 +84,8 @@ func TestMCPServer_ListConnectionsAndIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListTools failed: %v", err)
 	}
-	if len(toolsRes.Tools) != 19 {
-		t.Fatalf("expected all 19 MCP tools to be registered, got %d", len(toolsRes.Tools))
+	if len(toolsRes.Tools) != 20 {
+		t.Fatalf("expected all 20 MCP tools to be registered, got %d", len(toolsRes.Tools))
 	}
 	foundList := false
 	for _, tool := range toolsRes.Tools {
@@ -443,6 +443,38 @@ func TestMCPServer_AllToolsExecution(t *testing.T) {
 	confText := confRes.Content[0].(mcpproto.TextContent).Text
 	if !strings.Contains(confText, "completed") {
 		t.Errorf("expected completed status in confirm response: %s", confText)
+	}
+
+	// 5b. Prepare Delete Item and Confirm
+	delReq := mcpproto.CallToolRequest{}
+	delReq.Params.Name = "bitrix_prepare_delete_item"
+	delReq.Params.Arguments = map[string]any{
+		"connectionId": conn.ID,
+		"entityTypeId": 2,
+		"id":           99,
+	}
+	delRes, err := inProc.CallTool(ctx, delReq)
+	if err != nil || delRes.IsError {
+		t.Fatalf("bitrix_prepare_delete_item failed: %v, res: %+v", err, delRes)
+	}
+	delText := delRes.Content[0].(mcpproto.TextContent).Text
+	var delObj map[string]any
+	_ = json.Unmarshal([]byte(delText), &delObj)
+	delOpID, _ := delObj["operation_id"].(string)
+	if delOpID == "" {
+		t.Fatalf("expected operation_id in del response: %s", delText)
+	}
+
+	confDelReq := mcpproto.CallToolRequest{}
+	confDelReq.Params.Name = "bitrix_confirm_operation"
+	confDelReq.Params.Arguments = map[string]any{"operationId": delOpID}
+	confDelRes, err := inProc.CallTool(ctx, confDelReq)
+	if err != nil || confDelRes.IsError {
+		t.Fatalf("bitrix_confirm_operation for delete failed: %v, res: %+v", err, confDelRes)
+	}
+	confDelText := confDelRes.Content[0].(mcpproto.TextContent).Text
+	if !strings.Contains(confDelText, "completed") {
+		t.Errorf("expected completed status in confirm delete response: %s", confDelText)
 	}
 
 	// 6. Test Scoped Server isolates connection access

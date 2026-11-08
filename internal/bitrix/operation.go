@@ -3,6 +3,7 @@ package bitrix
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -31,6 +32,20 @@ func NewOperationService(
 	}
 }
 
+func (s *OperationService) isV2Mode(ctx context.Context, connectionID string) bool {
+	if s.cfg.BitrixAPIVersion == config.APIVersionV2 {
+		return true
+	}
+	if s.store != nil {
+		var cachedVersion string
+		found, err := s.store.GetSchemaCache(ctx, connectionID, "api_version", s.cfg.SchemaCacheTTLSeconds, &cachedVersion)
+		if err == nil && found && cachedVersion == config.APIVersionV2 {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *OperationService) PrepareCreate(
 	ctx context.Context,
 	connectionID string,
@@ -43,9 +58,13 @@ func (s *OperationService) PrepareCreate(
 	if len(fields) == 0 {
 		return nil, config.NewAppError("At least one field is required", "EMPTY_FIELDS", 400)
 	}
+	normFields := make(map[string]any, len(fields))
+	for k, v := range fields {
+		normFields[NormalizeFieldName(k)] = v
+	}
 	params := map[string]any{
 		"entityTypeId": entityTypeID,
-		"fields":       fields,
+		"fields":       normFields,
 	}
 	summary := fmt.Sprintf("Create an item in CRM entity type %d.", entityTypeID)
 	return s.createPending(ctx, connectionID, store.OpCreateItem, "crm.item.add", params, summary)
@@ -61,13 +80,20 @@ func (s *OperationService) PrepareUpdate(
 	if err := s.assertPrepare(ctx, connectionID); err != nil {
 		return nil, err
 	}
+	if id <= 0 {
+		return nil, config.NewAppError("Valid item id is required", "INVALID_ITEM_ID", 400)
+	}
 	if len(fields) == 0 {
 		return nil, config.NewAppError("At least one field is required", "EMPTY_FIELDS", 400)
+	}
+	normFields := make(map[string]any, len(fields))
+	for k, v := range fields {
+		normFields[NormalizeFieldName(k)] = v
 	}
 	params := map[string]any{
 		"entityTypeId": entityTypeID,
 		"id":           id,
-		"fields":       fields,
+		"fields":       normFields,
 	}
 	summary := fmt.Sprintf("Update item #%d in CRM entity type %d.", id, entityTypeID)
 	return s.createPending(ctx, connectionID, store.OpUpdateItem, "crm.item.update", params, summary)
@@ -83,6 +109,12 @@ func (s *OperationService) PrepareMove(
 	if err := s.assertPrepare(ctx, connectionID); err != nil {
 		return nil, err
 	}
+	if id <= 0 {
+		return nil, config.NewAppError("Valid item id is required", "INVALID_ITEM_ID", 400)
+	}
+	if stageID == "" {
+		return nil, config.NewAppError("stageId is required", "MISSING_STAGE_ID", 400)
+	}
 	params := map[string]any{
 		"entityTypeId": entityTypeID,
 		"id":           id,
@@ -90,6 +122,26 @@ func (s *OperationService) PrepareMove(
 	}
 	summary := fmt.Sprintf("Move item #%d in CRM entity type %d to stage '%s'.", id, entityTypeID, stageID)
 	return s.createPending(ctx, connectionID, store.OpMoveItemStage, "crm.item.update", params, summary)
+}
+
+func (s *OperationService) PrepareDelete(
+	ctx context.Context,
+	connectionID string,
+	entityTypeID int,
+	id int,
+) (map[string]any, error) {
+	if err := s.assertPrepare(ctx, connectionID); err != nil {
+		return nil, err
+	}
+	if id <= 0 {
+		return nil, config.NewAppError("Valid item id is required", "INVALID_ITEM_ID", 400)
+	}
+	params := map[string]any{
+		"entityTypeId": entityTypeID,
+		"id":           id,
+	}
+	summary := fmt.Sprintf("Delete item #%d in CRM entity type %d.", id, entityTypeID)
+	return s.createPending(ctx, connectionID, store.OpDeleteItem, "crm.item.delete", params, summary)
 }
 
 func (s *OperationService) Confirm(
@@ -120,18 +172,96 @@ func (s *OperationService) Confirm(
 		return nil, config.NewAppError("Operation is not pending or has expired", "OPERATION_NOT_CONFIRMABLE", 409)
 	}
 
-	resp, err := s.client.Call(ctx, claimed.ConnectionID, claimed.Method, claimed.Params)
-	if err != nil {
-		msg := config.SafeErrorMessage(err)
-		_ = s.store.FailPendingOperation(ctx, claimed.ID, msg)
-		_ = s.store.RecordAuditLog(ctx, store.RecordAuditLogInput{
-			ConnectionID: claimed.ConnectionID,
-			OperationID:  claimed.ID,
-			Action:       string(claimed.OperationType),
-			Outcome:      string(store.OpStatusFailed),
-			Details:      map[string]any{"method": claimed.Method, "error": msg},
-		})
-		return nil, err
+	entityTypeID := ToInt(claimed.Params["entityTypeId"])
+	id := ToInt(claimed.Params["id"])
+	rawFields, _ := claimed.Params["fields"].(map[string]any)
+	normFields := make(map[string]any, len(rawFields))
+	for k, v := range rawFields {
+		normFields[NormalizeFieldName(k)] = v
+	}
+
+	slug, slugErr := EntitySlug(entityTypeID)
+	isV2 := s.isV2Mode(ctx, claimed.ConnectionID)
+
+	var (
+		resp    *BitrixResponse
+		callErr error
+		usedMethod string
+	)
+
+	// Try REST 3.0 first
+	if !isV2 && slugErr == nil {
+		var method string
+		var reqBody map[string]any
+		switch claimed.OperationType {
+		case store.OpCreateItem:
+			method = fmt.Sprintf("crm.%s.add", slug)
+			reqBody = map[string]any{"fields": normFields}
+		case store.OpUpdateItem, store.OpMoveItemStage:
+			method = fmt.Sprintf("crm.%s.update", slug)
+			reqBody = map[string]any{"id": id, "fields": normFields}
+		case store.OpDeleteItem:
+			method = fmt.Sprintf("crm.%s.delete", slug)
+			reqBody = map[string]any{"id": id}
+		}
+
+		if method != "" {
+			usedMethod = method
+			resp, callErr = s.client.Call(ctx, claimed.ConnectionID, method, reqBody, WithIdempotencyKey(claimed.ID))
+			if callErr != nil {
+				var appErr *config.AppError
+				if errors.As(callErr, &appErr) && isVersionFallbackError(appErr) {
+					// Fall through to legacy
+					resp = nil
+				} else {
+					msg := config.SafeErrorMessage(callErr)
+					_ = s.store.FailPendingOperation(ctx, claimed.ID, msg)
+					_ = s.store.RecordAuditLog(ctx, store.RecordAuditLogInput{
+						ConnectionID: claimed.ConnectionID,
+						OperationID:  claimed.ID,
+						Action:       string(claimed.OperationType),
+						Outcome:      string(store.OpStatusFailed),
+						Details:      map[string]any{"method": method, "error": msg},
+					})
+					return nil, callErr
+				}
+			}
+		}
+	}
+
+	// Legacy REST fallback
+	if resp == nil {
+		var legacyMethod string
+		var legacyParams map[string]any
+		switch claimed.OperationType {
+		case store.OpCreateItem:
+			legacyMethod = "crm.item.add"
+			legacyParams = map[string]any{"entityTypeId": entityTypeID, "fields": normFields}
+		case store.OpUpdateItem, store.OpMoveItemStage:
+			legacyMethod = "crm.item.update"
+			legacyParams = map[string]any{"entityTypeId": entityTypeID, "id": id, "fields": normFields}
+		case store.OpDeleteItem:
+			legacyMethod = "crm.item.delete"
+			legacyParams = map[string]any{"entityTypeId": entityTypeID, "id": id}
+		default:
+			legacyMethod = claimed.Method
+			legacyParams = claimed.Params
+		}
+
+		usedMethod = legacyMethod
+		resp, callErr = s.client.Call(ctx, claimed.ConnectionID, legacyMethod, legacyParams, WithIdempotencyKey(claimed.ID))
+		if callErr != nil {
+			msg := config.SafeErrorMessage(callErr)
+			_ = s.store.FailPendingOperation(ctx, claimed.ID, msg)
+			_ = s.store.RecordAuditLog(ctx, store.RecordAuditLogInput{
+				ConnectionID: claimed.ConnectionID,
+				OperationID:  claimed.ID,
+				Action:       string(claimed.OperationType),
+				Outcome:      string(store.OpStatusFailed),
+				Details:      map[string]any{"method": legacyMethod, "error": msg},
+			})
+			return nil, callErr
+		}
 	}
 
 	var resVal any
@@ -145,7 +275,7 @@ func (s *OperationService) Confirm(
 		OperationID:  claimed.ID,
 		Action:       string(claimed.OperationType),
 		Outcome:      string(store.OpStatusCompleted),
-		Details:      map[string]any{"method": claimed.Method, "summary": claimed.HumanSummary},
+		Details:      map[string]any{"method": usedMethod, "summary": claimed.HumanSummary},
 	})
 
 	return map[string]any{

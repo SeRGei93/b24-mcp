@@ -122,6 +122,7 @@ const (
 	OpCreateItem    OperationType = "create_item"
 	OpUpdateItem    OperationType = "update_item"
 	OpMoveItemStage OperationType = "move_item_stage"
+	OpDeleteItem    OperationType = "delete_item"
 )
 
 type OperationStatus string

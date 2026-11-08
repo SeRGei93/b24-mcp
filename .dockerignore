@@ -1,11 +1,11 @@
-node_modules
-dist
-old
 .git
 .agents
 .env
 .env.*
 !.env.example
-coverage
-test
+data
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
 *.log

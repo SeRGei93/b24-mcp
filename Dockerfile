@@ -15,7 +15,7 @@ RUN apk add --no-cache ca-certificates tzdata \
   && chown -R app:app /app
 WORKDIR /app
 COPY --from=build /out/b24 /app/b24
-COPY LICENSE README.md ./
+COPY README.md ./
 USER app
 EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \

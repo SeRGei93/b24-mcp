@@ -3,7 +3,6 @@ services:
     build: .
     restart: unless-stopped
     environment:
-      NODE_ENV: production
       HOST: 0.0.0.0
       PORT: 3000
       APP_URL: ${APP_URL:?Set APP_URL to the public HTTPS URL}

@@ -1,6 +1,6 @@
 #!/bin/sh
 # Ставит git-хук pre-push, который вызывает scripts/pre-push.sh.
-# Запускается сам при `npm install` (скрипт prepare) и вручную — `npm run setup:hooks`.
+# Установка: sh scripts/install-hooks.sh
 set -eu
 
 root="$(cd "$(dirname "$0")/.." && pwd)"

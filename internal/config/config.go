@@ -42,7 +42,6 @@ type TrustProxyConfig struct {
 }
 
 type Config struct {
-	NodeEnv                        string
 	Host                           string
 	Port                           int
 	AppURL                         string
@@ -139,13 +138,6 @@ func loadDotEnv(path string, target map[string]string) {
 func Load(env map[string]string) (*Config, error) {
 	var issues []string
 
-	nodeEnv := getDefault(env, "NODE_ENV", "development")
-	switch nodeEnv {
-	case "development", "test", "production":
-	default:
-		issues = append(issues, "NODE_ENV: must be development, test, or production")
-	}
-
 	host := getDefault(env, "HOST", "0.0.0.0")
 	port := parseIntInRange(env, "PORT", 3000, 1, 65535, &issues)
 
@@ -224,7 +216,6 @@ func Load(env map[string]string) (*Config, error) {
 	}
 
 	return &Config{
-		NodeEnv:                        nodeEnv,
 		Host:                           host,
 		Port:                           port,
 		AppURL:                         strings.TrimRight(appURL, "/"),

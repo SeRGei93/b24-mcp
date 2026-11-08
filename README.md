@@ -78,23 +78,3 @@ https://your-server.example.com/mcp
 | `MCP_AUTH_TOKEN` | yes | — | Static bearer token (min 32 chars) |
 | `TOKEN_ENCRYPTION_KEY` | yes | — | 32-byte base64 or 64-char hex key for AES-256-GCM |
 | `BITRIX_MCP_DEFAULT_MODE` | no | `read_only` | `read_only` or `write_with_confirmation` |
-
-## Docker (Local)
-
-```bash
-docker compose up --build
-```
-
-SQLite data is persisted in the `sqlite_data` volume mounted at `/app/data`.
-
-## Deploy to Dokploy
-
-1. **GHCR & GitHub Actions** (`.github/workflows/deploy.yml`):
-   - On push to `main`, GitHub Actions builds and pushes `ghcr.io/sergei93/b24-mcp:latest` and triggers `DOKPLOY_DEPLOY_WEBHOOK`.
-   - In Dokploy: add GHCR registry (`Settings → Registry`, PAT with `read:packages`).
-2. **Create Compose Service**:
-   - `Create → Compose → GitHub` → select repository → set **Compose Path** to `docker-compose.dokploy.yml`.
-   - Disable auto-deploy on push in Dokploy, copy the **Webhook URL** from `Compose → Webhook`, and save it as `DOKPLOY_DEPLOY_WEBHOOK` in GitHub Repository Secrets.
-3. **Environment & Domain**:
-   - Fill required variables in Dokploy `Environment` (`APP_URL`, `BITRIX_CLIENT_ID`, `BITRIX_CLIENT_SECRET`, `MCP_AUTH_TOKEN`, `TOKEN_ENCRYPTION_KEY`, optional `BITRIX_PORTAL_DOMAIN`).
-   - In `Domains`, point your HTTPS domain to service `app` on port `3000`.

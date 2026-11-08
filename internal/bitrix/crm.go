@@ -11,6 +11,11 @@ import (
 	"github.com/SeRGei93/b24-mcp/internal/config"
 )
 
+const (
+	MaxBatchItems  = 250
+	MaxSearchLimit = 1000
+)
+
 func ToOwnerTypeCode(entityTypeID int) string {
 	switch entityTypeID {
 	case 1:
@@ -81,6 +86,9 @@ func (s *CrmService) SearchItems(ctx context.Context, input SearchItemsInput) (*
 	if input.Limit <= 0 {
 		input.Limit = 100
 	}
+	if input.Limit > MaxSearchLimit {
+		return nil, config.NewAppError(fmt.Sprintf("limit cannot exceed %d", MaxSearchLimit), "INVALID_LIMIT", 400)
+	}
 	baseSelect := input.Select
 	if len(baseSelect) == 0 {
 		baseSelect = []string{"*"}
@@ -130,7 +138,10 @@ func (s *CrmService) SearchItems(ctx context.Context, input SearchItemsInput) (*
 		}
 		if len(ownerIDs) > 0 {
 			rowsRes, err := s.listProductRowsForOwners(ctx, input.ConnectionID, ownerIDs, input.EntityTypeID, "", nil, nil)
-			if err == nil && rowsRes.ByOwnerID != nil {
+			if err != nil {
+				return nil, err
+			}
+			if rowsRes.ByOwnerID != nil {
 				for i, item := range sliced {
 					idStr := fmt.Sprintf("%v", item["id"])
 					if idStr == "" || idStr == "<nil>" {
@@ -175,6 +186,9 @@ func (s *CrmService) GetItem(ctx context.Context, connectionID string, entityTyp
 }
 
 func (s *CrmService) GetItems(ctx context.Context, connectionID string, entityTypeID int, ids []int) (map[string]any, error) {
+	if len(ids) > MaxBatchItems {
+		return nil, config.NewAppError(fmt.Sprintf("ids cannot exceed %d items", MaxBatchItems), "TOO_MANY_IDS", 400)
+	}
 	var uniqueIDs []int
 	for _, id := range ids {
 		if !slices.Contains(uniqueIDs, id) {
@@ -305,6 +319,12 @@ func (s *CrmService) ListProductRows(ctx context.Context, input ListProductRowsI
 	}
 	if len(ids) == 0 {
 		return nil, config.NewAppError("Supply dealIds, ownerIds, dealId, or ownerId", "MISSING_OWNER_ID", 400)
+	}
+	if len(ids) > MaxBatchItems {
+		return nil, config.NewAppError(fmt.Sprintf("ownerIds/dealIds cannot exceed %d items", MaxBatchItems), "TOO_MANY_IDS", 400)
+	}
+	if input.Limit != nil && *input.Limit > MaxSearchLimit {
+		return nil, config.NewAppError(fmt.Sprintf("limit cannot exceed %d", MaxSearchLimit), "INVALID_LIMIT", 400)
 	}
 
 	entityTypeID := 2

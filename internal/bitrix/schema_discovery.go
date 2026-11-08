@@ -14,8 +14,6 @@ import (
 	"golang.org/x/text/unicode/norm"
 )
 
-const PageSize = 50
-
 type EntityType struct {
 	EntityTypeID int    `json:"entityTypeId"`
 	Title        string `json:"title"`
@@ -251,7 +249,10 @@ func (s *SchemaDiscovery) Describe(
 
 	if len(uncachedCatIDs) == 1 {
 		cID := uncachedCatIDs[0]
-		loaded, _ := s.Stages(ctx, connectionID, entityTypeID, cID, refresh)
+		loaded, err := s.Stages(ctx, connectionID, entityTypeID, cID, refresh)
+		if err != nil {
+			return nil, err
+		}
 		stagesByCategory[cID] = loaded
 	} else if len(uncachedCatIDs) > 1 {
 		var commands []NamedBatchCommand
@@ -266,23 +267,20 @@ func (s *SchemaDiscovery) Describe(
 			})
 		}
 		batchRes, batchErr := s.client.CallBatch(ctx, connectionID, commands, false)
-		if batchErr == nil {
-			for _, cID := range uncachedCatIDs {
-				key := fmt.Sprintf("cat_%d", cID)
-				var list []map[string]any
-				if raw, ok := batchRes[key]; ok {
-					_ = json.Unmarshal(raw, &list)
-				}
-				if list == nil {
-					list = []map[string]any{}
-				}
-				_ = s.store.SetSchemaCache(ctx, connectionID, fmt.Sprintf("stages:%d:%d", entityTypeID, cID), list)
-				stagesByCategory[cID] = list
+		if batchErr != nil {
+			return nil, batchErr
+		}
+		for _, cID := range uncachedCatIDs {
+			key := fmt.Sprintf("cat_%d", cID)
+			var list []map[string]any
+			if raw, ok := batchRes[key]; ok {
+				_ = json.Unmarshal(raw, &list)
 			}
-		} else {
-			for _, cID := range uncachedCatIDs {
-				stagesByCategory[cID] = []map[string]any{}
+			if list == nil {
+				list = []map[string]any{}
 			}
+			_ = s.store.SetSchemaCache(ctx, connectionID, fmt.Sprintf("stages:%d:%d", entityTypeID, cID), list)
+			stagesByCategory[cID] = list
 		}
 	}
 

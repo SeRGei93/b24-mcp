@@ -342,13 +342,7 @@ func (c *RestClient) CollectPages(
 	limit int,
 	extract func(raw json.RawMessage) []map[string]any,
 ) ([]map[string]any, *int, error) {
-	firstParams := make(map[string]any, len(params)+1)
-	for k, v := range params {
-		firstParams[k] = v
-	}
-	firstParams["start"] = 0
-
-	firstResp, err := c.Call(ctx, connectionID, method, firstParams)
+	firstResp, err := c.Call(ctx, connectionID, method, clonePageParams(params, 0))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -375,39 +369,30 @@ func (c *RestClient) CollectPages(
 			for start := *firstResp.Next; start < targetCount && page < c.cfg.BitrixMaxPages; start += BitrixBatchLimit {
 				key := fmt.Sprintf("p_%d", start)
 				keys = append(keys, key)
-				pageParams := make(map[string]any, len(params)+1)
-				for k, v := range params {
-					pageParams[k] = v
-				}
-				pageParams["start"] = start
 				commands = append(commands, NamedBatchCommand{
 					Key:    key,
 					Method: method,
-					Params: pageParams,
+					Params: clonePageParams(params, start),
 				})
 				page++
 			}
 			if len(commands) > 0 {
 				batchResult, bErr := c.CallBatch(ctx, connectionID, commands, false)
-				if bErr == nil {
-					for _, k := range keys {
-						if raw, ok := batchResult[k]; ok {
-							values = append(values, extract(raw)...)
-						}
+				if bErr != nil {
+					return nil, nil, bErr
+				}
+				for _, k := range keys {
+					if raw, ok := batchResult[k]; ok {
+						values = append(values, extract(raw)...)
 					}
 				}
 			}
 		} else {
 			start := *firstResp.Next
 			for page := 1; page < c.cfg.BitrixMaxPages && (limit <= 0 || len(values) < limit); page++ {
-				pageParams := make(map[string]any, len(params)+1)
-				for k, v := range params {
-					pageParams[k] = v
-				}
-				pageParams["start"] = start
-				resp, rErr := c.Call(ctx, connectionID, method, pageParams)
+				resp, rErr := c.Call(ctx, connectionID, method, clonePageParams(params, start))
 				if rErr != nil {
-					break
+					return nil, nil, rErr
 				}
 				values = append(values, extract(resp.Result)...)
 				if resp.Next == nil {
@@ -419,6 +404,15 @@ func (c *RestClient) CollectPages(
 	}
 
 	return values, total, nil
+}
+
+func clonePageParams(params map[string]any, start int) map[string]any {
+	pageParams := make(map[string]any, len(params)+1)
+	for k, v := range params {
+		pageParams[k] = v
+	}
+	pageParams["start"] = start
+	return pageParams
 }
 
 func sleepBackoff(ctx context.Context, attempt int, retryAfter string) error {

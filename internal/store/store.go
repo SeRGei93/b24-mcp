@@ -13,7 +13,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,7 +20,6 @@ import (
 
 	"github.com/SeRGei93/b24-mcp/internal/config"
 	"github.com/google/uuid"
-	"github.com/pressly/goose/v3"
 	_ "modernc.org/sqlite"
 )
 
@@ -148,7 +146,7 @@ type Connection struct {
 	ExpiresAt         time.Time
 	Mode              config.ConnectionMode
 	AdminToolsEnabled bool
-	Status            string
+	Status            ConnectionStatus
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
 }
@@ -162,7 +160,7 @@ type PublicConnection struct {
 	ExpiresAt         string                `json:"expiresAt"`
 	Mode              config.ConnectionMode `json:"mode"`
 	AdminToolsEnabled bool                  `json:"adminToolsEnabled"`
-	Status            string                `json:"status"`
+	Status            ConnectionStatus      `json:"status"`
 	CreatedAt         string                `json:"createdAt"`
 	UpdatedAt         string                `json:"updatedAt"`
 }
@@ -276,26 +274,26 @@ type NewMcpOAuthTokenRecord struct {
 }
 
 type PendingOperation struct {
-	ID            string         `json:"id"`
-	ConnectionID  string         `json:"connectionId"`
-	OperationType string         `json:"operationType"`
-	Method        string         `json:"method"`
-	ParamsJSON    string         `json:"-"`
-	Params        map[string]any `json:"params"`
-	HumanSummary  string         `json:"humanSummary"`
-	Status        string         `json:"status"`
-	ResultJSON    string         `json:"-"`
-	Result        any            `json:"result"`
-	ErrorMessage  string         `json:"errorMessage,omitempty"`
-	CreatedAt     time.Time      `json:"createdAt"`
-	ExpiresAt     time.Time      `json:"expiresAt"`
-	ConfirmedAt   *time.Time     `json:"confirmedAt,omitempty"`
-	CompletedAt   *time.Time     `json:"completedAt,omitempty"`
+	ID            string          `json:"id"`
+	ConnectionID  string          `json:"connectionId"`
+	OperationType OperationType   `json:"operationType"`
+	Method        string          `json:"method"`
+	ParamsJSON    string          `json:"-"`
+	Params        map[string]any  `json:"params"`
+	HumanSummary  string          `json:"humanSummary"`
+	Status        OperationStatus `json:"status"`
+	ResultJSON    string          `json:"-"`
+	Result        any             `json:"result"`
+	ErrorMessage  string          `json:"errorMessage,omitempty"`
+	CreatedAt     time.Time       `json:"createdAt"`
+	ExpiresAt     time.Time       `json:"expiresAt"`
+	ConfirmedAt   *time.Time      `json:"confirmedAt,omitempty"`
+	CompletedAt   *time.Time      `json:"completedAt,omitempty"`
 }
 
 type CreatePendingOperationInput struct {
 	ConnectionID  string
-	OperationType string
+	OperationType OperationType
 	Method        string
 	Params        map[string]any
 	HumanSummary  string
@@ -310,11 +308,9 @@ type RecordAuditLogInput struct {
 	Details      map[string]any
 }
 
-
 type Store struct {
-	db       *sql.DB
-	cipher   *TokenCipher
-	migrator *goose.Provider
+	db     *sql.DB
+	cipher *TokenCipher
 }
 
 func NewStore(databasePath, rawEncryptionKey string) (*Store, error) {
@@ -357,18 +353,7 @@ func NewStore(databasePath, rawEncryptionKey string) (*Store, error) {
 		return nil, err
 	}
 
-	migrationsFS, err := fs.Sub(embeddedMigrations, "migrations")
-	if err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-	migrator, err := goose.NewProvider(goose.DialectSQLite3, db, migrationsFS)
-	if err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-
-	return &Store{db: db, cipher: cipher, migrator: migrator}, nil
+	return &Store{db: db, cipher: cipher}, nil
 }
 
 func (s *Store) Ping(ctx context.Context) error {
@@ -377,40 +362,53 @@ func (s *Store) Ping(ctx context.Context) error {
 }
 
 func (s *Store) Migrate(ctx context.Context, logger *config.Logger) error {
-	results, err := s.migrator.Up(ctx)
+	if _, err := s.db.ExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS schema_migrations (
+			id TEXT PRIMARY KEY,
+			applied_at TEXT NOT NULL
+		)
+	`); err != nil {
+		return err
+	}
+
+	const migrationID = "001_initial_sqlite"
+	var existing string
+	err := s.db.QueryRowContext(ctx, "SELECT id FROM schema_migrations WHERE id = ?1", migrationID).Scan(&existing)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+
+	sqlBytes, err := embeddedMigrations.ReadFile("migrations/001_initial_sqlite.sql")
 	if err != nil {
 		return err
 	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx, string(sqlBytes)); err != nil {
+		return err
+	}
+	now := time.Now().UTC().Format(isoTimeFormat)
+	if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations (id, applied_at) VALUES (?1, ?2)", migrationID, now); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
 	if logger != nil {
-		for _, res := range results {
-			logger.Info("Database migration applied", map[string]any{
-				"version": res.Source.Version,
-				"path":    res.Source.Path,
-			})
-		}
+		logger.Info("Database migration applied", map[string]any{
+			"migrationId": migrationID,
+		})
 	}
 	return nil
-}
-
-func (s *Store) DBVersion(ctx context.Context) (int64, error) {
-	return s.migrator.GetDBVersion(ctx)
-}
-
-func (s *Store) AppliedMigrations(ctx context.Context) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, "SELECT id FROM schema_migrations ORDER BY id ASC")
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		ids = append(ids, id)
-	}
-	return ids, rows.Err()
 }
 
 func (s *Store) ListConnections(ctx context.Context) ([]Connection, error) {
@@ -673,7 +671,7 @@ func (s *Store) CreatePendingOperation(ctx context.Context, input CreatePendingO
 	`,
 		id,
 		input.ConnectionID,
-		input.OperationType,
+		string(input.OperationType),
 		input.Method,
 		string(paramsBytes),
 		input.HumanSummary,
@@ -819,51 +817,6 @@ func (s *Store) RecordAuditLog(ctx context.Context, input RecordAuditLogInput) e
 	return err
 }
 
-type AuditLog struct {
-	ID           string
-	ConnectionID *string
-	OperationID  *string
-	Action       string
-	Outcome      string
-	DetailsJSON  string
-	CreatedAt    time.Time
-}
-
-func (s *Store) ListAuditLogs(ctx context.Context, limit, offset int) ([]AuditLog, error) {
-	if limit <= 0 {
-		limit = 50
-	}
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, connection_id, operation_id, action, outcome, details_json, created_at
-		FROM audit_logs
-		ORDER BY created_at DESC
-		LIMIT ?1 OFFSET ?2
-	`, limit, offset)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var logs []AuditLog
-	for rows.Next() {
-		var log AuditLog
-		var connID, opID sql.NullString
-		var createdAt string
-		if err := rows.Scan(&log.ID, &connID, &opID, &log.Action, &log.Outcome, &log.DetailsJSON, &createdAt); err != nil {
-			return nil, err
-		}
-		if connID.Valid {
-			log.ConnectionID = &connID.String
-		}
-		if opID.Valid {
-			log.OperationID = &opID.String
-		}
-		log.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
-		logs = append(logs, log)
-	}
-	return logs, rows.Err()
-}
-
 func (s *Store) expireStalePendingOperations(ctx context.Context) error {
 	now := time.Now().UTC().Format(isoTimeFormat)
 	_, err := s.db.ExecContext(ctx, `
@@ -877,17 +830,18 @@ func (s *Store) expireStalePendingOperations(ctx context.Context) error {
 func scanPendingOperation(scanner rowScanner) (*PendingOperation, error) {
 	var (
 		op                                                     PendingOperation
+		opTypeStr, statusStr                                   string
 		resultJSON, errorMsg, confirmedStr, completedStr      sql.NullString
 		createdStr, expiresStr                                 string
 	)
 	err := scanner.Scan(
 		&op.ID,
 		&op.ConnectionID,
-		&op.OperationType,
+		&opTypeStr,
 		&op.Method,
 		&op.ParamsJSON,
 		&op.HumanSummary,
-		&op.Status,
+		&statusStr,
 		&resultJSON,
 		&errorMsg,
 		&createdStr,
@@ -898,6 +852,8 @@ func scanPendingOperation(scanner rowScanner) (*PendingOperation, error) {
 	if err != nil {
 		return nil, err
 	}
+	op.OperationType = OperationType(opTypeStr)
+	op.Status = OperationStatus(statusStr)
 	op.ResultJSON = resultJSON.String
 	if op.ParamsJSON != "" {
 		_ = json.Unmarshal([]byte(op.ParamsJSON), &op.Params)
@@ -1362,6 +1318,7 @@ func (s *Store) scanConnection(scanner rowScanner) (*Connection, error) {
 	var (
 		c                            Connection
 		encAccess, encRefresh, modeS string
+		statusS                      string
 		expiresStr, createdStr       string
 		updatedStr                   string
 		adminInt                     int
@@ -1378,7 +1335,7 @@ func (s *Store) scanConnection(scanner rowScanner) (*Connection, error) {
 		&expiresStr,
 		&modeS,
 		&adminInt,
-		&c.Status,
+		&statusS,
 		&createdStr,
 		&updatedStr,
 	)
@@ -1396,6 +1353,7 @@ func (s *Store) scanConnection(scanner rowScanner) (*Connection, error) {
 	c.AccessToken = access
 	c.RefreshToken = refresh
 	c.Mode = config.ConnectionMode(modeS)
+	c.Status = ConnectionStatus(statusS)
 	c.AdminToolsEnabled = adminInt != 0
 	c.ExpiresAt, _ = time.Parse(time.RFC3339Nano, expiresStr)
 	c.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdStr)

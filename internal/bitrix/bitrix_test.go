@@ -808,6 +808,28 @@ func TestCrmService_SearchBatchAndProducts(t *testing.T) {
 	if len(users) != 1 || users[0]["NAME"] != "John" {
 		t.Fatalf("expected user John, got %+v", users)
 	}
+
+	// Test 5: Upper-bound validation on batch IDs (250) and search limit (1000)
+	tooManyIDs := make([]int, 251)
+	for i := range tooManyIDs {
+		tooManyIDs[i] = i + 1
+	}
+	if _, err := crmSvc.GetItems(ctx, conn.ID, 2, tooManyIDs); err == nil {
+		t.Fatalf("expected GetItems to reject >250 IDs")
+	}
+	if _, err := crmSvc.ListProductRows(ctx, bitrix.ListProductRowsInput{
+		ConnectionID: conn.ID,
+		OwnerIDs:     tooManyIDs,
+	}); err == nil {
+		t.Fatalf("expected ListProductRows to reject >250 ownerIDs")
+	}
+	if _, err := crmSvc.SearchItems(ctx, bitrix.SearchItemsInput{
+		ConnectionID: conn.ID,
+		EntityTypeID: 2,
+		Limit:        1001,
+	}); err == nil {
+		t.Fatalf("expected SearchItems to reject limit >1000")
+	}
 }
 
 func TestOperationService_TwoStepLifecycleAndPolicyGuard(t *testing.T) {
@@ -881,20 +903,24 @@ func TestOperationService_TwoStepLifecycleAndPolicyGuard(t *testing.T) {
 		t.Fatalf("expected crm.item.add to be executed, got %q", executedMethod)
 	}
 
-	// Verify audit log was written (1 prepared + 1 completed)
-	audit, err := st.ListAuditLogs(ctx, 10, 0)
-	if err != nil || len(audit) != 2 {
-		t.Fatalf("expected 2 audit log entries, got %d err=%v", len(audit), err)
+	// Verify completed operation state and double-confirm prevention
+	completedOp, err := st.GetPendingOperation(ctx, opID)
+	if err != nil || completedOp.Status != store.OpStatusCompleted {
+		t.Fatalf("expected operation %s to have status completed, got %+v err=%v", opID, completedOp, err)
 	}
-	var foundCompleted bool
-	for _, l := range audit {
-		if l.OperationID != nil && *l.OperationID == opID && l.Outcome == "completed" {
-			foundCompleted = true
-			break
-		}
+	if _, err := opSvc.Confirm(ctx, opID, ""); err == nil {
+		t.Fatalf("expected second Confirm on completed operation to be rejected")
 	}
-	if !foundCompleted {
-		t.Fatalf("expected audit log matching op %s with outcome completed, got %+v", opID, audit)
+
+	// Verify PolicyGuard capabilities (Read, Admin, Dangerous)
+	if err := policyGuard.Assert(conn, bitrix.CapabilityRead, false); err != nil {
+		t.Fatalf("expected CapabilityRead to be allowed, got %v", err)
+	}
+	if err := policyGuard.Assert(conn, bitrix.CapabilityDangerous, true); err == nil {
+		t.Fatalf("expected CapabilityDangerous to be rejected")
+	}
+	if err := policyGuard.Assert(conn, bitrix.CapabilityAdmin, true); err == nil {
+		t.Fatalf("expected CapabilityAdmin to be rejected when AdminToolsEnabled is false")
 	}
 
 	// 3. Cancel test

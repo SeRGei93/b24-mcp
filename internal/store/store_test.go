@@ -88,17 +88,19 @@ func TestStore_IdempotentMigrationsAndConnectivity(t *testing.T) {
 		t.Fatalf("expected Ping to succeed: %v", err)
 	}
 
-	version, err := st.DBVersion(ctx)
-	if err != nil || version != 1 {
-		t.Fatalf("expected goose DBVersion 1, got %d (err=%v)", version, err)
+	conns, err := st.ListConnections(ctx)
+	if err != nil || len(conns) != 0 {
+		t.Fatalf("expected empty connections list on fresh migrated store, got %d (err=%v)", len(conns), err)
 	}
 
-	applied, err := st.AppliedMigrations(ctx)
+	// Re-open the existing SQLite database file and verify Migrate is a no-op that preserves data
+	st2, err := store.NewStore(dbPath, testKeyHex)
 	if err != nil {
-		t.Fatalf("expected AppliedMigrations to succeed: %v", err)
+		t.Fatalf("failed to reopen store: %v", err)
 	}
-	if len(applied) != 1 || applied[0] != "001_initial_sqlite" {
-		t.Errorf("expected ['001_initial_sqlite'], got %v", applied)
+	defer st2.Close()
+	if err := st2.Migrate(ctx, logger); err != nil {
+		t.Fatalf("migration on reopened database failed: %v", err)
 	}
 
 	// After Close(), Ping should fail

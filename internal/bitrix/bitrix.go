@@ -457,7 +457,7 @@ func (s *OAuthService) resolveInstallationAllowedDomains(ctx context.Context) ([
 	}
 	var active []string
 	for _, c := range conns {
-		if c.Status == "active" && !slices.Contains(active, c.Domain) {
+		if c.Status == store.StatusActive && !slices.Contains(active, c.Domain) {
 			active = append(active, c.Domain)
 		}
 	}
@@ -604,7 +604,7 @@ func (tm *TokenManager) Get(ctx context.Context, connectionID string, forceRefre
 	if err != nil {
 		return nil, err
 	}
-	if conn.Status != "active" {
+	if conn.Status != store.StatusActive {
 		return nil, config.NewPolicyError(fmt.Sprintf("Connection '%s' is %s", connectionID, conn.Status))
 	}
 	if isTokenReusable(conn, forceRefresh, staleAccessToken) {

@@ -48,7 +48,7 @@ func (s *OperationService) PrepareCreate(
 		"fields":       fields,
 	}
 	summary := fmt.Sprintf("Create an item in CRM entity type %d.", entityTypeID)
-	return s.createPending(ctx, connectionID, string(store.OpCreateItem), "crm.item.add", params, summary)
+	return s.createPending(ctx, connectionID, store.OpCreateItem, "crm.item.add", params, summary)
 }
 
 func (s *OperationService) PrepareUpdate(
@@ -70,7 +70,7 @@ func (s *OperationService) PrepareUpdate(
 		"fields":       fields,
 	}
 	summary := fmt.Sprintf("Update item #%d in CRM entity type %d.", id, entityTypeID)
-	return s.createPending(ctx, connectionID, string(store.OpUpdateItem), "crm.item.update", params, summary)
+	return s.createPending(ctx, connectionID, store.OpUpdateItem, "crm.item.update", params, summary)
 }
 
 func (s *OperationService) PrepareMove(
@@ -89,7 +89,7 @@ func (s *OperationService) PrepareMove(
 		"fields":       map[string]any{"stageId": stageID},
 	}
 	summary := fmt.Sprintf("Move item #%d in CRM entity type %d to stage '%s'.", id, entityTypeID, stageID)
-	return s.createPending(ctx, connectionID, string(store.OpMoveItemStage), "crm.item.update", params, summary)
+	return s.createPending(ctx, connectionID, store.OpMoveItemStage, "crm.item.update", params, summary)
 }
 
 func (s *OperationService) Confirm(
@@ -127,7 +127,7 @@ func (s *OperationService) Confirm(
 		_ = s.store.RecordAuditLog(ctx, store.RecordAuditLogInput{
 			ConnectionID: claimed.ConnectionID,
 			OperationID:  claimed.ID,
-			Action:       claimed.OperationType,
+			Action:       string(claimed.OperationType),
 			Outcome:      string(store.OpStatusFailed),
 			Details:      map[string]any{"method": claimed.Method, "error": msg},
 		})
@@ -143,7 +143,7 @@ func (s *OperationService) Confirm(
 	_ = s.store.RecordAuditLog(ctx, store.RecordAuditLogInput{
 		ConnectionID: claimed.ConnectionID,
 		OperationID:  claimed.ID,
-		Action:       claimed.OperationType,
+		Action:       string(claimed.OperationType),
 		Outcome:      string(store.OpStatusCompleted),
 		Details:      map[string]any{"method": claimed.Method, "summary": claimed.HumanSummary},
 	})
@@ -179,13 +179,13 @@ func (s *OperationService) Cancel(
 	_ = s.store.RecordAuditLog(ctx, store.RecordAuditLogInput{
 		ConnectionID: cancelled.ConnectionID,
 		OperationID:  cancelled.ID,
-		Action:       cancelled.OperationType,
-		Outcome:      "cancelled",
+		Action:       string(cancelled.OperationType),
+		Outcome:      string(store.OpStatusCancelled),
 	})
 
 	return map[string]any{
 		"operationId": cancelled.ID,
-		"status":      cancelled.Status,
+		"status":      string(cancelled.Status),
 		"summary":     cancelled.HumanSummary,
 	}, nil
 }
@@ -208,7 +208,7 @@ func (s *OperationService) assertOperationAccess(connectionID, authorizedConnect
 func (s *OperationService) createPending(
 	ctx context.Context,
 	connectionID string,
-	operationType string,
+	operationType store.OperationType,
 	method string,
 	params map[string]any,
 	summary string,
@@ -229,7 +229,7 @@ func (s *OperationService) createPending(
 	_ = s.store.RecordAuditLog(ctx, store.RecordAuditLogInput{
 		ConnectionID: connectionID,
 		OperationID:  op.ID,
-		Action:       operationType,
+		Action:       string(operationType),
 		Outcome:      "prepared",
 		Details:      map[string]any{"method": method, "summary": summary},
 	})

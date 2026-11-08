@@ -1,11 +1,7 @@
--- +goose Up
 CREATE TABLE IF NOT EXISTS schema_migrations (
   id TEXT PRIMARY KEY,
   applied_at TEXT NOT NULL
 );
-
-INSERT OR IGNORE INTO schema_migrations (id, applied_at)
-VALUES ('001_initial_sqlite', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
 
 CREATE TABLE IF NOT EXISTS bitrix_connections (
   id TEXT PRIMARY KEY,
@@ -140,15 +136,3 @@ CREATE INDEX IF NOT EXISTS mcp_oauth_tokens_refresh_idx
   ON mcp_oauth_tokens (refresh_token_hash, refresh_expires_at) WHERE revoked_at IS NULL;
 CREATE INDEX IF NOT EXISTS mcp_oauth_tokens_connection_idx
   ON mcp_oauth_tokens (connection_id, revoked_at);
-
--- +goose Down
-DROP TABLE IF EXISTS mcp_oauth_tokens;
-DROP TABLE IF EXISTS mcp_oauth_authorization_codes;
-DROP TABLE IF EXISTS audit_logs;
-DROP TABLE IF EXISTS pending_operations;
-DROP TABLE IF EXISTS schema_cache;
-DROP TABLE IF EXISTS oauth_states;
-DROP TABLE IF EXISTS mcp_oauth_authorization_requests;
-DROP TABLE IF EXISTS mcp_oauth_clients;
-DROP TABLE IF EXISTS bitrix_connections;
-DROP TABLE IF EXISTS schema_migrations;

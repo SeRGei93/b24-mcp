@@ -44,65 +44,68 @@
 
 ## Быстрый старт
 
-### Вариант 1: Быстрый старт через входящий вебхук (Zero-Tunnel Setup)
-
-Самый быстрый способ запустить сервер локально или в CLI без белого IP и туннелей:
-
-1. В интерфейсе Битрикс24 перейдите: **Разработчикам** → **Другое** → **Входящий вебхук**.
-2. В правах доступа отметьте **CRM** (`crm`) и **Пользователи** (`user`), сохраните вебхук.
-3. Создайте `.env`:
-
-```dotenv
-BITRIX_WEBHOOK_URL=https://your-portal.bitrix24.ru/rest/1/abcdefghijklmnop/
-TOKEN_ENCRYPTION_KEY=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
-MCP_AUTH_TOKEN=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
-BITRIX_MCP_DEFAULT_MODE=write_with_confirmation
-```
-
-4. Запустите сервер:
-```bash
-go run ./cmd/b24
-```
-
-### Вариант 2: Полноценный OAuth 2.0 (Multi-Tenant)
-
-Для использования в командных средах с ротацией токенов и разделением доступов:
+Создайте локальное приложение в Битрикс24 (**Разработчикам** → **Другое** → **Локальное приложение**, права `crm` и `user`) и задайте переменные окружения `.env`:
 
 ```dotenv
 APP_URL=https://your-server.example.com
 BITRIX_CLIENT_ID=local.xxxxxxxxxxxxxxxx.xxxxxxxx
 BITRIX_CLIENT_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+BITRIX_PORTAL_DOMAIN=your-portal.bitrix24.ru
 TOKEN_ENCRYPTION_KEY=<32-байтный_ключ_base64_или_hex>
-MCP_AUTH_TOKEN=<статический_токен_>=32_символов>
+MCP_AUTH_TOKEN=<случайная_строка_>=32_символов>
 BITRIX_MCP_DEFAULT_MODE=write_with_confirmation
+```
+
+Запуск через Docker Compose:
+```bash
+docker compose up -d
 ```
 
 ---
 
 ## Подключение MCP-клиентов
 
-### OpenCode
+Все клиенты подключаются к серверу по протоколу **Streamable HTTP + OAuth 2.1** (`https://your-server.example.com/mcp`) с авторизацией через браузер в вашем портале Битрикс24.
 
-Добавьте в `~/.config/opencode/opencode.json` (или локальный `opencode.json`):
+### ChatGPT (в браузере `chatgpt.com` и приложении ChatGPT)
 
-**Через статический токен (`MCP_AUTH_TOKEN`):**
+1. Откройте **Settings (Настройки)** → **Connectors (Коннекторы / Приложения)**.
+2. Перейдите в **Advanced (Дополнительно)** и включите **Developer mode (Режим разработчика)**.
+3. Нажмите **Create (Создать)** и заполните поля:
+   - **Name**: `Bitrix24 CRM`
+   - **Description**: `Управление CRM Битрикс24: поиск и аналитика сделок, лидов, контактов, компаний, предложений, счетов и смарт-процессов, двухэтапное создание и изменение записей.`
+   - **MCP Server URL**: `https://your-server.example.com/mcp`
+   - **Authentication**: выберите **OAuth** (поля Client ID / Client Secret оставьте пустыми — регистрация происходит автоматически).
+4. Нажмите **Create** и подтвердите вход в ваш портал Битрикс24 в открывшемся окне.
+
+### Приложение Codex / ChatGPT Desktop
+
+В настройках MCP-интеграций приложения укажите удалённый сервер с OAuth-авторизацией:
+
 ```json
 {
-  "$schema": "https://opencode.ai/config.json",
-  "mcp": {
+  "mcpServers": {
     "bitrix24": {
-      "type": "remote",
-      "url": "https://your-server.example.com/mcp",
-      "oauth": false,
-      "headers": {
-        "Authorization": "Bearer {env:MCP_AUTH_TOKEN}"
-      }
+      "url": "https://your-server.example.com/mcp"
     }
   }
 }
 ```
+При первом обращении приложение откроет браузер для входа через ваш портал Битрикс24.
 
-**Через браузерный MCP OAuth 2.1 (индивидуальный вход сотрудника в Битрикс24):**
+### Claude (в браузере `claude.ai` и приложении Claude Desktop)
+
+1. Откройте **Settings (Настройки)** → **Integrations (Интеграции / Connectors)** → **Add custom integration (Добавить интеграцию)**.
+2. Укажите имя `Bitrix24` и URL:
+   ```text
+   https://your-server.example.com/mcp
+   ```
+3. Нажмите **Connect** и завершите вход в ваш портал Битрикс24 в браузере.
+
+### OpenCode
+
+Добавьте в `~/.config/opencode/opencode.json` (или локальный `opencode.json`):
+
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
@@ -114,93 +117,22 @@ BITRIX_MCP_DEFAULT_MODE=write_with_confirmation
   }
 }
 ```
-Затем выполните в терминале `opencode mcp auth bitrix24` для прохождения авторизации в браузере.
-
-### Claude Code
-
-Через HTTP-транспорт со статическим Bearer-токеном:
-```bash
-claude mcp add --transport http bitrix24 https://your-server.example.com/mcp \
-  --header "Authorization: Bearer <MCP_AUTH_TOKEN>"
-```
-
-### Cursor / Windsurf / Claude Desktop
-
-Добавьте в конфигурационный JSON (`mcp.json` / `claude_desktop_config.json`):
-
-```json
-{
-  "mcpServers": {
-    "bitrix24": {
-      "url": "https://your-server.example.com/mcp",
-      "headers": {
-        "Authorization": "Bearer <MCP_AUTH_TOKEN>"
-      }
-    }
-  }
-}
-```
-
-### Режим Stdio (локальный процесс без открытия портов)
-
-```json
-{
-  "mcpServers": {
-    "bitrix24": {
-      "command": "/path/to/b24",
-      "env": {
-        "MCP_TRANSPORT": "stdio",
-        "BITRIX_WEBHOOK_URL": "https://your-portal.bitrix24.ru/rest/1/abcdefghijklmnop/",
-        "DATABASE_PATH": "/path/to/data/bitrix24-mcp.sqlite",
-        "TOKEN_ENCRYPTION_KEY": "<hex-key>",
-        "MCP_AUTH_TOKEN": "<hex-token>",
-        "BITRIX_MCP_DEFAULT_MODE": "write_with_confirmation"
-      }
-    }
-  }
-}
-```
+При подключении откроется браузер для прохождения OAuth-авторизации в Битрикс24.
 
 ---
 
 ## Готовые AI-скиллы (`SKILL.md`)
 
-В репозитории в папке [`.agents/skills/`](.agents/skills/) находятся два специализированных скилла для AI-агентов (OpenCode, Claude Code, Cursor, Antigravity):
+В репозитории в папке [`.agents/skills/`](.agents/skills/) находятся два специализированных скилла для AI-агентов:
 
-- **[`bitrix24-crm`](.agents/skills/bitrix24-crm/SKILL.md)** — операционная работа с CRM и смарт-процессами: таблица `entityTypeId`, правило Discovery-First (`bitrix_describe_entity` перед фильтрацией по стадиям и `UF_CRM_*`), реляционные dot-notation поля REST 3.0 без лишних N+1 запросов, шпаргалка по сложным фильтрам и строгий регламент двухшаговых мутаций (`prepare_*` → превью пользователю → `confirm_operation`).
-- **[`bitrix24-analytics`](.agents/skills/bitrix24-analytics/SKILL.md)** — аналитика воронки продаж и аудит CRM: быстрые подсчёты через `bitrix_count_items` (`crm.<slug>.aggregate`), расчёт конверсии по стадиям, отчёты по эффективности менеджеров, товарная аналитика (`bitrix_list_product_rows`) и поиск «зависших» сделок.
-
----
-
-## Совместное использование с официальным сервером `b24-dev-mcp`
-
-Официальный MCP-сервер от Битрикс24 ([`b24-dev-mcp`](https://mcp-dev.bitrix24.tech/mcp)) и данный сервер идеально дополняют друг друга в IDE (Cursor, Windsurf, Claude Desktop):
-
-- **`b24-dev-mcp`** предоставляет контекст для разработчика: документацию по REST API Битрикс24, справочники методов и примеры SDK.
-- **Данный сервер (`bitrix24`)** обеспечивает прямое защищённое взаимодействие с живым порталом: чтение данных в REST 3.0 с реляционными полями, аутентификацию через вебхук или OAuth, двухэтапные подтверждаемые мутации записей (`prepare_*` → `confirm`) и аудит действий в SQLite.
-
-Пример совместной конфигурации:
-
-```json
-{
-  "mcpServers": {
-    "bitrix24": {
-      "url": "https://your-server.example.com/mcp",
-      "headers": {
-        "Authorization": "Bearer <MCP_AUTH_TOKEN>"
-      }
-    },
-    "b24-dev": {
-      "url": "https://mcp-dev.bitrix24.tech/mcp"
-    }
-  }
-}
-```
+- **[`bitrix24-crm`](.agents/skills/bitrix24-crm/SKILL.md)** — операционная работа с CRM и смарт-процессами: таблица `entityTypeId`, правило Discovery-First (`bitrix_describe_entity` перед фильтрацией по стадиям и `UF_CRM_*`), реляционные dot-notation поля REST 3.0 без лишних N+1 запросов, сценарий «Досье на клиента 360°», шпаргалка по сложным фильтрам и строгий регламент двухшаговых мутаций (`prepare_*` → превью пользователю → `confirm_operation`).
+- **[`bitrix24-analytics`](.agents/skills/bitrix24-analytics/SKILL.md)** — аналитика воронки продаж и аудит CRM: быстрые подсчёты через `bitrix_count_items` (`crm.<slug>.aggregate`), расчёт конверсии по стадиям, отчёты по эффективности менеджеров, UTM-атрибуция, товарная аналитика (`bitrix_list_product_rows`) и поиск «зависших» сделок.
 
 ---
 
 ## Документация
 
-- [**Настройка Битрикс24 и авторизация**](docs/setup.md) — создание локального приложения, входящие вебхуки без туннелей, способы авторизации портала и управление токенами.
+- [**Настройка Битрикс24 и авторизация**](docs/setup.md) — создание локального приложения в Битрикс24, способы авторизации портала и управление токенами.
 - [**Конфигурация и переменные окружения**](docs/configuration.md) — полный справочник переменных `.env`, таймаутов, лимитов, режимов `BITRIX_API_VERSION` и безопасности.
 - [**Деплой и эксплуатация**](docs/deployment.md) — Docker Compose, продакшн-деплой в Dokploy, резервное копирование SQLite и тесты.
+- [**Дополнительные режимы подключения**](docs/advanced-clients.md) — локальный режим `stdio`, подключение со статическим токеном, CLI и `b24-dev-mcp`.

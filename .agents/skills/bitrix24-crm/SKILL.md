@@ -162,7 +162,6 @@ When the user asks for full context on a client, contact, or company:
 - **Lead Conversion (`CONVERTED`)**: When a Lead (`1`) is converted, Bitrix24 creates a Deal (`2`), Contact (`3`), and/or Company (`4`). If a lead is in status `CONVERTED`, also check Deals filtered by `LEAD_ID` to see current progress.
 - **Repeat Inquiries**: Repeat messages or calls from an existing phone/email often attach directly to the existing Contact and open a new Deal rather than creating a new Lead.
 - **Unknown Relational Fields in REST 3.0**: Passing a non-existent relational path in `select` (e.g. `foo.bar`) causes Bitrix24 REST 3.0 to return `UNKNOWNDTOPROPERTYEXCEPTION`. Stick to verified relational paths (`stage.name`, `category.name`, `company.title`, `contact.name`, `contact.lastName`, `assignedBy.firstName`, `assignedBy.lastName`) or check `bitrix_describe_entity`.
-- **Collaborating with `b24-dev-mcp`**: If the official documentation MCP (`b24-dev`) is also connected, use `b24-dev` only to look up Bitrix24 REST API documentation — never send portal URLs, tokens, or client personal data to the documentation MCP.
 
 ---
 

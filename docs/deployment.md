@@ -20,7 +20,7 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o b24 ./cmd/b24
 ## 2. Локальный запуск в Docker Compose
 
 В репозитории предусмотрены два файла для стандартного Docker Compose:
-- [`Dockerfile`](../Dockerfile) — двухступенчатая сборка (`golang:1.26-alpine` → `alpine:3.21`), работающая от непривилегированного пользователя `app` (`UID 1000`, `GID 1000`) со встроенным `HEALTHCHECK` на `http://127.0.0.1:3000/health`.
+- [`Dockerfile`](../Dockerfile) — двухступенчатая сборка (`golang:1.26-alpine` → `FROM scratch` с одним статическим бинарником `/app/b24`), работающая от непривилегированного пользователя (`1000:1000`) со встроенным `HEALTHCHECK` (`["/app/b24", "-healthcheck"]`).
 - [`docker-compose.yml`](../docker-compose.yml) — базовое описание сервиса `app` и тома `sqlite_data:/app/data`.
 - [`docker-compose.override.yml`](../docker-compose.override.yml) — автоматически подхватывается при локальном вызове `docker compose up` и публикует порт `${APP_PORT:-3000}:3000` на хост-машину.
 
@@ -64,10 +64,10 @@ docker compose logs -f app
    - Нажмите **Create → Compose**, выберите ваш GitHub-репозиторий.
    - В поле **Compose Path** укажите:
      ```text
-     docker-compose.dokploy.yml
+     ./docker-compose.dokploy.yml
      ```
-   - **Отключите** встроенный Auto-Deploy по пушу в настройках самого Dokploy (чтобы деплой запускался строго *после* завершения сборки образа в GitHub Actions).
-   - Перейдите на вкладку **Webhook** в настройках Compose-сервиса, скопируйте **Webhook URL** и добавьте его в секреты GitHub-репозитория (`Settings → Secrets and variables → Actions`) под именем:
+   - Оставьте **Autodeploy** включённым, а в поле **Watch Paths** добавьте `docker-compose.dokploy.yml` (чтобы деплой запускался по вебхуку из GitHub Actions строго *после* завершения сборки образа).
+   - Скопируйте **Webhook URL** в настройках Compose-сервиса и добавьте его в секреты GitHub-репозитория (`Settings → Secrets and variables → Actions`) под именем:
      ```text
      DOKPLOY_DEPLOY_WEBHOOK
      ```

@@ -729,8 +729,8 @@ func (s *Server) sendAuthorizationConsentPage(w http.ResponseWriter, pending *mc
 			`<form method="post" action="/authorize">`+
 			`<input type="hidden" name="request_token" value="%s">`+
 			`<input type="hidden" name="csrf_token" value="%s">`+
-			`<div class="actions"><button type="submit" name="decision" value="approve">Approve</button>`+
-			`<button type="submit" name="decision" value="deny">Deny</button></div>`+
+			`<div class="actions"><button type="submit" name="decision" value="approve">Разрешить</button>`+
+			`<button type="submit" name="decision" value="deny">Отклонить</button></div>`+
 			`</form></card></body></html>`,
 		escapeHTML(clientLabel),
 		escapeHTML(pending.ClientID),

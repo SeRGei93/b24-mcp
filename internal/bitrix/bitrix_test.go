@@ -1299,13 +1299,13 @@ func TestRestClient_TelemetryTime_OperatingResetAt_AndIdempotencyKey(t *testing.
 
 		cnt := requestCount.Add(1)
 		if cnt == 1 {
-			// First attempt: return 429 with operating_reset_at in time block
+			// First attempt: return 429 with operating_reset_at in time block (+2s avoids integer-second boundary rollover)
 			resp := jsonResponse(429, map[string]any{
 				"error": "OPERATION_TIME_LIMIT",
 				"time": map[string]any{
 					"duration":           0.5,
 					"operating":          360.5,
-					"operating_reset_at": nowSec + 1,
+					"operating_reset_at": time.Now().Unix() + 2,
 				},
 			})
 			return resp, nil

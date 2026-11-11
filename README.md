@@ -138,3 +138,9 @@ docker compose up -d
 - [**Конфигурация и переменные окружения**](docs/configuration.md) — полный справочник переменных `.env`, таймаутов, лимитов, режимов `BITRIX_API_VERSION` и безопасности.
 - [**Деплой и эксплуатация**](docs/deployment.md) — Docker Compose, продакшн-деплой в Dokploy, резервное копирование SQLite и тесты.
 - [**Дополнительные режимы подключения**](docs/advanced-clients.md) — локальный режим `stdio`, подключение со статическим токеном, CLI и `b24-dev-mcp`.
+
+---
+
+## Теги / Keywords
+
+`bitrix24`, `битрикс24`, `mcp`, `mcp-server`, `model-context-protocol`, `crm`, `smart-processes`, `смарт-процессы`, `rest-api`, `rest-v3`, `ai-agent`, `claude`, `chatgpt`, `opencode`, `codex`, `golang`, `sqlite`, `oauth2`, `webhook`

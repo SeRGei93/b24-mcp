@@ -86,8 +86,8 @@ docker compose logs -f app
    - На вкладке **Domains** привяжите ваш HTTPS-домен (например, `mcp.example.com`) к сервису `app` на порт `3000`.
 
 4. **Как работает CI/CD (`.github/workflows/deploy.yml`)**:
-   - При пуше в ветку `main` или `master` (если изменились файлы в `cmd/**`, `internal/**`, `go.mod`, `go.sum`, `Dockerfile`, `docker-compose.dokploy.yml` или сам workflow) запускается job `build`.
-   - `build` собирает Docker-образ и пушит теги `ghcr.io/sergei93/b24-mcp:<sha>` и `ghcr.io/sergei93/b24-mcp:latest`.
+   - При пуше в ветку `main` или `master` (если изменились файлы в `cmd/**`, `internal/**`, `go.mod`, `go.sum`, `Dockerfile`, `docker-compose.dokploy.yml` или сам workflow) сначала запускается job `test` (`go vet ./...`, `go test -race ./...` и контрольная статическая сборка).
+   - После успешного прохождения тестов запускается job `build`, который собирает Docker-образ и пушит теги `ghcr.io/sergei93/b24-mcp:<sha>` и `ghcr.io/sergei93/b24-mcp:latest`.
    - После успешного пуша запускается job `deploy`, который вызывает `DOKPLOY_DEPLOY_WEBHOOK`, и Dokploy обновляет контейнер из свежего образа.
 
 ---
@@ -96,11 +96,19 @@ docker compose logs -f app
 
 Все данные сервера (зашифрованные подключения Битрикс24, зарегистрированные OAuth-клиенты, выданные токены и журнал аудита) находятся в одном файле SQLite (и его WAL-файлах при активной записи).
 
-Чтобы сделать резервную копию из Docker-тома `sqlite_data`:
+Так как runtime-образ контейнера `app` собран на базе `FROM scratch` и не содержит `/bin/sh`, для горячего консистентного бэкапа из тома `sqlite_data` с учётом WAL используйте одноразовый вспомогательный контейнер с `sqlite3`:
 
 ```bash
-docker compose exec app sh -c 'cp /app/data/bitrix24-mcp.sqlite /app/data/backup.sqlite'
-docker compose cp app:/app/data/backup.sqlite ./bitrix24-mcp-backup.sqlite
+docker run --rm \
+  --volumes-from "$(docker compose ps -q app)" \
+  -v "$(pwd):/backup" \
+  alpine:3.21 sh -c 'apk add --no-cache sqlite >/dev/null && sqlite3 /app/data/bitrix24-mcp.sqlite ".backup /backup/bitrix24-mcp-backup.sqlite"'
+```
+
+Либо при остановленном контейнере скопируйте файл напрямую с помощью `docker compose cp`:
+
+```bash
+docker compose cp app:/app/data/bitrix24-mcp.sqlite ./bitrix24-mcp-backup.sqlite
 ```
 
 > Не забудьте также надёжно сохранить значение `TOKEN_ENCRYPTION_KEY` в вашем менеджере секретов — без него расшифровать токены из бэкапа невозможно.

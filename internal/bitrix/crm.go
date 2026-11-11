@@ -20,9 +20,11 @@ const (
 var (
 	ufRegex       = regexp.MustCompile(`(?i)^uf_?crm_?(.*)$`)
 	productRowSel = []string{
-		"id", "ownerId", "ownerType", "productId", "productName",
-		"price", "quantity", "discountTypeId", "discountRate", "discountSum",
-		"taxRate", "taxIncluded", "measureCode", "measureName", "sort",
+		"id", "ownerId", "productId", "productName",
+		"price", "priceAccount", "priceExclusive", "priceNetto", "priceBrutto",
+		"quantity", "discountTypeId", "discountRate", "discountSum",
+		"taxRate", "taxIncluded", "customized",
+		"measureCode", "measureName", "sort", "xmlId", "type", "storeId", "reserveId", "dateReserveEnd", "reserveQuantity",
 	}
 )
 
@@ -351,6 +353,30 @@ func addConditionToLegacyMap(dst map[string]any, cond []any) {
 	}
 }
 
+func extractCountFromMap(obj map[string]any) (int, bool) {
+	if cVal, ok := obj["count"]; ok {
+		switch cv := cVal.(type) {
+		case float64:
+			return int(cv), true
+		case int:
+			return cv, true
+		case map[string]any:
+			for _, v := range cv {
+				return ToInt(v), true
+			}
+		}
+	}
+	if inner, ok := obj["result"].(map[string]any); ok {
+		if n, found := extractCountFromMap(inner); found {
+			return n, true
+		}
+	}
+	if totalVal, ok := obj["total"]; ok {
+		return ToInt(totalVal), true
+	}
+	return 0, false
+}
+
 func extractCount(raw json.RawMessage) int {
 	if len(raw) == 0 {
 		return 0
@@ -361,20 +387,8 @@ func extractCount(raw json.RawMessage) int {
 	}
 	var obj map[string]any
 	if err := json.Unmarshal(raw, &obj); err == nil {
-		if cVal, ok := obj["count"]; ok {
-			switch cv := cVal.(type) {
-			case float64:
-				return int(cv)
-			case int:
-				return cv
-			case map[string]any:
-				for _, v := range cv {
-					return ToInt(v)
-				}
-			}
-		}
-		if totalVal, ok := obj["total"]; ok {
-			return ToInt(totalVal)
+		if n, ok := extractCountFromMap(obj); ok {
+			return n
 		}
 	}
 	return 0
@@ -397,12 +411,13 @@ func (in SearchItemsInput) shouldEnrich() bool {
 }
 
 type GetItemInput struct {
-	ConnectionID   string
-	EntityTypeID   int
-	ID             int
-	IDs            []int
-	Select         []string
-	IncludeDetails bool
+	ConnectionID           string
+	EntityTypeID           int
+	ID                     int
+	IDs                    []int
+	Select                 []string
+	IncludeDetails         bool
+	IncludeDetailsExplicit bool
 }
 
 type SearchItemsResult struct {
@@ -776,7 +791,8 @@ func (s *CrmService) FetchItems(ctx context.Context, input GetItemInput) (any, e
 		if err != nil {
 			return nil, err
 		}
-		if input.IncludeDetails && len(items) > 0 {
+		shouldEnrich := input.IncludeDetails && (input.IncludeDetailsExplicit || len(items) <= BitrixBatchLimit)
+		if shouldEnrich && len(items) > 0 {
 			items = s.enrichItems(ctx, input.ConnectionID, input.EntityTypeID, items, fullFields)
 		}
 		return items, nil
@@ -1071,13 +1087,18 @@ func (s *CrmService) listProductRowsForOwners(
 		}
 	}
 
-	// Single owner: try REST 3.0 crm.productrow.list first, then fall back to crm.item.productrow.list
+	v3Slug, hasV3Slug := productRowSlug(entityTypeID, ownerType)
+	v3Method := ""
+	if hasV3Slug {
+		v3Method = fmt.Sprintf("crm.%s.productrow.list", v3Slug)
+	}
+
+	// Single owner: try REST 3.0 crm.<slug>.productrow.list first, then fall back to crm.item.productrow.list
 	if len(uniqueOwnerIDs) == 1 {
 		oID := uniqueOwnerIDs[0]
-		if !s.client.IsV2Mode(ctx, connectionID) && len(filter) == 0 {
-			resp, err := s.client.Call(ctx, connectionID, "crm.productrow.list", map[string]any{
+		if v3Method != "" && !s.client.IsV2Mode(ctx, connectionID) && len(filter) == 0 {
+			resp, err := s.client.Call(ctx, connectionID, v3Method, map[string]any{
 				"filter": []any{
-					[]any{"ownerType", "=", ownerType},
 					[]any{"ownerId", "=", oID},
 				},
 				"select":     productRowSel,
@@ -1130,18 +1151,17 @@ func (s *CrmService) listProductRowsForOwners(
 		}
 	}
 
-	// Multiple owners (or single owner fallback): batch REST 3.0 crm.productrow.list with legacy fallback
-	useV3 := !s.client.IsV2Mode(ctx, connectionID) && len(filter) == 0
+	// Multiple owners (or single owner fallback): batch REST 3.0 crm.<slug>.productrow.list with legacy fallback
+	useV3 := v3Method != "" && !s.client.IsV2Mode(ctx, connectionID) && len(filter) == 0
 	var commands []NamedBatchCommand
 	if useV3 {
 		commands = make([]NamedBatchCommand, 0, len(uniqueOwnerIDs))
 		for _, oID := range uniqueOwnerIDs {
 			commands = append(commands, NamedBatchCommand{
 				Key:    strconv.Itoa(oID),
-				Method: "crm.productrow.list",
+				Method: v3Method,
 				Params: map[string]any{
 					"filter": []any{
-						[]any{"ownerType", "=", ownerType},
 						[]any{"ownerId", "=", oID},
 					},
 					"select":     productRowSel,

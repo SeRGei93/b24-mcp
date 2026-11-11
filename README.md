@@ -26,6 +26,7 @@
 1. **Подключения и обнаружение**: список подключений, автоопределение сущностей CRM (Лиды, Сделки, Контакты, Компании, Счета, встроенные Предложения `Quote` и смарт-процессы) (`bitrix_list_connections`, `bitrix_discover_portal`, `bitrix_list_crm_entities`, `bitrix_describe_entity`).
 2. **Схема и структура**: чтение метаданных полей (включая автоматическую нормализацию пользовательских полей `UF_CRM_*`), воронок и стадий через REST 3.0 с плоскими фильтрами и кэшированием в SQLite (`bitrix_list_fields`, `bitrix_list_categories`, `bitrix_list_stages`, `bitrix_refresh_schema_cache`).
 3. **Чтение данных (REST 3.0 Read Engine)**:
+   - Поиск и пакетное чтение карточек CRM (`bitrix_search_items`, `bitrix_get_item`).
    - Реляционные dot-notation поля в `select` (`stage.name`, `category.name`, `company.title`, `contact.name`, `assignedBy.firstName`, `assignedBy.lastName`).
    - Оптимизированные списки полей по умолчанию (wildcard `*` никогда не отправляется в REST 3.0).
    - Трансляция фильтров (поддержка операторов `=`, `!=`, `>`, `>=`, `<`, `<=`, `@` -> `in`, с автоматическим фоллбэком на legacy `crm.item.list` при substring-поиске `%` или `like`).
@@ -33,6 +34,7 @@
    - Быстрый подсчёт через `crm.<slug>.aggregate` (`bitrix_count_items`).
    - Выгрузка товарных позиций (`bitrix_list_product_rows`) и пользователей (`bitrix_list_users`).
 4. **Двухшаговые идемпотентные мутации**:
+   - `bitrix_list_pending_operations` — просмотр ожидающих и завершённых операций записи;
    - `bitrix_prepare_create_item` — подготовка создания элемента CRM;
    - `bitrix_prepare_update_item` — подготовка обновления полей элемента;
    - `bitrix_prepare_move_item_stage` — подготовка перевода сделки/лида/смарт-процесса на другую стадию;

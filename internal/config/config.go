@@ -2,33 +2,31 @@ package config
 
 import (
 	"bufio"
-	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"math"
 	"net/url"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
-	"time"
 )
 
 type ConnectionMode string
+
+type APIVersion string
 
 const (
 	ModeReadOnly              ConnectionMode = "read_only"
 	ModeWriteWithConfirmation ConnectionMode = "write_with_confirmation"
 
 	DefaultBitrixOAuthURL = "https://oauth.bitrix.info/oauth/token"
-	APIVersionAuto        = "auto"
-	APIVersionV3          = "v3"
-	APIVersionV2          = "v2"
+
+	APIVersionAuto APIVersion = "auto"
+	APIVersionV3   APIVersion = "v3"
+	APIVersionV2   APIVersion = "v2"
 )
 
 func ParseConnectionMode(raw string) (ConnectionMode, error) {
@@ -37,6 +35,20 @@ func ParseConnectionMode(raw string) (ConnectionMode, error) {
 		return ConnectionMode(raw), nil
 	default:
 		return "", errors.New("invalid connection mode")
+	}
+}
+
+func ParseAPIVersion(raw string) (APIVersion, error) {
+	trimmed := strings.ToLower(strings.TrimSpace(raw))
+	switch trimmed {
+	case "", string(APIVersionAuto):
+		return APIVersionAuto, nil
+	case string(APIVersionV3):
+		return APIVersionV3, nil
+	case string(APIVersionV2), "legacy":
+		return APIVersionV2, nil
+	default:
+		return "", errors.New("must be 'auto', 'v3', 'v2', or 'legacy'")
 	}
 }
 
@@ -56,7 +68,7 @@ type Config struct {
 	BitrixPortalDomain             string
 	BitrixWebhookURL               string
 	BitrixOAuthURL                 string
-	BitrixAPIVersion               string
+	BitrixAPIVersion               APIVersion
 	DefaultMode                    ConnectionMode
 	AdminToolsEnabled              bool
 	McpAuthToken                   string
@@ -110,7 +122,7 @@ func NormalizeSqlitePath(raw string) string {
 
 var webhookPattern = regexp.MustCompile(`^/rest/([0-9]+)/([a-zA-Z0-9_\-]+)/?$`)
 
-func ParseWebhookURL(raw string) (domain string, userID string, webhookCode string, err error) {
+func ParseWebhookURL(raw string, allowedPortalDomains ...string) (domain string, userID string, webhookCode string, err error) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
 		return "", "", "", errors.New("webhook URL is required")
@@ -120,13 +132,23 @@ func ParseWebhookURL(raw string) (domain string, userID string, webhookCode stri
 		return "", "", "", errors.New("invalid webhook URL")
 	}
 	hostname := parsed.Hostname()
-	isLoopback := hostname == "localhost" || hostname == "127.0.0.1" || hostname == "::1"
+	isLoopback := IsLoopbackHost(hostname)
 	if parsed.Scheme != "https" && !(parsed.Scheme == "http" && isLoopback) {
 		return "", "", "", errors.New("webhook URL must use HTTPS except on localhost or a loopback address")
 	}
 	matches := webhookPattern.FindStringSubmatch(parsed.Path)
 	if len(matches) != 3 {
 		return "", "", "", errors.New("webhook URL must match format https://<domain>/rest/<user_id>/<webhook_code>[/]")
+	}
+	if !isLoopback {
+		if parsed.Port() != "" || parsed.User != nil {
+			return "", "", "", errors.New("webhook URL must not include custom port or credentials")
+		}
+		normDomain, domErr := NormalizePortalDomain(hostname, allowedPortalDomains)
+		if domErr != nil {
+			return "", "", "", domErr
+		}
+		return normDomain, matches[1], matches[2], nil
 	}
 	return parsed.Host, matches[1], matches[2], nil
 }
@@ -172,15 +194,24 @@ func Load(env map[string]string) (*Config, error) {
 	host := getDefault(env, "HOST", "0.0.0.0")
 	port := parseIntInRange(env, "PORT", 3000, 1, 65535, &issues)
 
+	bitrixPortalDomain := strings.TrimSpace(env["BITRIX_PORTAL_DOMAIN"])
+	if bitrixPortalDomain != "" {
+		if normPortal, err := ParsePortalHost(bitrixPortalDomain); err != nil {
+			issues = append(issues, fmt.Sprintf("BITRIX_PORTAL_DOMAIN: %s", err.Error()))
+		} else {
+			bitrixPortalDomain = normPortal
+		}
+	}
+
 	rawWebhookURL := strings.TrimSpace(env["BITRIX_WEBHOOK_URL"])
 	var bitrixWebhookURL string
 	if rawWebhookURL != "" {
-		domain, userID, code, err := ParseWebhookURL(rawWebhookURL)
+		domain, userID, code, err := ParseWebhookURL(rawWebhookURL, bitrixPortalDomain)
 		if err != nil {
 			issues = append(issues, fmt.Sprintf("BITRIX_WEBHOOK_URL: %s", err.Error()))
 		} else {
 			scheme := "https"
-			if strings.HasPrefix(rawWebhookURL, "http://") {
+			if strings.HasPrefix(strings.ToLower(rawWebhookURL), "http://") {
 				scheme = "http"
 			}
 			bitrixWebhookURL = fmt.Sprintf("%s://%s/rest/%s/%s", scheme, domain, userID, code)
@@ -226,18 +257,10 @@ func Load(env map[string]string) (*Config, error) {
 		}
 	}
 
-	bitrixAPIVersion := strings.TrimSpace(env["BITRIX_API_VERSION"])
-	if bitrixAPIVersion == "" {
-		bitrixAPIVersion = APIVersionAuto
-	} else {
-		switch bitrixAPIVersion {
-		case APIVersionAuto, APIVersionV3, APIVersionV2:
-		default:
-			issues = append(issues, "BITRIX_API_VERSION: must be 'auto', 'v3', or 'v2'")
-		}
+	bitrixAPIVersion, err := ParseAPIVersion(env["BITRIX_API_VERSION"])
+	if err != nil {
+		issues = append(issues, fmt.Sprintf("BITRIX_API_VERSION: %s", err.Error()))
 	}
-
-	bitrixPortalDomain := strings.TrimSpace(env["BITRIX_PORTAL_DOMAIN"])
 
 	defaultModeStr := getDefault(env, "BITRIX_MCP_DEFAULT_MODE", string(ModeReadOnly))
 	defaultMode, err := ParseConnectionMode(defaultModeStr)
@@ -326,8 +349,7 @@ func validateAppURL(raw string) (string, error) {
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
 		return "", errors.New("invalid URL")
 	}
-	hostname := parsed.Hostname()
-	isLoopback := hostname == "localhost" || hostname == "127.0.0.1" || hostname == "::1"
+	isLoopback := IsLoopbackHost(parsed.Hostname())
 	if parsed.Scheme != "https" && !(parsed.Scheme == "http" && isLoopback) {
 		return "", errors.New("URL must use HTTPS except on localhost or a loopback address")
 	}
@@ -390,187 +412,4 @@ func parseIntInRange(env map[string]string, key string, fallback, minVal, maxVal
 		return fallback
 	}
 	return v
-}
-
-var redactedKeys = map[string]struct{}{
-	"access_token":       {},
-	"refresh_token":      {},
-	"accessToken":        {},
-	"refreshToken":       {},
-	"authorization":      {},
-	"client_secret":      {},
-	"bitrixClientSecret": {},
-	"mcpAuthToken":       {},
-	"tokenEncryptionKey": {},
-	"code":               {},
-	"code_verifier":      {},
-	"token":              {},
-	"auth":               {},
-}
-
-func RedactValue(value any) any {
-	switch v := value.(type) {
-	case map[string]any:
-		return redactMap(v, func(val any) any { return RedactValue(val) })
-	case map[string]string:
-		return redactMap(v, func(val string) any { return val })
-	case []any:
-		out := make([]any, len(v))
-		for i, item := range v {
-			out[i] = RedactValue(item)
-		}
-		return out
-	default:
-		return value
-	}
-}
-
-func redactMap[V any](in map[string]V, transform func(V) any) map[string]any {
-	out := make(map[string]any, len(in))
-	for k, v := range in {
-		if _, ok := redactedKeys[k]; ok {
-			out[k] = "[REDACTED]"
-		} else {
-			out[k] = transform(v)
-		}
-	}
-	return out
-}
-
-var logLevelPriority = map[string]int{
-	"trace":  10,
-	"debug":  20,
-	"info":   30,
-	"warn":   40,
-	"error":  50,
-	"fatal":  60,
-	"silent": 100,
-}
-
-type Logger struct {
-	mu       sync.Mutex
-	out      io.Writer
-	minLevel int
-}
-
-func NewLogger(out io.Writer, level string) *Logger {
-	prio, ok := logLevelPriority[level]
-	if !ok {
-		prio = logLevelPriority["info"]
-	}
-	return &Logger{out: out, minLevel: prio}
-}
-
-func StderrLogger(level string) *Logger {
-	return NewLogger(os.Stderr, level)
-}
-
-func (l *Logger) Debug(message string, fields map[string]any) {
-	l.write("debug", message, fields)
-}
-
-func (l *Logger) Info(message string, fields map[string]any) {
-	l.write("info", message, fields)
-}
-
-func (l *Logger) Warn(message string, fields map[string]any) {
-	l.write("warn", message, fields)
-}
-
-func (l *Logger) Error(message string, fields map[string]any) {
-	l.write("error", message, fields)
-}
-
-func (l *Logger) write(level, message string, fields map[string]any) {
-	if l == nil || l.out == nil {
-		return
-	}
-	if logLevelPriority[level] < l.minLevel {
-		return
-	}
-	payload := map[string]any{
-		"level":   level,
-		"time":    time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
-		"message": message,
-	}
-	if fields != nil {
-		redacted, _ := RedactValue(fields).(map[string]any)
-		for k, v := range redacted {
-			payload[k] = v
-		}
-	}
-	encoded, err := json.Marshal(payload)
-	if err != nil {
-		return
-	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	_, _ = l.out.Write(append(encoded, '\n'))
-}
-
-func IsValidBearerToken(authorization, expectedToken string) bool {
-	if !strings.HasPrefix(authorization, "Bearer ") || expectedToken == "" {
-		return false
-	}
-	supplied := authorization[len("Bearer "):]
-	return IsValidSecret(supplied, expectedToken)
-}
-
-func IsValidSecret(supplied, expected string) bool {
-	if len(supplied) != len(expected) {
-		return false
-	}
-	return subtle.ConstantTimeCompare([]byte(supplied), []byte(expected)) == 1
-}
-
-type BitrixValidationError struct {
-	Field   string `json:"field"`
-	Message string `json:"message"`
-}
-
-type AppError struct {
-	Message    string
-	Code       string
-	StatusCode int
-	OAuthCode  string
-	Validation []BitrixValidationError
-	Cause      error
-}
-
-func (e *AppError) Error() string {
-	return e.Message
-}
-
-func (e *AppError) Unwrap() error {
-	return e.Cause
-}
-
-func NewAppError(message, code string, statusCode int) *AppError {
-	if statusCode == 0 {
-		statusCode = 400
-	}
-	return &AppError{Message: message, Code: code, StatusCode: statusCode}
-}
-
-func NewNotFoundError(message string) *AppError {
-	return &AppError{Message: message, Code: "NOT_FOUND", StatusCode: 404}
-}
-
-func NewPolicyError(message string) *AppError {
-	return &AppError{Message: message, Code: "POLICY_DENIED", StatusCode: 403}
-}
-
-func NewAuthenticationError(message string) *AppError {
-	if message == "" {
-		message = "Unauthorized"
-	}
-	return &AppError{Message: message, Code: "UNAUTHORIZED", StatusCode: 401}
-}
-
-func SafeErrorMessage(err error) string {
-	var appErr *AppError
-	if errors.As(err, &appErr) {
-		return appErr.Message
-	}
-	return "An unexpected internal error occurred"
 }

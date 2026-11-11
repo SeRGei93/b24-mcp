@@ -41,14 +41,14 @@ type NamedBatchCommand struct {
 }
 
 type RequestOptions struct {
-	APIVersion        string
+	APIVersion        config.APIVersion
 	IdempotencyKey    string
 	IgnoreBatchErrors bool
 }
 
 type RequestOption func(*RequestOptions)
 
-func WithAPIVersion(version string) RequestOption {
+func WithAPIVersion(version config.APIVersion) RequestOption {
 	return func(o *RequestOptions) {
 		o.APIVersion = version
 	}
@@ -243,7 +243,7 @@ func BuildBatchCommand(method string, params map[string]any) (string, error) {
 	return method + "?" + query, nil
 }
 
-func buildEndpoint(clientEndpoint string, isWebhook bool, apiVersion string, method string) (string, error) {
+func buildEndpoint(clientEndpoint string, isWebhook bool, apiVersion config.APIVersion, method string) (string, error) {
 	u, err := url.Parse(strings.TrimSpace(clientEndpoint))
 	if err != nil {
 		return "", err
@@ -251,42 +251,26 @@ func buildEndpoint(clientEndpoint string, isWebhook bool, apiVersion string, met
 	origin := fmt.Sprintf("%s://%s", u.Scheme, u.Host)
 	cleanPath := strings.Trim(u.Path, "/")
 
-	if isWebhook {
-		parts := strings.Split(cleanPath, "/")
-		restIdx := -1
-		for i, part := range parts {
-			if part == "rest" {
-				restIdx = i
-				break
-			}
-		}
-		if restIdx == -1 || restIdx+2 >= len(parts) {
-			return "", fmt.Errorf("invalid webhook endpoint: %s", clientEndpoint)
-		}
-		prefix := ""
-		if restIdx > 0 {
-			prefix = "/" + strings.Join(parts[:restIdx], "/")
-		}
-		userID := parts[restIdx+1]
-		code := parts[restIdx+2]
-
-		if apiVersion == config.APIVersionV3 {
-			return fmt.Sprintf("%s%s/rest/api/%s/%s/%s", origin, prefix, userID, code, method), nil
-		}
-		return fmt.Sprintf("%s%s/rest/%s/%s/%s.json", origin, prefix, userID, code, method), nil
+	var parts []string
+	if cleanPath != "" {
+		parts = strings.Split(cleanPath, "/")
 	}
-
-	parts := strings.Split(cleanPath, "/")
-	restIdx := -1
-	for i, part := range parts {
-		if part == "rest" {
-			restIdx = i
-			break
-		}
-	}
+	restIdx := slices.Index(parts, "rest")
 	prefix := ""
 	if restIdx > 0 {
 		prefix = "/" + strings.Join(parts[:restIdx], "/")
+	}
+
+	if isWebhook {
+		if restIdx == -1 || restIdx+2 >= len(parts) {
+			return "", fmt.Errorf("invalid webhook endpoint: %s", clientEndpoint)
+		}
+		userID := parts[restIdx+1]
+		code := parts[restIdx+2]
+		if apiVersion == config.APIVersionV3 {
+			return fmt.Sprintf("%s%s/rest/%s/%s/api/%s", origin, prefix, userID, code, method), nil
+		}
+		return fmt.Sprintf("%s%s/rest/%s/%s/%s.json", origin, prefix, userID, code, method), nil
 	}
 
 	if apiVersion == config.APIVersionV3 {
@@ -327,12 +311,8 @@ func (c *RestClient) IsV2Mode(ctx context.Context, connectionID string) bool {
 	if c.cfg.BitrixAPIVersion == config.APIVersionV3 {
 		return false
 	}
-	if c.tokens != nil && c.tokens.store != nil {
-		var cachedVersion string
-		found, err := c.tokens.store.GetSchemaCache(ctx, connectionID, "api_version", c.cfg.SchemaCacheTTLSeconds, &cachedVersion)
-		if err == nil && found && cachedVersion == config.APIVersionV2 {
-			return true
-		}
+	if cachedVersion, found := c.tokens.GetCachedAPIVersion(ctx, connectionID, c.cfg.SchemaCacheTTLSeconds); found && cachedVersion == config.APIVersionV2 {
+		return true
 	}
 	return false
 }
@@ -371,6 +351,7 @@ func shouldCachePortalV2(method string, appErr *config.AppError) bool {
 	}
 	if strings.HasSuffix(method, ".aggregate") ||
 		strings.HasSuffix(method, ".delete") ||
+		strings.HasSuffix(method, ".productrow.list") ||
 		strings.HasPrefix(method, "crm.productrow.") {
 		return false
 	}
@@ -378,16 +359,34 @@ func shouldCachePortalV2(method string, appErr *config.AppError) bool {
 }
 
 func isLegacyOnlyMethod(method string) bool {
-	if strings.HasPrefix(method, "crm.item.") ||
+	return strings.HasPrefix(method, "crm.item.") ||
 		strings.HasPrefix(method, "crm.type.") ||
 		strings.HasPrefix(method, "crm.status.") ||
 		strings.HasPrefix(method, "crm.category.") ||
 		strings.HasPrefix(method, "user.") ||
 		strings.HasPrefix(method, "app.") ||
-		method == "profile" {
-		return true
+		method == "profile"
+}
+
+func (c *RestClient) resolveTargetVersion(ctx context.Context, connectionID string, options RequestOptions, methods ...string) config.APIVersion {
+	target := options.APIVersion
+	if target == "" {
+		target = c.cfg.BitrixAPIVersion
 	}
-	return false
+	if target == "" {
+		target = config.APIVersionAuto
+	}
+	if options.APIVersion != config.APIVersionV3 {
+		for _, m := range methods {
+			if isLegacyOnlyMethod(m) {
+				return config.APIVersionV2
+			}
+		}
+	}
+	if target == config.APIVersionAuto && c.IsV2Mode(ctx, connectionID) {
+		return config.APIVersionV2
+	}
+	return target
 }
 
 func (c *RestClient) waitForPacing(ctx context.Context, connectionID string) error {
@@ -438,32 +437,17 @@ func (c *RestClient) Call(ctx context.Context, connectionID string, method strin
 		opt(&options)
 	}
 
-	targetVersion := options.APIVersion
-	if targetVersion == "" {
-		targetVersion = c.cfg.BitrixAPIVersion
-	}
-	if targetVersion == "" {
-		targetVersion = config.APIVersionAuto
-	}
-
-	if options.APIVersion != config.APIVersionV3 && isLegacyOnlyMethod(method) {
-		targetVersion = config.APIVersionV2
-	}
-
+	targetVersion := c.resolveTargetVersion(ctx, connectionID, options, method)
 	if targetVersion != config.APIVersionAuto {
 		return c.callWithVersion(ctx, connectionID, method, params, targetVersion, options)
-	}
-
-	if c.IsV2Mode(ctx, connectionID) {
-		return c.callWithVersion(ctx, connectionID, method, params, config.APIVersionV2, options)
 	}
 
 	resp, err := c.callWithVersion(ctx, connectionID, method, params, config.APIVersionV3, options)
 	if err != nil {
 		var appErr *config.AppError
 		if errors.As(err, &appErr) && isVersionFallbackError(appErr) {
-			if shouldCachePortalV2(method, appErr) && c.tokens != nil && c.tokens.store != nil {
-				_ = c.tokens.store.SetSchemaCache(ctx, connectionID, "api_version", config.APIVersionV2)
+			if shouldCachePortalV2(method, appErr) {
+				c.tokens.CacheAPIVersion(ctx, connectionID, config.APIVersionV2)
 			}
 			if c.logger != nil {
 				c.logger.Warn("Bitrix24 REST 3.0 endpoint unavailable, falling back to Legacy REST v2", map[string]any{
@@ -484,10 +468,10 @@ func (c *RestClient) callWithVersion(
 	connectionID string,
 	method string,
 	params map[string]any,
-	version string,
+	version config.APIVersion,
 	options RequestOptions,
 ) (*BitrixResponse, error) {
-	return c.doPostWithRetry(ctx, connectionID, method, version, options, func(accessToken string, isWebhook bool) ([]byte, error) {
+	return c.doPostWithRetry(ctx, connectionID, method, version, options, nil, func(accessToken string, isWebhook bool) ([]byte, error) {
 		reqBody := make(map[string]any, len(params)+1)
 		for k, v := range params {
 			reqBody[k] = v
@@ -503,8 +487,9 @@ func (c *RestClient) doPostWithRetry(
 	ctx context.Context,
 	connectionID string,
 	method string,
-	version string,
+	version config.APIVersion,
 	options RequestOptions,
+	buildQuery func(accessToken string, isWebhook bool) url.Values,
 	buildBody func(accessToken string, isWebhook bool) ([]byte, error),
 ) (*BitrixResponse, error) {
 	if err := c.waitForPacing(ctx, connectionID); err != nil {
@@ -529,6 +514,11 @@ func (c *RestClient) doPostWithRetry(
 		if err != nil {
 			return nil, err
 		}
+		if buildQuery != nil {
+			if q := buildQuery(credentials.AccessToken, isWebhook); len(q) > 0 {
+				endpoint = endpoint + "?" + q.Encode()
+			}
+		}
 
 		payloadBytes, err := buildBody(credentials.AccessToken, isWebhook)
 		if err != nil {
@@ -541,7 +531,7 @@ func (c *RestClient) doPostWithRetry(
 				"connectionId": connectionID,
 				"method":       method,
 				"attempt":      attempt,
-				"version":      version,
+				"version":      string(version),
 				"isWebhook":    isWebhook,
 			})
 		}
@@ -674,27 +664,11 @@ func (c *RestClient) CallBatch(
 		opt(&options)
 	}
 
-	targetVersion := options.APIVersion
-	if targetVersion == "" {
-		targetVersion = c.cfg.BitrixAPIVersion
+	methods := make([]string, len(commands))
+	for i, cmd := range commands {
+		methods[i] = cmd.Method
 	}
-	if targetVersion == "" {
-		targetVersion = config.APIVersionAuto
-	}
-
-	if options.APIVersion != config.APIVersionV3 {
-		for _, cmd := range commands {
-			if isLegacyOnlyMethod(cmd.Method) {
-				targetVersion = config.APIVersionV2
-				break
-			}
-		}
-	}
-
-	if targetVersion == config.APIVersionAuto && c.IsV2Mode(ctx, connectionID) {
-		targetVersion = config.APIVersionV2
-	}
-
+	targetVersion := c.resolveTargetVersion(ctx, connectionID, options, methods...)
 	if targetVersion == config.APIVersionV2 {
 		return c.callBatchV2(ctx, connectionID, commands, halt, options)
 	}
@@ -703,13 +677,24 @@ func (c *RestClient) CallBatch(
 	if err != nil {
 		var appErr *config.AppError
 		if targetVersion == config.APIVersionAuto && errors.As(err, &appErr) && isVersionFallbackError(appErr) {
-			if c.tokens != nil && c.tokens.store != nil {
-				_ = c.tokens.store.SetSchemaCache(ctx, connectionID, "api_version", config.APIVersionV2)
-			}
+			c.tokens.CacheAPIVersion(ctx, connectionID, config.APIVersionV2)
 		}
 		return nil, err
 	}
 	return res, nil
+}
+
+func forEachBatchChunk(commands []NamedBatchCommand, fn func(chunk []NamedBatchCommand) error) error {
+	for offset := 0; offset < len(commands); offset += BitrixBatchLimit {
+		end := offset + BitrixBatchLimit
+		if end > len(commands) {
+			end = len(commands)
+		}
+		if err := fn(commands[offset:end]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (c *RestClient) callBatchV3(
@@ -721,25 +706,26 @@ func (c *RestClient) callBatchV3(
 ) (map[string]json.RawMessage, error) {
 	combined := make(map[string]json.RawMessage)
 
-	for offset := 0; offset < len(commands); offset += BitrixBatchLimit {
-		end := offset + BitrixBatchLimit
-		if end > len(commands) {
-			end = len(commands)
+	err := forEachBatchChunk(commands, func(chunk []NamedBatchCommand) error {
+		queryBuilder := func(accessToken string, isWebhook bool) url.Values {
+			q := url.Values{}
+			if !isWebhook && accessToken != "" {
+				q.Set("auth", accessToken)
+			}
+			if halt {
+				q.Set("halt", "1")
+			}
+			return q
 		}
-		chunk := commands[offset:end]
-
-		bitrixResp, err := c.doPostWithRetry(ctx, connectionID, "batch", config.APIVersionV3, options, func(accessToken string, isWebhook bool) ([]byte, error) {
+		bodyBuilder := func(_ string, _ bool) ([]byte, error) {
 			items := make([]v3BatchItem, 0, len(chunk))
 			for _, cmd := range chunk {
-				q := make(map[string]any, len(cmd.Params)+2)
-				for k, v := range cmd.Params {
-					q[k] = v
-				}
-				if halt {
-					q["halt"] = 1
-				}
-				if !isWebhook {
-					q["auth"] = accessToken
+				var q map[string]any
+				if len(cmd.Params) > 0 {
+					q = make(map[string]any, len(cmd.Params))
+					for k, v := range cmd.Params {
+						q[k] = v
+					}
 				}
 				items = append(items, v3BatchItem{
 					Method: cmd.Method,
@@ -747,42 +733,55 @@ func (c *RestClient) callBatchV3(
 				})
 			}
 			return json.Marshal(items)
-		})
+		}
+
+		bitrixResp, err := c.doPostWithRetry(ctx, connectionID, "batch", config.APIVersionV3, options, queryBuilder, bodyBuilder)
 		if err != nil {
-			return nil, err
+			return err
 		}
 
 		var resList []json.RawMessage
 		if err := json.Unmarshal(bitrixResp.Result, &resList); err == nil && len(resList) == len(chunk) {
 			for i, cmd := range chunk {
 				var itemResp BitrixResponse
-				if err := json.Unmarshal(resList[i], &itemResp); err == nil && itemResp.Error != "" {
-					if options.IgnoreBatchErrors {
+				if err := json.Unmarshal(resList[i], &itemResp); err == nil {
+					if itemResp.Error != "" {
+						if options.IgnoreBatchErrors {
+							continue
+						}
+						return config.NewAppError(
+							fmt.Sprintf("Bitrix24 batch command '%s' failed (%s)", cmd.Key, itemResp.Error),
+							itemResp.Error,
+							502,
+						)
+					}
+					if len(itemResp.Result) > 0 {
+						combined[cmd.Key] = itemResp.Result
 						continue
 					}
-					return nil, config.NewAppError(
-						fmt.Sprintf("Bitrix24 batch command '%s' failed (%s)", cmd.Key, itemResp.Error),
-						itemResp.Error,
-						502,
-					)
 				}
 				combined[cmd.Key] = resList[i]
 			}
-		} else {
-			var batchPayload batchResultPayload
-			if err := json.Unmarshal(bitrixResp.Result, &batchPayload); err == nil {
-				if !options.IgnoreBatchErrors {
-					if err := checkBatchResultErrors(batchPayload.ResultError); err != nil {
-						return nil, err
-					}
+			return nil
+		}
+
+		var batchPayload batchResultPayload
+		if err := json.Unmarshal(bitrixResp.Result, &batchPayload); err == nil {
+			if !options.IgnoreBatchErrors {
+				if err := checkBatchResultErrors(batchPayload.ResultError); err != nil {
+					return err
 				}
-				for _, cmd := range chunk {
-					if val, ok := batchPayload.Result[cmd.Key]; ok {
-						combined[cmd.Key] = val
-					}
+			}
+			for _, cmd := range chunk {
+				if val, ok := batchPayload.Result[cmd.Key]; ok {
+					combined[cmd.Key] = val
 				}
 			}
 		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return combined, nil
 }
@@ -795,18 +794,13 @@ func (c *RestClient) callBatchV2(
 	options RequestOptions,
 ) (map[string]json.RawMessage, error) {
 	combined := make(map[string]json.RawMessage)
-	for offset := 0; offset < len(commands); offset += BitrixBatchLimit {
-		end := offset + BitrixBatchLimit
-		if end > len(commands) {
-			end = len(commands)
-		}
-		chunk := commands[offset:end]
 
+	err := forEachBatchChunk(commands, func(chunk []NamedBatchCommand) error {
 		cmdMap := make(map[string]any, len(chunk))
 		for _, cmd := range chunk {
 			serialized, err := BuildBatchCommand(cmd.Method, cmd.Params)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			cmdMap[cmd.Key] = serialized
 		}
@@ -821,17 +815,17 @@ func (c *RestClient) callBatchV2(
 			"cmd":  cmdMap,
 		}, config.APIVersionV2, options)
 		if err != nil {
-			return nil, err
+			return err
 		}
 
 		var batchPayload batchResultPayload
 		if err := json.Unmarshal(resp.Result, &batchPayload); err != nil {
-			return nil, err
+			return err
 		}
 
 		if !options.IgnoreBatchErrors {
 			if err := checkBatchResultErrors(batchPayload.ResultError); err != nil {
-				return nil, err
+				return err
 			}
 		}
 
@@ -840,8 +834,11 @@ func (c *RestClient) callBatchV2(
 				combined[cmd.Key] = val
 			}
 		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
-
 	return combined, nil
 }
 
@@ -862,9 +859,6 @@ func checkBatchResultErrors(resultError FlexMap[json.RawMessage]) error {
 	return nil
 }
 
-// CollectPages fetches the first page (start=0) of a paginated Bitrix24 REST method
-// and, if additional pages exist within c.cfg.BitrixMaxPages and the optional limit,
-// fetches subsequent pages via CallBatch (when total is known) or sequential Call fallback.
 func (c *RestClient) CollectPages(
 	ctx context.Context,
 	connectionID string,

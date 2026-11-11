@@ -90,8 +90,7 @@ func run() error {
 	rc := bitrix.NewRestClient(cfg, tokens, logger, oauth.HTTPClient())
 	schema := bitrix.NewSchemaDiscovery(cfg, st, rc)
 	crm := bitrix.NewCrmService(cfg, rc)
-	guard := bitrix.NewPolicyGuard()
-	ops := bitrix.NewOperationService(cfg, st, guard, rc)
+	ops := bitrix.NewOperationService(cfg, st, rc)
 
 	if cfg.Transport == "stdio" {
 		mcpSrv := mcp.NewServer(st, schema, crm, ops, "")

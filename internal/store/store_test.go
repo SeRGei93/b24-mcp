@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -594,5 +595,98 @@ func TestStore_EnsureWebhookConnectionAndIsWebhook(t *testing.T) {
 	none, err := st.EnsureWebhookConnection(ctx, noHookCfg)
 	if err != nil || none != nil {
 		t.Fatalf("expected nil, nil for empty webhook URL, got %+v err=%v", none, err)
+	}
+
+	// 5. EnsureWebhookConnection rejects domain mismatch instead of silently overwriting
+	mismatchCfg := &config.Config{
+		BitrixWebhookURL:   "https://webhook-portal.bitrix24.com/rest/7/secret-hook-code/",
+		BitrixPortalDomain: "other-portal.bitrix24.com",
+		DefaultMode:        config.ModeReadOnly,
+	}
+	if _, err := st.EnsureWebhookConnection(ctx, mismatchCfg); err == nil {
+		t.Fatalf("expected error when webhook domain mismatches BITRIX_PORTAL_DOMAIN")
+	}
+}
+
+func TestStore_UpgradeMigrationFrom001To002(t *testing.T) {
+	ctx := context.Background()
+	dbFile := filepath.Join(t.TempDir(), "legacy-upgrade.sqlite")
+
+	rawDB, err := sql.Open("sqlite", dbFile)
+	if err != nil {
+		t.Fatalf("failed to open sqlite: %v", err)
+	}
+	const legacy001 = `
+		CREATE TABLE schema_migrations (id TEXT PRIMARY KEY, applied_at TEXT NOT NULL);
+		INSERT INTO schema_migrations (id, applied_at) VALUES ('001_initial_sqlite', '2026-01-01T00:00:00.000Z');
+		CREATE TABLE bitrix_connections (
+			id TEXT PRIMARY KEY, domain TEXT NOT NULL, member_id TEXT NOT NULL, bitrix_user_id TEXT NOT NULL,
+			client_endpoint TEXT NOT NULL, access_token_encrypted TEXT NOT NULL, refresh_token_encrypted TEXT NOT NULL,
+			scope TEXT NOT NULL DEFAULT '', expires_at TEXT NOT NULL, mode TEXT NOT NULL DEFAULT 'read_only',
+			admin_tools_enabled INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'active',
+			created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+		);
+		CREATE TABLE pending_operations (
+			id TEXT PRIMARY KEY,
+			connection_id TEXT NOT NULL REFERENCES bitrix_connections(id) ON DELETE CASCADE,
+			operation_type TEXT NOT NULL CHECK (operation_type IN ('create_item', 'update_item', 'move_item_stage')),
+			method TEXT NOT NULL, params_json TEXT NOT NULL, human_summary TEXT NOT NULL,
+			status TEXT NOT NULL DEFAULT 'pending', result_json TEXT, error_message TEXT,
+			created_at TEXT NOT NULL, expires_at TEXT NOT NULL, confirmed_at TEXT, completed_at TEXT
+		);
+		CREATE TABLE audit_logs (
+			id TEXT PRIMARY KEY,
+			connection_id TEXT REFERENCES bitrix_connections(id) ON DELETE SET NULL,
+			operation_id TEXT REFERENCES pending_operations(id) ON DELETE SET NULL,
+			action TEXT NOT NULL, outcome TEXT NOT NULL, details_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL
+		);
+	`
+	if _, err := rawDB.Exec(legacy001); err != nil {
+		t.Fatalf("failed to seed legacy 001 schema: %v", err)
+	}
+	cipher, err := store.NewTokenCipher(testKeyHex)
+	if err != nil {
+		t.Fatalf("cipher: %v", err)
+	}
+	encTok, _ := cipher.Encrypt("tok")
+	_, err = rawDB.Exec(`
+		INSERT INTO bitrix_connections VALUES ('conn-1','p.bitrix24.com','m1','1','https://p.bitrix24.com/rest/',?,?, 'crm','2030-01-01T00:00:00.000Z','write_with_confirmation',0,'active','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z');
+		INSERT INTO pending_operations (id, connection_id, operation_type, method, params_json, human_summary, status, created_at, expires_at)
+		VALUES ('op-1', 'conn-1', 'create_item', 'crm.deal.add', '{}', 'Create deal', 'completed', '2026-01-01T00:00:00.000Z', '2030-01-01T00:00:00.000Z');
+		INSERT INTO audit_logs (id, connection_id, operation_id, action, outcome, details_json, created_at)
+		VALUES ('aud-1', 'conn-1', 'op-1', 'create_item', 'completed', '{}', '2026-01-01T00:00:00.000Z');
+	`, encTok, encTok)
+	if err != nil {
+		t.Fatalf("failed to seed legacy rows: %v", err)
+	}
+	_ = rawDB.Close()
+
+	st, err := store.NewStore(dbFile, testKeyHex)
+	if err != nil {
+		t.Fatalf("NewStore failed: %v", err)
+	}
+	defer st.Close()
+
+	if err := st.Migrate(ctx, nil); err != nil {
+		t.Fatalf("Migrate from 001 to 002 failed: %v", err)
+	}
+
+	delOp, err := st.CreatePendingOperation(ctx, store.CreatePendingOperationInput{
+		ConnectionID:  "conn-1",
+		OperationType: store.OpDeleteItem,
+		Method:        "crm.deal.delete",
+		Params:        map[string]any{"entityTypeId": 2, "id": 99},
+		HumanSummary:  "Delete deal #99",
+		ExpiresAt:     time.Now().Add(10 * time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("CreatePendingOperation(delete_item) after upgrade failed: %v", err)
+	}
+	if delOp.OperationType != store.OpDeleteItem {
+		t.Errorf("expected delete_item, got %q", delOp.OperationType)
+	}
+	preserved, err := st.GetPendingOperation(ctx, "op-1")
+	if err != nil || preserved.ID != "op-1" {
+		t.Fatalf("expected existing op-1 preserved, got %+v err=%v", preserved, err)
 	}
 }

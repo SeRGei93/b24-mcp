@@ -75,7 +75,7 @@ CREATE TABLE IF NOT EXISTS schema_cache (
 CREATE TABLE IF NOT EXISTS pending_operations (
   id TEXT PRIMARY KEY,
   connection_id TEXT NOT NULL REFERENCES bitrix_connections(id) ON DELETE CASCADE,
-  operation_type TEXT NOT NULL CHECK (operation_type IN ('create_item', 'update_item', 'move_item_stage', 'delete_item')),
+  operation_type TEXT NOT NULL CHECK (operation_type IN ('create_item', 'update_item', 'move_item_stage')),
   method TEXT NOT NULL,
   params_json TEXT NOT NULL,
   human_summary TEXT NOT NULL,

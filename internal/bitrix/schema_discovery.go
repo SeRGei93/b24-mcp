@@ -224,6 +224,29 @@ func supportsOrderDetails(entityTypeID int) bool {
 	return meta.supportsOrder
 }
 
+func supportsV3CategoryStages(entityTypeID int) bool {
+	return entityTypeID == EntityTypeDeal || entityTypeID >= EntityTypeDynamicMin
+}
+
+func productRowSlug(entityTypeID int, ownerType string) (string, bool) {
+	switch strings.ToUpper(strings.TrimSpace(ownerType)) {
+	case "D":
+		return "deal", true
+	case "L":
+		return "lead", true
+	case "Q":
+		return "quote", true
+	case "SI":
+		return "smartinvoice", true
+	}
+	if supportsProductRows(entityTypeID) {
+		if slug, err := entitySlug(entityTypeID); err == nil {
+			return slug, true
+		}
+	}
+	return "", false
+}
+
 func entityCode(entityTypeID int) string {
 	meta, _ := getEntityMeta(entityTypeID)
 	return meta.code
@@ -232,9 +255,9 @@ func entityCode(entityTypeID int) string {
 func stageEntityID(entityTypeID, categoryID int) string {
 	meta, _ := getEntityMeta(entityTypeID)
 	switch entityTypeID {
-	case 1, 7:
+	case EntityTypeLead, EntityTypeQuote:
 		return meta.stagePrefix
-	case 2:
+	case EntityTypeDeal:
 		if categoryID == 0 {
 			return meta.stagePrefix
 		}
@@ -333,9 +356,32 @@ func (s *SchemaDiscovery) ListEntityTypes(ctx context.Context, connectionID stri
 	return result, nil
 }
 
+func fieldsFromItemSlice(items []map[string]any) map[string]any {
+	out := make(map[string]any, len(items))
+	for _, item := range items {
+		for _, k := range []string{"name", "fieldName", "id"} {
+			if s, ok := item[k].(string); ok && s != "" {
+				out[s] = item
+				break
+			}
+		}
+	}
+	return out
+}
+
 func extractFields(raw json.RawMessage) map[string]any {
 	if len(raw) == 0 {
 		return make(map[string]any)
+	}
+	var v3Obj struct {
+		Items []map[string]any `json:"items"`
+	}
+	if err := json.Unmarshal(raw, &v3Obj); err == nil && v3Obj.Items != nil {
+		return fieldsFromItemSlice(v3Obj.Items)
+	}
+	var itemList []map[string]any
+	if err := json.Unmarshal(raw, &itemList); err == nil && itemList != nil {
+		return fieldsFromItemSlice(itemList)
 	}
 	var resObj struct {
 		Fields map[string]any `json:"fields"`
@@ -363,7 +409,7 @@ func (s *SchemaDiscovery) Fields(ctx context.Context, connectionID string, entit
 	var fields map[string]any
 	slug, slugErr := entitySlug(entityTypeID)
 	if slugErr == nil && !s.client.IsV2Mode(ctx, connectionID) {
-		method := fmt.Sprintf("crm.%s.fields", slug)
+		method := fmt.Sprintf("crm.%s.field.list", slug)
 		resp, err := s.client.Call(ctx, connectionID, method, map[string]any{})
 		if err == nil {
 			fields = extractFields(resp.Result)
@@ -403,7 +449,7 @@ func (s *SchemaDiscovery) Categories(ctx context.Context, connectionID string, e
 
 	var cats []map[string]any
 	slug, slugErr := entitySlug(entityTypeID)
-	if slugErr == nil && !s.client.IsV2Mode(ctx, connectionID) && (entityTypeID == 2 || entityTypeID >= 128) {
+	if slugErr == nil && !s.client.IsV2Mode(ctx, connectionID) && supportsV3CategoryStages(entityTypeID) {
 		method := fmt.Sprintf("crm.%s.category.list", slug)
 		loaded, err := s.collect(ctx, connectionID, method, map[string]any{}, "items")
 		if err == nil {
@@ -443,7 +489,7 @@ func (s *SchemaDiscovery) Stages(ctx context.Context, connectionID string, entit
 
 	var stages []map[string]any
 	slug, slugErr := entitySlug(entityTypeID)
-	if slugErr == nil && !s.client.IsV2Mode(ctx, connectionID) && (entityTypeID == 2 || entityTypeID >= 128) {
+	if slugErr == nil && !s.client.IsV2Mode(ctx, connectionID) && supportsV3CategoryStages(entityTypeID) {
 		method := fmt.Sprintf("crm.%s.category.stage.list", slug)
 		loaded, err := s.collect(ctx, connectionID, method, map[string]any{
 			"filter": []any{"categoryId", "=", categoryID},
@@ -571,7 +617,7 @@ func (s *SchemaDiscovery) Describe(
 		stagesByCategory[cID] = loaded
 	} else if len(uncachedCatIDs) > 1 {
 		slug, slugErr := entitySlug(entityTypeID)
-		useV3 := slugErr == nil && !s.client.IsV2Mode(ctx, connectionID) && (entityTypeID == 2 || entityTypeID >= 128)
+		useV3 := slugErr == nil && !s.client.IsV2Mode(ctx, connectionID) && supportsV3CategoryStages(entityTypeID)
 
 		var commands []NamedBatchCommand
 		if useV3 {

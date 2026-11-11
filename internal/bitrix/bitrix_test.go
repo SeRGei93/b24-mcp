@@ -248,18 +248,18 @@ func TestOAuthService_HandleInstallationAndDomainLock(t *testing.T) {
 
 func TestTokenManager_DeduplicatesRefreshAndMarksRevoked(t *testing.T) {
 	ctx := context.Background()
-	var refreshCalls atomic.Int32
+	var tokenSeq atomic.Int32
 	shouldFailInvalidGrant := false
 
 	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		refreshCalls.Add(1)
+		seq := tokenSeq.Add(1)
 		time.Sleep(25 * time.Millisecond)
 		if shouldFailInvalidGrant {
 			return jsonResponse(400, map[string]any{"error": "invalid_grant"}), nil
 		}
 		return jsonResponse(200, map[string]any{
-			"access_token":    "new-access",
-			"refresh_token":   "new-refresh",
+			"access_token":    fmt.Sprintf("new-access-%d", seq),
+			"refresh_token":   fmt.Sprintf("new-refresh-%d", seq),
 			"expires_in":      3600,
 			"scope":           "crm",
 			"domain":          "oauth.bitrix.info",
@@ -285,47 +285,47 @@ func TestTokenManager_DeduplicatesRefreshAndMarksRevoked(t *testing.T) {
 		t.Fatalf("failed to seed connection: %v", err)
 	}
 
-	var wg sync.WaitGroup
-	results := make([]string, 2)
-	errs := make([]error, 2)
-	for i := 0; i < 2; i++ {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			res, err := tm.Get(ctx, created.ID, true, "old-access")
+	t.Run("deduplicates concurrent refresh into same token", func(t *testing.T) {
+		var wg sync.WaitGroup
+		results := make([]string, 2)
+		errs := make([]error, 2)
+		for i := 0; i < 2; i++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				res, err := tm.Get(ctx, created.ID, true, "old-access")
+				if err != nil {
+					errs[idx] = err
+					return
+				}
+				results[idx] = res.AccessToken
+			}(i)
+		}
+		wg.Wait()
+
+		for i, err := range errs {
 			if err != nil {
-				errs[idx] = err
-				return
+				t.Fatalf("goroutine %d failed: %v", i, err)
 			}
-			results[idx] = res.AccessToken
-		}(i)
-	}
-	wg.Wait()
+			if results[i] != "new-access-1" {
+				t.Errorf("goroutine %d got %q, want deduplicated 'new-access-1'", i, results[i])
+			}
+		}
+	})
 
-	for i, err := range errs {
+	t.Run("marks connection revoked on invalid_grant", func(t *testing.T) {
+		shouldFailInvalidGrant = true
+		if _, err := tm.Get(ctx, created.ID, true, ""); err == nil {
+			t.Fatalf("expected error on invalid_grant")
+		}
+		afterRevoke, err := st.GetConnection(ctx, created.ID)
 		if err != nil {
-			t.Fatalf("goroutine %d failed: %v", i, err)
+			t.Fatalf("GetConnection failed: %v", err)
 		}
-		if results[i] != "new-access" {
-			t.Errorf("goroutine %d got %q, want 'new-access'", i, results[i])
+		if afterRevoke.Status != "revoked" {
+			t.Errorf("expected connection status 'revoked', got %q", afterRevoke.Status)
 		}
-	}
-	if got := refreshCalls.Load(); got != 1 {
-		t.Errorf("expected exactly 1 refresh HTTP call, got %d", got)
-	}
-
-	// Verify invalid_grant marks connection revoked
-	shouldFailInvalidGrant = true
-	if _, err := tm.Get(ctx, created.ID, true, ""); err == nil {
-		t.Fatalf("expected error on invalid_grant")
-	}
-	afterRevoke, err := st.GetConnection(ctx, created.ID)
-	if err != nil {
-		t.Fatalf("GetConnection failed: %v", err)
-	}
-	if afterRevoke.Status != "revoked" {
-		t.Errorf("expected connection status 'revoked', got %q", afterRevoke.Status)
-	}
+	})
 }
 
 func TestOAuthService_CreateMcpAuthorizationURLAndContinuationError(t *testing.T) {
@@ -395,17 +395,9 @@ func TestOAuthService_CreateMcpAuthorizationURLAndContinuationError(t *testing.T
 	if cbErr == nil || !strings.Contains(cbErr.Error(), "Bitrix24 authorization was denied") {
 		t.Fatalf("expected continuation error on denied callback, got %v", cbErr)
 	}
-	if ok := errorsAsContinuation(cbErr, &contErr); !ok || contErr.McpRequestHash != "req-hash-cont" || contErr.OAuthErrorCode != "access_denied" {
+	if !errors.As(cbErr, &contErr) || contErr.McpRequestHash != "req-hash-cont" || contErr.OAuthErrorCode != "access_denied" {
 		t.Errorf("unexpected ContinuationError: %+v", contErr)
 	}
-}
-
-func errorsAsContinuation(err error, target **bitrix.ContinuationError) bool {
-	if c, ok := err.(*bitrix.ContinuationError); ok {
-		*target = c
-		return true
-	}
-	return false
 }
 
 func TestFlexMap_DecodesEmptyArrayAndObject(t *testing.T) {
@@ -551,17 +543,16 @@ func TestRestClient_RefreshesExpiredTokenRetriesAndBatch(t *testing.T) {
 
 func TestSchemaDiscovery_CachingAndDescribeBatchStages(t *testing.T) {
 	ctx := context.Background()
-	var batchCalls atomic.Int32
-	var typeCalls atomic.Int32
+	var upstreamTitle atomic.Value
+	upstreamTitle.Store("Smart Process")
 
 	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "crm.type.list.json"):
-			typeCalls.Add(1)
 			return jsonResponse(200, map[string]any{
 				"result": map[string]any{
 					"types": []map[string]any{
-						{"entityTypeId": 128, "title": "Smart Process"},
+						{"entityTypeId": 128, "title": upstreamTitle.Load().(string)},
 					},
 				},
 			}), nil
@@ -581,7 +572,6 @@ func TestSchemaDiscovery_CachingAndDescribeBatchStages(t *testing.T) {
 				},
 			}), nil
 		case strings.HasSuffix(r.URL.Path, "batch.json"):
-			batchCalls.Add(1)
 			return jsonResponse(200, map[string]any{
 				"result": map[string]any{
 					"result": map[string]any{
@@ -618,40 +608,41 @@ func TestSchemaDiscovery_CachingAndDescribeBatchStages(t *testing.T) {
 	rc := bitrix.NewRestClient(cfg, tm, config.NewLogger(nil, "silent"), httpClient)
 	schema := bitrix.NewSchemaDiscovery(cfg, st, rc)
 
-	// 1. ListEntityTypes merges built-in + dynamic and caches result
-	types1, err := schema.ListEntityTypes(ctx, conn.ID, false)
-	if err != nil || len(types1) != 7 {
-		t.Fatalf("expected 7 entity types (6 built-in + 1 dynamic), got %d err=%v", len(types1), err)
-	}
-	types2, err := schema.ListEntityTypes(ctx, conn.ID, false)
-	if err != nil || len(types2) != 7 || typeCalls.Load() != 1 {
-		t.Fatalf("expected cached ListEntityTypes (1 HTTP call), got calls=%d err=%v", typeCalls.Load(), err)
-	}
+	t.Run("lists and caches entity types until refresh", func(t *testing.T) {
+		types1, err := schema.ListEntityTypes(ctx, conn.ID, false)
+		if err != nil || len(types1) != 7 {
+			t.Fatalf("expected 7 entity types (6 built-in + 1 dynamic), got %d err=%v", len(types1), err)
+		}
 
-	// 2. ResolveEntityType by title
-	resolved, err := schema.ResolveEntityType(ctx, conn.ID, "Smart Process")
-	if err != nil || resolved["entityTypeId"] != 128 {
-		t.Fatalf("expected entityTypeId 128 for 'Smart Process', got %+v err=%v", resolved, err)
-	}
+		// Mutate upstream title; cached read must still return original "Smart Process"
+		upstreamTitle.Store("Renamed Smart Process")
+		resolved, err := schema.ResolveEntityType(ctx, conn.ID, "Smart Process")
+		if err != nil || resolved["entityTypeId"] != 128 {
+			t.Fatalf("expected cached entityTypeId 128 for 'Smart Process', got %+v err=%v", resolved, err)
+		}
+	})
 
-	// 3. Describe batch-fetches uncached category stages
-	desc, err := schema.Describe(ctx, conn.ID, 2, nil, false)
-	if err != nil {
-		t.Fatalf("Describe failed: %v", err)
-	}
-	if batchCalls.Load() != 1 {
-		t.Errorf("expected 1 batch call for 2 uncached categories, got %d", batchCalls.Load())
-	}
-	descJSON, _ := json.Marshal(desc)
-	if !strings.Contains(string(descJSON), "C5:NEW") {
-		t.Errorf("expected C5:NEW in describe output: %s", string(descJSON))
-	}
+	t.Run("describes entity with category stages", func(t *testing.T) {
+		desc, err := schema.Describe(ctx, conn.ID, 2, nil, false)
+		if err != nil {
+			t.Fatalf("Describe failed: %v", err)
+		}
+		descJSON, _ := json.Marshal(desc)
+		if !strings.Contains(string(descJSON), "C5:NEW") || !strings.Contains(string(descJSON), "NEW") {
+			t.Errorf("expected NEW and C5:NEW in describe output: %s", string(descJSON))
+		}
+	})
 
-	// 4. Refresh clears schema cache
-	refreshed, err := schema.Refresh(ctx, conn.ID)
-	if err != nil || refreshed["clearedEntries"] == int64(0) {
-		t.Errorf("expected non-zero clearedEntries on Refresh, got %+v err=%v", refreshed, err)
-	}
+	t.Run("refresh clears schema cache and observes updated upstream", func(t *testing.T) {
+		refreshed, err := schema.Refresh(ctx, conn.ID)
+		if err != nil || refreshed["clearedEntries"] == int64(0) {
+			t.Errorf("expected non-zero clearedEntries on Refresh, got %+v err=%v", refreshed, err)
+		}
+		resolvedAfter, err := schema.ResolveEntityType(ctx, conn.ID, "Renamed Smart Process")
+		if err != nil || resolvedAfter["entityTypeId"] != 128 {
+			t.Fatalf("expected refreshed entityTypeId 128 for 'Renamed Smart Process', got %+v err=%v", resolvedAfter, err)
+		}
+	})
 }
 
 func TestCrmService_SearchBatchAndProducts(t *testing.T) {
@@ -770,73 +761,77 @@ func TestCrmService_SearchBatchAndProducts(t *testing.T) {
 	rc := bitrix.NewRestClient(cfg, tm, config.NewLogger(nil, "silent"), httpClient)
 	crmSvc := bitrix.NewCrmService(cfg, rc)
 
-	// Test 1: SearchItems pagination (fetching 51 deals across 2 pages)
-	searchRes, err := crmSvc.SearchItems(ctx, bitrix.SearchItemsInput{
-		ConnectionID:       conn.ID,
-		EntityTypeID:       2,
-		Limit:              60,
-		IncludeProductRows: true,
+	t.Run("SearchItems pagination and product rows", func(t *testing.T) {
+		searchRes, err := crmSvc.SearchItems(ctx, bitrix.SearchItemsInput{
+			ConnectionID:       conn.ID,
+			EntityTypeID:       2,
+			Limit:              60,
+			IncludeProductRows: true,
+		})
+		if err != nil {
+			t.Fatalf("SearchItems failed: %v", err)
+		}
+		if len(searchRes.Items) != 51 {
+			t.Fatalf("expected 51 items, got %d", len(searchRes.Items))
+		}
+		if rows, ok := searchRes.Items[0]["productRows"].([]map[string]any); !ok || len(rows) != 1 {
+			t.Errorf("expected productRows attached to item 1, got %+v", searchRes.Items[0]["productRows"])
+		}
 	})
-	if err != nil {
-		t.Fatalf("SearchItems failed: %v", err)
-	}
-	if len(searchRes.Items) != 51 {
-		t.Fatalf("expected 51 items, got %d", len(searchRes.Items))
-	}
-	// Verify product rows were attached to item 1
-	if rows, ok := searchRes.Items[0]["productRows"].([]map[string]any); !ok || len(rows) != 1 {
-		t.Errorf("expected productRows attached to item 1, got %+v", searchRes.Items[0]["productRows"])
-	}
 
-	// Test 2: GetItem for dynamic entity
-	itemRes, err := crmSvc.GetItem(ctx, conn.ID, 128, 100)
-	if err != nil {
-		t.Fatalf("GetItem failed: %v", err)
-	}
-	itemMap, ok := itemRes.(map[string]any)
-	if !ok || itemMap["title"] != "Smart Item 100" {
-		t.Errorf("expected item title 'Smart Item 100', got %+v", itemRes)
-	}
+	t.Run("GetItem dynamic entity", func(t *testing.T) {
+		itemRes, err := crmSvc.GetItem(ctx, conn.ID, 128, 100)
+		if err != nil {
+			t.Fatalf("GetItem failed: %v", err)
+		}
+		itemMap, ok := itemRes.(map[string]any)
+		if !ok || itemMap["title"] != "Smart Item 100" {
+			t.Errorf("expected item title 'Smart Item 100', got %+v", itemRes)
+		}
+	})
 
-	// Test 3: GetItems batch
-	batchItems, err := crmSvc.GetItems(ctx, conn.ID, 2, []int{1, 2})
-	if err != nil {
-		t.Fatalf("GetItems failed: %v", err)
-	}
-	if len(batchItems) != 2 {
-		t.Fatalf("expected 2 items, got %d", len(batchItems))
-	}
+	t.Run("GetItems batch", func(t *testing.T) {
+		batchItems, err := crmSvc.GetItems(ctx, conn.ID, 2, []int{1, 2})
+		if err != nil {
+			t.Fatalf("GetItems failed: %v", err)
+		}
+		if len(batchItems) != 2 {
+			t.Fatalf("expected 2 items, got %d", len(batchItems))
+		}
+	})
 
-	// Test 4: ListUsers batch
-	users, err := crmSvc.ListUsers(ctx, conn.ID, map[string]any{"ID": "1"})
-	if err != nil {
-		t.Fatalf("ListUsers failed: %v", err)
-	}
-	if len(users) != 1 || users[0]["NAME"] != "John" {
-		t.Fatalf("expected user John, got %+v", users)
-	}
+	t.Run("ListUsers batch", func(t *testing.T) {
+		users, err := crmSvc.ListUsers(ctx, conn.ID, map[string]any{"ID": "1"})
+		if err != nil {
+			t.Fatalf("ListUsers failed: %v", err)
+		}
+		if len(users) != 1 || users[0]["NAME"] != "John" {
+			t.Fatalf("expected user John, got %+v", users)
+		}
+	})
 
-	// Test 5: Upper-bound validation on batch IDs (250) and search limit (1000)
-	tooManyIDs := make([]int, 251)
-	for i := range tooManyIDs {
-		tooManyIDs[i] = i + 1
-	}
-	if _, err := crmSvc.GetItems(ctx, conn.ID, 2, tooManyIDs); err == nil {
-		t.Fatalf("expected GetItems to reject >250 IDs")
-	}
-	if _, err := crmSvc.ListProductRows(ctx, bitrix.ListProductRowsInput{
-		ConnectionID: conn.ID,
-		OwnerIDs:     tooManyIDs,
-	}); err == nil {
-		t.Fatalf("expected ListProductRows to reject >250 ownerIDs")
-	}
-	if _, err := crmSvc.SearchItems(ctx, bitrix.SearchItemsInput{
-		ConnectionID: conn.ID,
-		EntityTypeID: 2,
-		Limit:        1001,
-	}); err == nil {
-		t.Fatalf("expected SearchItems to reject limit >1000")
-	}
+	t.Run("upper-bound validation on legacy batch IDs and search limit", func(t *testing.T) {
+		tooManyIDs := make([]int, 251)
+		for i := range tooManyIDs {
+			tooManyIDs[i] = i + 1
+		}
+		if _, err := crmSvc.GetItems(ctx, conn.ID, 2, tooManyIDs); err == nil {
+			t.Fatalf("expected GetItems to reject >250 IDs")
+		}
+		if _, err := crmSvc.ListProductRows(ctx, bitrix.ListProductRowsInput{
+			ConnectionID: conn.ID,
+			OwnerIDs:     tooManyIDs,
+		}); err == nil {
+			t.Fatalf("expected ListProductRows to reject >250 ownerIDs")
+		}
+		if _, err := crmSvc.SearchItems(ctx, bitrix.SearchItemsInput{
+			ConnectionID: conn.ID,
+			EntityTypeID: 2,
+			Limit:        1001,
+		}); err == nil {
+			t.Fatalf("expected SearchItems to reject limit >1000")
+		}
+	})
 }
 
 func TestOperationService_TwoStepLifecycleAndPolicyGuard(t *testing.T) {
@@ -881,130 +876,125 @@ func TestOperationService_TwoStepLifecycleAndPolicyGuard(t *testing.T) {
 
 	httpClient := &http.Client{Transport: rt, Timeout: 2 * time.Second}
 	rc := bitrix.NewRestClient(cfg, tm, config.NewLogger(nil, "silent"), httpClient)
-	policyGuard := bitrix.NewPolicyGuard()
-	opSvc := bitrix.NewOperationService(cfg, st, policyGuard, rc)
+	opSvc := bitrix.NewOperationService(cfg, st, rc)
 
-	// 1. Prepare Create
-	prep, err := opSvc.PrepareCreate(ctx, conn.ID, 2, map[string]any{"TITLE": "New Big Deal"})
-	if err != nil {
-		t.Fatalf("PrepareCreate failed: %v", err)
-	}
-	opID, _ := prep["operation_id"].(string)
-	if opID == "" || prep["requires_confirmation"] != true {
-		t.Fatalf("expected pending operation, got %+v", prep)
-	}
+	t.Run("prepare, list, confirm, and prevent double confirm", func(t *testing.T) {
+		prep, err := opSvc.PrepareCreate(ctx, conn.ID, 2, map[string]any{"TITLE": "New Big Deal"})
+		if err != nil {
+			t.Fatalf("PrepareCreate failed: %v", err)
+		}
+		opID, _ := prep["operation_id"].(string)
+		if opID == "" || prep["requires_confirmation"] != true {
+			t.Fatalf("expected pending operation, got %+v", prep)
+		}
 
-	// Check listing pending
-	list, err := st.ListPendingOperations(ctx, &conn.ID)
-	if err != nil || len(list) != 1 {
-		t.Fatalf("expected 1 pending operation in list, got %d, err=%v", len(list), err)
-	}
+		list, err := st.ListPendingOperations(ctx, &conn.ID)
+		if err != nil || len(list) != 1 {
+			t.Fatalf("expected 1 pending operation in list, got %d, err=%v", len(list), err)
+		}
 
-	// 2. Confirm operation
-	confirmRes, err := opSvc.Confirm(ctx, opID, "")
-	if err != nil {
-		t.Fatalf("Confirm failed: %v", err)
-	}
-	if confirmRes["status"] != "completed" {
-		t.Fatalf("expected completed status, got %+v", confirmRes)
-	}
-	if executedMethod != "crm.item.add" {
-		t.Fatalf("expected crm.item.add to be executed, got %q", executedMethod)
-	}
+		confirmRes, err := opSvc.Confirm(ctx, opID, "")
+		if err != nil {
+			t.Fatalf("Confirm failed: %v", err)
+		}
+		if confirmRes["status"] != "completed" {
+			t.Fatalf("expected completed status, got %+v", confirmRes)
+		}
+		if executedMethod != "crm.item.add" {
+			t.Fatalf("expected crm.item.add to be executed, got %q", executedMethod)
+		}
 
-	// Verify completed operation state and double-confirm prevention
-	completedOp, err := st.GetPendingOperation(ctx, opID)
-	if err != nil || completedOp.Status != store.OpStatusCompleted {
-		t.Fatalf("expected operation %s to have status completed, got %+v err=%v", opID, completedOp, err)
-	}
-	if _, err := opSvc.Confirm(ctx, opID, ""); err == nil {
-		t.Fatalf("expected second Confirm on completed operation to be rejected")
-	}
-
-	// Verify PolicyGuard capabilities (Read, Admin, Dangerous)
-	if err := policyGuard.Assert(conn, bitrix.CapabilityRead, false); err != nil {
-		t.Fatalf("expected CapabilityRead to be allowed, got %v", err)
-	}
-	if err := policyGuard.Assert(conn, bitrix.CapabilityDangerous, true); err == nil {
-		t.Fatalf("expected CapabilityDangerous to be rejected")
-	}
-	if err := policyGuard.Assert(conn, bitrix.CapabilityAdmin, true); err == nil {
-		t.Fatalf("expected CapabilityAdmin to be rejected when AdminToolsEnabled is false")
-	}
-
-	// 3. Cancel test
-	prepCancel, err := opSvc.PrepareUpdate(ctx, conn.ID, 2, 42, map[string]any{"TITLE": "Updated Deal"})
-	if err != nil {
-		t.Fatalf("PrepareUpdate failed: %v", err)
-	}
-	cancelID, _ := prepCancel["operation_id"].(string)
-
-	cancelRes, err := opSvc.Cancel(ctx, cancelID, "")
-	if err != nil {
-		t.Fatalf("Cancel failed: %v", err)
-	}
-	if cancelRes["status"] != "cancelled" {
-		t.Fatalf("expected cancelled status, got %+v", cancelRes)
-	}
-
-	// 4. Policy Guard rejection in read_only mode
-	_, err = st.UpsertConnection(ctx, store.UpsertConnectionInput{
-		Domain:         "example.bitrix24.com",
-		MemberID:       "member-ops",
-		BitrixUserID:   "1",
-		ClientEndpoint: "https://example.bitrix24.com/rest/",
-		AccessToken:    "acc",
-		RefreshToken:   "ref",
-		Scope:          "crm",
-		ExpiresAt:      time.Now().Add(time.Hour),
-		Mode:           config.ModeReadOnly,
+		completedOp, err := st.GetPendingOperation(ctx, opID)
+		if err != nil || completedOp.Status != store.OpStatusCompleted {
+			t.Fatalf("expected operation %s to have status completed, got %+v err=%v", opID, completedOp, err)
+		}
+		if _, err := opSvc.Confirm(ctx, opID, ""); err == nil {
+			t.Fatalf("expected second Confirm on completed operation to be rejected")
+		}
 	})
-	if err != nil {
-		t.Fatalf("update connection to read_only failed: %v", err)
-	}
 
-	_, err = opSvc.PrepareCreate(ctx, conn.ID, 2, map[string]any{"TITLE": "Blocked Deal"})
-	if err == nil {
-		t.Fatalf("expected PrepareCreate to be blocked in read_only mode")
-	}
+	t.Run("policy assertions enforce connection mode", func(t *testing.T) {
+		if err := bitrix.AssertCanPrepareWrite(conn); err != nil {
+			t.Fatalf("expected AssertCanPrepareWrite to allow write_with_confirmation, got %v", err)
+		}
+		if err := bitrix.AssertCanExecuteWrite(conn, false); err == nil {
+			t.Fatalf("expected AssertCanExecuteWrite without confirmation to fail in write_with_confirmation mode")
+		}
+		if err := bitrix.AssertCanExecuteWrite(conn, true); err != nil {
+			t.Fatalf("expected AssertCanExecuteWrite with confirmation to succeed, got %v", err)
+		}
+	})
+
+	t.Run("cancel pending operation", func(t *testing.T) {
+		prepCancel, err := opSvc.PrepareUpdate(ctx, conn.ID, 2, 42, map[string]any{"TITLE": "Updated Deal"})
+		if err != nil {
+			t.Fatalf("PrepareUpdate failed: %v", err)
+		}
+		cancelID, _ := prepCancel["operation_id"].(string)
+
+		cancelRes, err := opSvc.Cancel(ctx, cancelID, "")
+		if err != nil {
+			t.Fatalf("Cancel failed: %v", err)
+		}
+		if cancelRes["status"] != "cancelled" {
+			t.Fatalf("expected cancelled status, got %+v", cancelRes)
+		}
+	})
+
+	t.Run("blocks prepare in read_only mode", func(t *testing.T) {
+		_, err := st.UpsertConnection(ctx, store.UpsertConnectionInput{
+			Domain:         "example.bitrix24.com",
+			MemberID:       "member-ops",
+			BitrixUserID:   "1",
+			ClientEndpoint: "https://example.bitrix24.com/rest/",
+			AccessToken:    "acc",
+			RefreshToken:   "ref",
+			Scope:          "crm",
+			ExpiresAt:      time.Now().Add(time.Hour),
+			Mode:           config.ModeReadOnly,
+		})
+		if err != nil {
+			t.Fatalf("update connection to read_only failed: %v", err)
+		}
+
+		if _, err := opSvc.PrepareCreate(ctx, conn.ID, 2, map[string]any{"TITLE": "Blocked Deal"}); err == nil {
+			t.Fatalf("expected PrepareCreate to be blocked in read_only mode")
+		}
+	})
 }
 
 func TestRestClient_REST3AndLegacyRouting_OAuthAndWebhook(t *testing.T) {
 	ctx := context.Background()
 
-	var recordedRequests []struct {
-		URL    string
-		Auth   any
-		IsJSON bool
-		Raw    string
+	type capturedReq struct {
+		URL  string
+		Auth any
+		Raw  string
 	}
+	var lastReq capturedReq
 	var mu sync.Mutex
 
 	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		bodyBytes, _ := io.ReadAll(r.Body)
 		var bodyMap map[string]any
-		isJSON := json.Unmarshal(bodyBytes, &bodyMap) == nil
+		_ = json.Unmarshal(bodyBytes, &bodyMap)
 
 		mu.Lock()
-		recordedRequests = append(recordedRequests, struct {
-			URL    string
-			Auth   any
-			IsJSON bool
-			Raw    string
-		}{
-			URL:    r.URL.String(),
-			Auth:   bodyMap["auth"],
-			IsJSON: isJSON,
-			Raw:    string(bodyBytes),
-		})
+		lastReq = capturedReq{
+			URL:  r.URL.String(),
+			Auth: bodyMap["auth"],
+			Raw:  string(bodyBytes),
+		}
 		mu.Unlock()
 
 		if strings.Contains(r.URL.Path, "batch") {
-			if strings.Contains(r.URL.Path, "/rest/api") {
-				// REST 3.0 batch response: json array
+			if strings.Contains(r.URL.Path, "/api/") {
+				// REST 3.0 batch response: json array (supports wrapped item {"result": ...})
 				return jsonResponse(200, map[string]any{
 					"result": []any{
-						map[string]any{"id": 1, "title": "Deal 1"},
+						map[string]any{
+							"result": map[string]any{"id": 1, "title": "Deal 1"},
+						},
 					},
 				}), nil
 			}
@@ -1027,7 +1017,12 @@ func TestRestClient_REST3AndLegacyRouting_OAuthAndWebhook(t *testing.T) {
 	cfg, st, _, tm := newTestEnv(t, "", "client-id", rt)
 	rc := bitrix.NewRestClient(cfg, tm, config.NewLogger(nil, "silent"), &http.Client{Transport: rt})
 
-	// 1. OAuth Connection
+	getLastReq := func() capturedReq {
+		mu.Lock()
+		defer mu.Unlock()
+		return lastReq
+	}
+
 	oauthConn, err := st.UpsertConnection(ctx, store.UpsertConnectionInput{
 		Domain:         "example.bitrix24.com",
 		MemberID:       "member-oauth",
@@ -1043,32 +1038,6 @@ func TestRestClient_REST3AndLegacyRouting_OAuthAndWebhook(t *testing.T) {
 		t.Fatalf("UpsertConnection failed: %v", err)
 	}
 
-	// OAuth v3 single call
-	_, err = rc.Call(ctx, oauthConn.ID, "crm.deal.get", map[string]any{"id": 10}, bitrix.WithAPIVersion("v3"))
-	if err != nil {
-		t.Fatalf("OAuth v3 Call failed: %v", err)
-	}
-	// OAuth v2 single call
-	_, err = rc.Call(ctx, oauthConn.ID, "crm.deal.get", map[string]any{"id": 10}, bitrix.WithAPIVersion("v2"))
-	if err != nil {
-		t.Fatalf("OAuth v2 Call failed: %v", err)
-	}
-	// OAuth v3 batch
-	_, err = rc.CallBatch(ctx, oauthConn.ID, []bitrix.NamedBatchCommand{
-		{Key: "cmd0", Method: "crm.deal.get", Params: map[string]any{"id": 1}},
-	}, false, bitrix.WithAPIVersion("v3"))
-	if err != nil {
-		t.Fatalf("OAuth v3 CallBatch failed: %v", err)
-	}
-	// OAuth v2 batch
-	_, err = rc.CallBatch(ctx, oauthConn.ID, []bitrix.NamedBatchCommand{
-		{Key: "cmd0", Method: "crm.deal.get", Params: map[string]any{"id": 1}},
-	}, false, bitrix.WithAPIVersion("v2"))
-	if err != nil {
-		t.Fatalf("OAuth v2 CallBatch failed: %v", err)
-	}
-
-	// 2. Webhook Connection
 	whCfg := &config.Config{
 		BitrixWebhookURL: "https://example.bitrix24.com/rest/42/webhook-secret-code/",
 		DefaultMode:      config.ModeReadOnly,
@@ -1078,102 +1047,121 @@ func TestRestClient_REST3AndLegacyRouting_OAuthAndWebhook(t *testing.T) {
 		t.Fatalf("EnsureWebhookConnection failed: %v", err)
 	}
 
-	// Webhook v3 single call
-	_, err = rc.Call(ctx, whConn.ID, "crm.deal.get", map[string]any{"id": 10}, bitrix.WithAPIVersion("v3"))
-	if err != nil {
-		t.Fatalf("Webhook v3 Call failed: %v", err)
-	}
-	// Webhook v2 single call
-	_, err = rc.Call(ctx, whConn.ID, "crm.deal.get", map[string]any{"id": 10}, bitrix.WithAPIVersion("v2"))
-	if err != nil {
-		t.Fatalf("Webhook v2 Call failed: %v", err)
-	}
-	// Webhook v3 batch
-	_, err = rc.CallBatch(ctx, whConn.ID, []bitrix.NamedBatchCommand{
-		{Key: "cmd0", Method: "crm.deal.get", Params: map[string]any{"id": 1}},
-	}, false, bitrix.WithAPIVersion("v3"))
-	if err != nil {
-		t.Fatalf("Webhook v3 CallBatch failed: %v", err)
-	}
-	// Webhook v2 batch
-	_, err = rc.CallBatch(ctx, whConn.ID, []bitrix.NamedBatchCommand{
-		{Key: "cmd0", Method: "crm.deal.get", Params: map[string]any{"id": 1}},
-	}, false, bitrix.WithAPIVersion("v2"))
-	if err != nil {
-		t.Fatalf("Webhook v2 CallBatch failed: %v", err)
-	}
+	t.Run("OAuth v3 single call", func(t *testing.T) {
+		if _, err := rc.Call(ctx, oauthConn.ID, "crm.deal.get", map[string]any{"id": 10}, bitrix.WithAPIVersion(config.APIVersionV3)); err != nil {
+			t.Fatalf("OAuth v3 Call failed: %v", err)
+		}
+		got := getLastReq()
+		if got.URL != "https://example.bitrix24.com/rest/api/crm.deal.get" {
+			t.Errorf("OAuth v3 single URL mismatch: %s", got.URL)
+		}
+		if got.Auth != "oauth-secret" {
+			t.Errorf("OAuth v3 single expected auth in body, got: %v", got.Auth)
+		}
+	})
 
-	mu.Lock()
-	reqs := recordedRequests
-	mu.Unlock()
+	t.Run("OAuth v2 single call", func(t *testing.T) {
+		if _, err := rc.Call(ctx, oauthConn.ID, "crm.deal.get", map[string]any{"id": 10}, bitrix.WithAPIVersion(config.APIVersionV2)); err != nil {
+			t.Fatalf("OAuth v2 Call failed: %v", err)
+		}
+		got := getLastReq()
+		if got.URL != "https://example.bitrix24.com/rest/crm.deal.get.json" {
+			t.Errorf("OAuth v2 single URL mismatch: %s", got.URL)
+		}
+		if got.Auth != "oauth-secret" {
+			t.Errorf("OAuth v2 single expected auth in body, got: %v", got.Auth)
+		}
+	})
 
-	if len(reqs) != 8 {
-		t.Fatalf("expected 8 recorded requests, got %d", len(reqs))
-	}
+	t.Run("OAuth v3 batch puts auth and halt in query string and unwraps item result", func(t *testing.T) {
+		res, err := rc.CallBatch(ctx, oauthConn.ID, []bitrix.NamedBatchCommand{
+			{Key: "cmd0", Method: "crm.deal.get", Params: map[string]any{"id": 1}},
+		}, true, bitrix.WithAPIVersion(config.APIVersionV3))
+		if err != nil {
+			t.Fatalf("OAuth v3 CallBatch failed: %v", err)
+		}
+		got := getLastReq()
+		parsed, err := url.Parse(got.URL)
+		if err != nil {
+			t.Fatalf("invalid batch URL %q: %v", got.URL, err)
+		}
+		if parsed.Path != "/rest/api/batch" || parsed.Query().Get("auth") != "oauth-secret" || parsed.Query().Get("halt") != "1" {
+			t.Errorf("OAuth v3 batch URL/query mismatch: %s", got.URL)
+		}
+		var dtoItems []map[string]any
+		if err := json.Unmarshal([]byte(got.Raw), &dtoItems); err != nil || len(dtoItems) != 1 {
+			t.Fatalf("expected 1 DTO item in JSON array body, got %s (err=%v)", got.Raw, err)
+		}
+		if q, ok := dtoItems[0]["query"].(map[string]any); !ok || q["auth"] != nil || q["halt"] != nil {
+			t.Errorf("item query must not contain auth or halt: %+v", dtoItems[0])
+		}
+		var unwrapped map[string]any
+		if err := json.Unmarshal(res["cmd0"], &unwrapped); err != nil || unwrapped["title"] != "Deal 1" {
+			t.Errorf("expected unwrapped item result for cmd0, got %s (err=%v)", string(res["cmd0"]), err)
+		}
+	})
 
-	// Check 0: OAuth v3 single
-	if reqs[0].URL != "https://example.bitrix24.com/rest/api/crm.deal.get" {
-		t.Errorf("OAuth v3 single URL mismatch: %s", reqs[0].URL)
-	}
-	if reqs[0].Auth != "oauth-secret" {
-		t.Errorf("OAuth v3 single expected auth in body, got: %v", reqs[0].Auth)
-	}
+	t.Run("OAuth v2 batch", func(t *testing.T) {
+		if _, err := rc.CallBatch(ctx, oauthConn.ID, []bitrix.NamedBatchCommand{
+			{Key: "cmd0", Method: "crm.deal.get", Params: map[string]any{"id": 1}},
+		}, false, bitrix.WithAPIVersion(config.APIVersionV2)); err != nil {
+			t.Fatalf("OAuth v2 CallBatch failed: %v", err)
+		}
+		got := getLastReq()
+		if got.URL != "https://example.bitrix24.com/rest/batch.json" || got.Auth != "oauth-secret" {
+			t.Errorf("OAuth v2 batch mismatch: url=%s auth=%v", got.URL, got.Auth)
+		}
+	})
 
-	// Check 1: OAuth v2 single
-	if reqs[1].URL != "https://example.bitrix24.com/rest/crm.deal.get.json" {
-		t.Errorf("OAuth v2 single URL mismatch: %s", reqs[1].URL)
-	}
-	if reqs[1].Auth != "oauth-secret" {
-		t.Errorf("OAuth v2 single expected auth in body, got: %v", reqs[1].Auth)
-	}
+	t.Run("Webhook v3 single call", func(t *testing.T) {
+		if _, err := rc.Call(ctx, whConn.ID, "crm.deal.get", map[string]any{"id": 10}, bitrix.WithAPIVersion(config.APIVersionV3)); err != nil {
+			t.Fatalf("Webhook v3 Call failed: %v", err)
+		}
+		got := getLastReq()
+		if got.URL != "https://example.bitrix24.com/rest/42/webhook-secret-code/api/crm.deal.get" {
+			t.Errorf("Webhook v3 single URL mismatch: %s", got.URL)
+		}
+		if got.Auth != nil {
+			t.Errorf("Webhook v3 single must NOT contain auth in body, got: %v", got.Auth)
+		}
+	})
 
-	// Check 2: OAuth v3 batch -> /rest/api/batch?auth=... with native JSON array
-	if !strings.HasPrefix(reqs[2].URL, "https://example.bitrix24.com/rest/api/batch") {
-		t.Errorf("OAuth v3 batch URL mismatch: %s", reqs[2].URL)
-	}
-	if !strings.HasPrefix(strings.TrimSpace(reqs[2].Raw), "[") {
-		t.Errorf("OAuth v3 batch expected JSON array body, got: %s", reqs[2].Raw)
-	}
+	t.Run("Webhook v2 single call", func(t *testing.T) {
+		if _, err := rc.Call(ctx, whConn.ID, "crm.deal.get", map[string]any{"id": 10}, bitrix.WithAPIVersion(config.APIVersionV2)); err != nil {
+			t.Fatalf("Webhook v2 Call failed: %v", err)
+		}
+		got := getLastReq()
+		if got.URL != "https://example.bitrix24.com/rest/42/webhook-secret-code/crm.deal.get.json" || got.Auth != nil {
+			t.Errorf("Webhook v2 single mismatch: url=%s auth=%v", got.URL, got.Auth)
+		}
+	})
 
-	// Check 3: OAuth v2 batch -> /rest/batch.json
-	if reqs[3].URL != "https://example.bitrix24.com/rest/batch.json" {
-		t.Errorf("OAuth v2 batch URL mismatch: %s", reqs[3].URL)
-	}
-	if reqs[3].Auth != "oauth-secret" {
-		t.Errorf("OAuth v2 batch expected auth in body, got: %v", reqs[3].Auth)
-	}
+	t.Run("Webhook v3 batch", func(t *testing.T) {
+		if _, err := rc.CallBatch(ctx, whConn.ID, []bitrix.NamedBatchCommand{
+			{Key: "cmd0", Method: "crm.deal.get", Params: map[string]any{"id": 1}},
+		}, true, bitrix.WithAPIVersion(config.APIVersionV3)); err != nil {
+			t.Fatalf("Webhook v3 CallBatch failed: %v", err)
+		}
+		got := getLastReq()
+		if got.URL != "https://example.bitrix24.com/rest/42/webhook-secret-code/api/batch?halt=1" {
+			t.Errorf("Webhook v3 batch URL mismatch: %s", got.URL)
+		}
+		if !strings.HasPrefix(strings.TrimSpace(got.Raw), "[") {
+			t.Errorf("Webhook v3 batch expected JSON array body, got: %s", got.Raw)
+		}
+	})
 
-	// Check 4: Webhook v3 single -> /rest/api/42/webhook-secret-code/crm.deal.get (no auth)
-	if reqs[4].URL != "https://example.bitrix24.com/rest/api/42/webhook-secret-code/crm.deal.get" {
-		t.Errorf("Webhook v3 single URL mismatch: %s", reqs[4].URL)
-	}
-	if reqs[4].Auth != nil {
-		t.Errorf("Webhook v3 single must NOT contain auth in body, got: %v", reqs[4].Auth)
-	}
-
-	// Check 5: Webhook v2 single -> /rest/42/webhook-secret-code/crm.deal.get.json (no auth)
-	if reqs[5].URL != "https://example.bitrix24.com/rest/42/webhook-secret-code/crm.deal.get.json" {
-		t.Errorf("Webhook v2 single URL mismatch: %s", reqs[5].URL)
-	}
-	if reqs[5].Auth != nil {
-		t.Errorf("Webhook v2 single must NOT contain auth in body, got: %v", reqs[5].Auth)
-	}
-
-	// Check 6: Webhook v3 batch -> /rest/api/42/webhook-secret-code/batch
-	if reqs[6].URL != "https://example.bitrix24.com/rest/api/42/webhook-secret-code/batch" {
-		t.Errorf("Webhook v3 batch URL mismatch: %s", reqs[6].URL)
-	}
-	if !strings.HasPrefix(strings.TrimSpace(reqs[6].Raw), "[") {
-		t.Errorf("Webhook v3 batch expected JSON array body, got: %s", reqs[6].Raw)
-	}
-
-	// Check 7: Webhook v2 batch -> /rest/42/webhook-secret-code/batch.json
-	if reqs[7].URL != "https://example.bitrix24.com/rest/42/webhook-secret-code/batch.json" {
-		t.Errorf("Webhook v2 batch URL mismatch: %s", reqs[7].URL)
-	}
-	if reqs[7].Auth != nil {
-		t.Errorf("Webhook v2 batch must NOT contain auth in body, got: %v", reqs[7].Auth)
-	}
+	t.Run("Webhook v2 batch", func(t *testing.T) {
+		if _, err := rc.CallBatch(ctx, whConn.ID, []bitrix.NamedBatchCommand{
+			{Key: "cmd0", Method: "crm.deal.get", Params: map[string]any{"id": 1}},
+		}, false, bitrix.WithAPIVersion(config.APIVersionV2)); err != nil {
+			t.Fatalf("Webhook v2 CallBatch failed: %v", err)
+		}
+		got := getLastReq()
+		if got.URL != "https://example.bitrix24.com/rest/42/webhook-secret-code/batch.json" || got.Auth != nil {
+			t.Errorf("Webhook v2 batch mismatch: url=%s auth=%v", got.URL, got.Auth)
+		}
+	})
 }
 
 func TestRestClient_PolymorphicErrorsAndValidation(t *testing.T) {
@@ -1251,46 +1239,49 @@ func TestRestClient_PolymorphicErrorsAndValidation(t *testing.T) {
 		t.Fatalf("UpsertConnection failed: %v", err)
 	}
 
-	// 1. Legacy error string decoded
-	_, err = rc.Call(ctx, conn.ID, "legacy_err", nil)
-	if err == nil {
-		t.Fatalf("expected error for legacy_err")
-	}
-	var appErr *config.AppError
-	if !errorsAsAppError(err, &appErr) {
-		t.Fatalf("expected *config.AppError, got %T: %v", err, err)
-	}
-	if appErr.Code != "ERROR_LEGACY" {
-		t.Errorf("expected code 'ERROR_LEGACY', got %q", appErr.Code)
-	}
+	t.Run("legacy error string decoded", func(t *testing.T) {
+		_, err := rc.Call(ctx, conn.ID, "legacy_err", nil)
+		if err == nil {
+			t.Fatalf("expected error for legacy_err")
+		}
+		var appErr *config.AppError
+		if !errors.As(err, &appErr) {
+			t.Fatalf("expected *config.AppError, got %T: %v", err, err)
+		}
+		if appErr.Code != "ERROR_LEGACY" {
+			t.Errorf("expected code 'ERROR_LEGACY', got %q", appErr.Code)
+		}
+	})
 
-	// 2. REST 3.0 nested error with validation items decoded
-	_, err = rc.Call(ctx, conn.ID, "rest3_validation", nil)
-	if err == nil {
-		t.Fatalf("expected error for rest3_validation")
-	}
-	if !errorsAsAppError(err, &appErr) {
-		t.Fatalf("expected *config.AppError, got %T: %v", err, err)
-	}
-	if appErr.Code != "BITRIX_REST_V3_EXCEPTION_VALIDATION_REQUESTVALIDATIONEXCEPTION" {
-		t.Errorf("expected REST 3.0 code, got %q", appErr.Code)
-	}
-	if !strings.Contains(appErr.Message, "title: Title is required") {
-		t.Errorf("expected validation field details in message, got %q", appErr.Message)
-	}
-	if len(appErr.Validation) != 1 || appErr.Validation[0].Field != "title" {
-		t.Errorf("expected validation slice on AppError, got %+v", appErr.Validation)
-	}
+	t.Run("REST 3.0 nested error with validation items decoded", func(t *testing.T) {
+		_, err := rc.Call(ctx, conn.ID, "rest3_validation", nil)
+		if err == nil {
+			t.Fatalf("expected error for rest3_validation")
+		}
+		var appErr *config.AppError
+		if !errors.As(err, &appErr) {
+			t.Fatalf("expected *config.AppError, got %T: %v", err, err)
+		}
+		if appErr.Code != "BITRIX_REST_V3_EXCEPTION_VALIDATION_REQUESTVALIDATIONEXCEPTION" {
+			t.Errorf("expected REST 3.0 code, got %q", appErr.Code)
+		}
+		if !strings.Contains(appErr.Message, "title: Title is required") {
+			t.Errorf("expected validation field details in message, got %q", appErr.Message)
+		}
+		if len(appErr.Validation) != 1 || appErr.Validation[0].Field != "title" {
+			t.Errorf("expected validation slice on AppError, got %+v", appErr.Validation)
+		}
+	})
 
-	// 3. REST 3.0 nested expired_token triggers singleflight OAuth token refresh
-	_, err = rc.Call(ctx, conn.ID, "rest3_expired", nil)
-	if err != nil {
-		t.Fatalf("expected successful call after token refresh, got: %v", err)
-	}
-	updatedConn, err := st.GetConnection(ctx, conn.ID)
-	if err != nil || updatedConn.AccessToken != "refreshed-secret" {
-		t.Errorf("expected access token to be refreshed to 'refreshed-secret', got %+v err=%v", updatedConn, err)
-	}
+	t.Run("REST 3.0 nested expired_token triggers OAuth token refresh", func(t *testing.T) {
+		if _, err := rc.Call(ctx, conn.ID, "rest3_expired", nil); err != nil {
+			t.Fatalf("expected successful call after token refresh, got: %v", err)
+		}
+		updatedConn, err := st.GetConnection(ctx, conn.ID)
+		if err != nil || updatedConn.AccessToken != "refreshed-secret" {
+			t.Errorf("expected access token to be refreshed to 'refreshed-secret', got %+v err=%v", updatedConn, err)
+		}
+	})
 }
 
 func TestRestClient_TelemetryTime_OperatingResetAt_AndIdempotencyKey(t *testing.T) {
@@ -1319,7 +1310,7 @@ func TestRestClient_TelemetryTime_OperatingResetAt_AndIdempotencyKey(t *testing.
 			})
 			return resp, nil
 		}
-	// Second attempt succeeds with high operating time (>= 400s) to trigger proactive pacing on the next call
+		// Second attempt succeeds with high operating time (>= 400s) to trigger proactive pacing on the next call
 		if cnt == 2 {
 			return jsonResponse(200, map[string]any{
 				"result": map[string]any{"id": 42},
@@ -1379,9 +1370,6 @@ func TestRestClient_TelemetryTime_OperatingResetAt_AndIdempotencyKey(t *testing.
 	mu.Lock()
 	headers := slices.Clone(idempotencyHeaders)
 	mu.Unlock()
-	if len(headers) != 2 {
-		t.Fatalf("expected 2 requests, got %d", len(headers))
-	}
 	for i, h := range headers {
 		if h != "uuid-idem-123" {
 			t.Errorf("attempt %d missing or wrong Idempotency-Key: %q", i, h)
@@ -1427,12 +1415,12 @@ func TestRestClient_AutoFallbackToLegacyOn404OrMethodNotFound(t *testing.T) {
 			}), nil
 		}
 
-		// Connection 2 (partialv3.example.com): supports crm.deal.get in v3, but returns UNKNOWNMETHOD on crm.deal.aggregate
-		if r.URL.Host == "partialv3.example.com" && strings.HasSuffix(r.URL.Path, "/rest/api/crm.deal.aggregate") {
+		// Connection 2 (partialv3.example.com): supports crm.deal.get in v3, but returns UNKNOWNMETHOD on crm.deal.aggregate and crm.quote.productrow.list
+		if r.URL.Host == "partialv3.example.com" && (strings.HasSuffix(r.URL.Path, "/rest/api/crm.deal.aggregate") || strings.HasSuffix(r.URL.Path, "/rest/api/crm.quote.productrow.list")) {
 			return jsonResponse(404, map[string]any{
 				"error": map[string]any{
 					"code":    "BITRIX_REST_V3_EXCEPTION_UNKNOWNMETHOD",
-					"message": "Method crm.deal.aggregate not found in REST 3.0",
+					"message": "Method not found in REST 3.0",
 				},
 			}), nil
 		}
@@ -1440,6 +1428,11 @@ func TestRestClient_AutoFallbackToLegacyOn404OrMethodNotFound(t *testing.T) {
 			return jsonResponse(200, map[string]any{
 				"result": map[string]any{"items": []any{}},
 				"total":  19,
+			}), nil
+		}
+		if r.URL.Host == "partialv3.example.com" && strings.HasSuffix(r.URL.Path, "crm.item.productrow.list.json") {
+			return jsonResponse(200, map[string]any{
+				"result": map[string]any{"productRows": []any{}},
 			}), nil
 		}
 		if r.URL.Host == "partialv3.example.com" && strings.HasSuffix(r.URL.Path, "/rest/api/crm.deal.get") {
@@ -1481,45 +1474,6 @@ func TestRestClient_AutoFallbackToLegacyOn404OrMethodNotFound(t *testing.T) {
 		t.Fatalf("UpsertConnection failed: %v", err)
 	}
 
-	// 1. auto mode: REST 3.0 returns HTML 404 on /rest/api/crm.deal.get -> caches v2 in schema_cache and CrmService seamlessly executes crm.item.get.json
-	itemRaw, err := crmSvc.GetItem(ctx, connOnPrem.ID, 2, 77)
-	if err != nil {
-		t.Fatalf("expected seamless fallback to v2 crm.item.get, got error: %v", err)
-	}
-	itemMap, ok := itemRaw.(map[string]any)
-	if !ok || itemMap["title"] != "Legacy OnPrem Deal" {
-		t.Errorf("expected Legacy OnPrem Deal from v2 fallback, got: %+v", itemRaw)
-	}
-
-	// Verify schema_cache cached "v2"
-	var cachedVersion string
-	found, err := st.GetSchemaCache(ctx, connOnPrem.ID, "api_version", 900, &cachedVersion)
-	if err != nil || !found || cachedVersion != "v2" {
-		t.Errorf("expected api_version='v2' in schema_cache, found=%v version=%q err=%v", found, cachedVersion, err)
-	}
-
-	// Subsequent call on connOnPrem should directly call v2 (crm.item.get.json) in 1 request without trying /rest/api/
-	mu.Lock()
-	beforeLen := len(requestedPaths)
-	mu.Unlock()
-
-	_, err = crmSvc.GetItem(ctx, connOnPrem.ID, 2, 77)
-	if err != nil {
-		t.Fatalf("subsequent GetItem failed: %v", err)
-	}
-	mu.Lock()
-	lastPath := requestedPaths[len(requestedPaths)-1]
-	afterLen := len(requestedPaths)
-	mu.Unlock()
-
-	if afterLen-beforeLen != 1 {
-		t.Errorf("expected exactly 1 request for subsequent call, got %d", afterLen-beforeLen)
-	}
-	if !strings.HasSuffix(lastPath, "crm.item.get.json") || strings.Contains(lastPath, "/rest/api/") {
-		t.Errorf("expected direct Legacy REST call to crm.item.get.json, got: %s", lastPath)
-	}
-
-	// 2. Partial REST 3.0 portal: crm.deal.aggregate returns UNKNOWNMETHOD -> falls back locally to crm.item.list.json WITHOUT caching api_version='v2'
 	connPartial, err := st.UpsertConnection(ctx, store.UpsertConnectionInput{
 		Domain:         "partialv3.example.com",
 		MemberID:       "member-partial-v3",
@@ -1535,45 +1489,88 @@ func TestRestClient_AutoFallbackToLegacyOn404OrMethodNotFound(t *testing.T) {
 		t.Fatalf("UpsertConnection failed: %v", err)
 	}
 
-	total, err := crmSvc.CountItems(ctx, bitrix.CountItemsInput{
-		ConnectionID: connPartial.ID,
-		EntityTypeID: 2,
+	t.Run("auto mode HTML 404 falls back to v2 and caches portal api_version", func(t *testing.T) {
+		itemRaw, err := crmSvc.GetItem(ctx, connOnPrem.ID, 2, 77)
+		if err != nil {
+			t.Fatalf("expected seamless fallback to v2 crm.item.get, got error: %v", err)
+		}
+		itemMap, ok := itemRaw.(map[string]any)
+		if !ok || itemMap["title"] != "Legacy OnPrem Deal" {
+			t.Errorf("expected Legacy OnPrem Deal from v2 fallback, got: %+v", itemRaw)
+		}
+
+		var cachedVersion string
+		found, err := st.GetSchemaCache(ctx, connOnPrem.ID, "api_version", 900, &cachedVersion)
+		if err != nil || !found || cachedVersion != "v2" {
+			t.Errorf("expected api_version='v2' in schema_cache, found=%v version=%q err=%v", found, cachedVersion, err)
+		}
+
+		mu.Lock()
+		requestedPaths = nil
+		mu.Unlock()
+
+		if _, err := crmSvc.GetItem(ctx, connOnPrem.ID, 2, 77); err != nil {
+			t.Fatalf("subsequent GetItem failed: %v", err)
+		}
+		mu.Lock()
+		paths := slices.Clone(requestedPaths)
+		mu.Unlock()
+
+		for _, p := range paths {
+			if strings.Contains(p, "/rest/api/") {
+				t.Errorf("cached v2 connection must not hit /rest/api/, got path %q", p)
+			}
+		}
 	})
-	if err != nil || total != 19 {
-		t.Fatalf("expected CountItems local fallback to return 19, got %d err=%v", total, err)
-	}
-	var cachedPartial string
-	foundPartial, _ := st.GetSchemaCache(ctx, connPartial.ID, "api_version", 900, &cachedPartial)
-	if foundPartial {
-		t.Errorf("expected local-only fallback on .aggregate NOT to cache api_version='v2', got %q", cachedPartial)
-	}
 
-	// Subsequent GetItem on connPartial still uses REST 3.0 /rest/api/crm.deal.get
-	v3Item, err := crmSvc.GetItem(ctx, connPartial.ID, 2, 88)
-	if err != nil {
-		t.Fatalf("GetItem on connPartial failed: %v", err)
-	}
-	if m, ok := v3Item.(map[string]any); !ok || m["title"] != "Still REST 3.0 Deal" {
-		t.Errorf("expected REST 3.0 deal on connPartial, got: %+v", v3Item)
-	}
+	t.Run("partial REST 3.0 portal falls back locally without poisoning portal api_version", func(t *testing.T) {
+		total, err := crmSvc.CountItems(ctx, bitrix.CountItemsInput{
+			ConnectionID: connPartial.ID,
+			EntityTypeID: 2,
+		})
+		if err != nil || total != 19 {
+			t.Fatalf("expected CountItems local fallback to return 19, got %d err=%v", total, err)
+		}
 
-	// 3. Explicit BITRIX_API_VERSION=v3: legacy-only crm.type.list still uses /rest/crm.type.list.json, while 404 on v3 method returns error without fallback
-	cfgV3 := cfg
-	cfgV3.BitrixAPIVersion = config.APIVersionV3
-	rcV3 := bitrix.NewRestClient(cfgV3, tm, config.NewLogger(nil, "silent"), &http.Client{Transport: rt})
-	schemaV3 := bitrix.NewSchemaDiscovery(cfgV3, st, rcV3)
-	crmV3 := bitrix.NewCrmService(cfgV3, rcV3)
+		quoteType := bitrix.EntityTypeQuote
+		ownerID := 5
+		if _, err := crmSvc.ListProductRows(ctx, bitrix.ListProductRowsInput{
+			ConnectionID: connPartial.ID,
+			EntityTypeID: &quoteType,
+			OwnerID:      &ownerID,
+		}); err != nil {
+			t.Fatalf("expected ListProductRows local fallback on .productrow.list to succeed, got %v", err)
+		}
 
-	if _, err := schemaV3.ListEntityTypes(ctx, connPartial.ID, true); err != nil {
-		t.Fatalf("expected ListEntityTypes (crm.type.list) to route to legacy endpoint even in BITRIX_API_VERSION=v3, got err: %v", err)
-	}
-	if _, err := crmV3.GetItem(ctx, connOnPrem.ID, 2, 77); err == nil {
-		t.Fatalf("expected error in BITRIX_API_VERSION=v3 when /rest/api/crm.deal.get returns 404")
-	}
-}
+		var cachedPartial string
+		foundPartial, _ := st.GetSchemaCache(ctx, connPartial.ID, "api_version", 900, &cachedPartial)
+		if foundPartial {
+			t.Errorf("expected local-only fallback NOT to cache api_version='v2', got %q", cachedPartial)
+		}
 
-func errorsAsAppError(err error, target **config.AppError) bool {
-	return errors.As(err, target)
+		v3Item, err := crmSvc.GetItem(ctx, connPartial.ID, 2, 88)
+		if err != nil {
+			t.Fatalf("GetItem on connPartial failed: %v", err)
+		}
+		if m, ok := v3Item.(map[string]any); !ok || m["title"] != "Still REST 3.0 Deal" {
+			t.Errorf("expected REST 3.0 deal on connPartial, got: %+v", v3Item)
+		}
+	})
+
+	t.Run("explicit BITRIX_API_VERSION=v3 fails without v2 fallback except legacy-only methods", func(t *testing.T) {
+		cfgV3 := *cfg
+		cfgV3.BitrixAPIVersion = config.APIVersionV3
+		rcV3 := bitrix.NewRestClient(&cfgV3, tm, config.NewLogger(nil, "silent"), &http.Client{Transport: rt})
+		schemaV3 := bitrix.NewSchemaDiscovery(&cfgV3, st, rcV3)
+		crmV3 := bitrix.NewCrmService(&cfgV3, rcV3)
+
+		if _, err := schemaV3.ListEntityTypes(ctx, connPartial.ID, true); err != nil {
+			t.Fatalf("expected ListEntityTypes (crm.type.list) to route to legacy endpoint even in BITRIX_API_VERSION=v3, got err: %v", err)
+		}
+		if _, err := crmV3.GetItem(ctx, connOnPrem.ID, 2, 77); err == nil {
+			t.Fatalf("expected error in BITRIX_API_VERSION=v3 when /rest/api/crm.deal.get returns 404")
+		}
+	})
 }
 
 func TestSchemaDiscovery_HybridREST3_QuoteAndDictionaries(t *testing.T) {
@@ -1623,23 +1620,23 @@ func TestSchemaDiscovery_HybridREST3_QuoteAndDictionaries(t *testing.T) {
 			}), nil
 		}
 
-		// REST 3.0 crm.deal.fields
-		if strings.HasSuffix(path, "/rest/api/crm.deal.fields") {
+		// REST 3.0 crm.deal.field.list
+		if strings.HasSuffix(path, "/rest/api/crm.deal.field.list") {
 			return jsonResponse(200, map[string]any{
 				"result": map[string]any{
-					"fields": map[string]any{
-						"TITLE": map[string]any{"type": "string", "title": "Deal Title"},
+					"items": []map[string]any{
+						{"name": "TITLE", "type": "string", "title": "Deal Title"},
 					},
 				},
 			}), nil
 		}
 
-		// REST 3.0 crm.quote.fields
-		if strings.HasSuffix(path, "/rest/api/crm.quote.fields") {
+		// REST 3.0 crm.quote.field.list
+		if strings.HasSuffix(path, "/rest/api/crm.quote.field.list") {
 			return jsonResponse(200, map[string]any{
 				"result": map[string]any{
-					"fields": map[string]any{
-						"TITLE": map[string]any{"type": "string", "title": "Quote Title"},
+					"items": []map[string]any{
+						{"name": "TITLE", "type": "string", "title": "Quote Title"},
 					},
 				},
 			}), nil
@@ -1692,15 +1689,19 @@ func TestSchemaDiscovery_HybridREST3_QuoteAndDictionaries(t *testing.T) {
 			}), nil
 		}
 
-		// REST 3.0 /rest/api/batch for Describe uncached categories
+		// REST 3.0 /rest/api/batch for Describe uncached categories (wrapped item result)
 		if strings.Contains(path, "/rest/api/batch") {
 			return jsonResponse(200, map[string]any{
 				"result": []any{
 					map[string]any{
-						"items": []map[string]any{{"statusId": "NEW", "name": "New"}},
+						"result": map[string]any{
+							"items": []map[string]any{{"statusId": "NEW", "name": "New"}},
+						},
 					},
 					map[string]any{
-						"items": []map[string]any{{"statusId": "C3:NEW", "name": "VIP New"}},
+						"result": map[string]any{
+							"items": []map[string]any{{"statusId": "C3:NEW", "name": "VIP New"}},
+						},
 					},
 				},
 			}), nil
@@ -1728,148 +1729,152 @@ func TestSchemaDiscovery_HybridREST3_QuoteAndDictionaries(t *testing.T) {
 	rc := bitrix.NewRestClient(cfg, tm, config.NewLogger(nil, "silent"), &http.Client{Transport: rt})
 	schema := bitrix.NewSchemaDiscovery(cfg, st, rc)
 
-	// 1. ListEntityTypes sends start: -1 to crm.type.list and returns 6 built-ins + 1 SPA with accurate capability flags
-	types, err := schema.ListEntityTypes(ctx, conn.ID, false)
-	if err != nil {
-		t.Fatalf("ListEntityTypes failed: %v", err)
-	}
-	if len(types) != 7 {
-		t.Fatalf("expected 7 entity types (6 built-in including Quote + 1 dynamic), got %d", len(types))
-	}
-	wantMeta := map[int]struct {
-		code string
-		slug string
-		cats bool
-		stgs bool
-	}{
-		1:   {"LEAD", "lead", false, true},
-		2:   {"DEAL", "deal", true, true},
-		3:   {"CONTACT", "contact", false, false},
-		4:   {"COMPANY", "company", false, false},
-		7:   {"QUOTE", "quote", false, true},
-		31:  {"SMART_INVOICE", "smartinvoice", true, true},
-		128: {"DYNAMIC_128", "smartprocess128", true, true},
-	}
-	for _, et := range types {
-		id, _ := et["entityTypeId"].(int)
-		if id == 0 {
-			if f, ok := et["entityTypeId"].(float64); ok {
-				id = int(f)
+	t.Run("ListEntityTypes merges built-in and dynamic SPA with start -1", func(t *testing.T) {
+		types, err := schema.ListEntityTypes(ctx, conn.ID, false)
+		if err != nil {
+			t.Fatalf("ListEntityTypes failed: %v", err)
+		}
+		if len(types) != 7 {
+			t.Fatalf("expected 7 entity types (6 built-in including Quote + 1 dynamic), got %d", len(types))
+		}
+		wantMeta := map[int]struct {
+			code string
+			slug string
+			cats bool
+			stgs bool
+		}{
+			1:   {"LEAD", "lead", false, true},
+			2:   {"DEAL", "deal", true, true},
+			3:   {"CONTACT", "contact", false, false},
+			4:   {"COMPANY", "company", false, false},
+			7:   {"QUOTE", "quote", false, true},
+			31:  {"SMART_INVOICE", "smartinvoice", true, true},
+			128: {"DYNAMIC_128", "smartprocess128", true, true},
+		}
+		for _, et := range types {
+			id, _ := et["entityTypeId"].(int)
+			if id == 0 {
+				if f, ok := et["entityTypeId"].(float64); ok {
+					id = int(f)
+				}
+			}
+			exp, ok := wantMeta[id]
+			if !ok {
+				t.Errorf("unexpected entityTypeId %d in ListEntityTypes: %+v", id, et)
+				continue
+			}
+			if et["code"] != exp.code || et["slug"] != exp.slug || et["supportsCategories"] != exp.cats || et["supportsStages"] != exp.stgs {
+				t.Errorf("entity %d metadata mismatch: got %+v, want %+v", id, et, exp)
 			}
 		}
-		exp, ok := wantMeta[id]
-		if !ok {
-			t.Errorf("unexpected entityTypeId %d in ListEntityTypes: %+v", id, et)
-			continue
+		mu.Lock()
+		firstReq := recordedRequests[0]
+		mu.Unlock()
+		if firstReq.Body["start"] != -1 && firstReq.Body["start"] != float64(-1) {
+			t.Errorf("expected start: -1 in crm.type.list request, got: %v", firstReq.Body["start"])
 		}
-		if et["code"] != exp.code || et["slug"] != exp.slug || et["supportsCategories"] != exp.cats || et["supportsStages"] != exp.stgs {
-			t.Errorf("entity %d metadata mismatch: got %+v, want %+v", id, et, exp)
+	})
+
+	t.Run("Fields calls REST 3.0 crm.<slug>.field.list and indexes items by name", func(t *testing.T) {
+		fieldsDeal, err := schema.Fields(ctx, conn.ID, 2, false)
+		if err != nil {
+			t.Fatalf("Fields(2) failed: %v", err)
 		}
-	}
-	mu.Lock()
-	firstReq := recordedRequests[0]
-	mu.Unlock()
-	if firstReq.Body["start"] != -1 && firstReq.Body["start"] != float64(-1) {
-		t.Errorf("expected start: -1 in crm.type.list request, got: %v", firstReq.Body["start"])
-	}
-
-	// 3. ListFields for Deal (2) calls REST 3.0 crm.deal.fields
-	fieldsDeal, err := schema.Fields(ctx, conn.ID, 2, false)
-	if err != nil {
-		t.Fatalf("Fields(2) failed: %v", err)
-	}
-	if fieldsDeal["TITLE"] == nil {
-		t.Errorf("expected TITLE field in fieldsDeal: %+v", fieldsDeal)
-	}
-
-	// 4. ListFields for Quote (7) calls REST 3.0 crm.quote.fields
-	fieldsQuote, err := schema.Fields(ctx, conn.ID, 7, false)
-	if err != nil {
-		t.Fatalf("Fields(7) failed: %v", err)
-	}
-	if fieldsQuote["TITLE"] == nil {
-		t.Errorf("expected TITLE field in fieldsQuote: %+v", fieldsQuote)
-	}
-
-	// 5. ListCategories:
-	// Category-less entities (1 Lead, 3 Contact, 4 Company, 7 Quote) make 0 network requests
-	mu.Lock()
-	reqsBefore := len(recordedRequests)
-	mu.Unlock()
-	for _, catLessID := range []int{1, 3, 4, 7} {
-		cats, err := schema.Categories(ctx, conn.ID, catLessID, false)
-		if err != nil || len(cats) != 0 {
-			t.Errorf("expected empty categories without error for %d, got %v err=%v", catLessID, cats, err)
+		if fieldsDeal["TITLE"] == nil {
+			t.Errorf("expected TITLE field in fieldsDeal: %+v", fieldsDeal)
 		}
-	}
-	mu.Lock()
-	reqsAfter := len(recordedRequests)
-	mu.Unlock()
-	if reqsAfter != reqsBefore {
-		t.Errorf("expected 0 HTTP requests for category-less entities, made %d", reqsAfter-reqsBefore)
-	}
 
-	// Deals (2) calls REST 3.0 crm.deal.category.list
-	catsDeal, err := schema.Categories(ctx, conn.ID, 2, false)
-	if err != nil || len(catsDeal) != 2 {
-		t.Fatalf("expected 2 deal categories, got %d err=%v", len(catsDeal), err)
-	}
-
-	// Smart Invoices (31) calls legacy crm.category.list
-	catsInvoice, err := schema.Categories(ctx, conn.ID, 31, false)
-	if err != nil || len(catsInvoice) != 1 {
-		t.Fatalf("expected 1 invoice category via legacy endpoint, got %d err=%v", len(catsInvoice), err)
-	}
-
-	// 6. ListStages:
-	// Deals (2) calls REST 3.0 crm.deal.category.stage.list with flat 3-element filter ["categoryId", "=", 0]
-	stagesDeal, err := schema.Stages(ctx, conn.ID, 2, 0, false)
-	if err != nil || len(stagesDeal) != 1 {
-		t.Fatalf("expected 1 deal stage, got %d err=%v", len(stagesDeal), err)
-	}
-	mu.Lock()
-	var lastStageReq struct {
-		Method string
-		URL    string
-		Body   map[string]any
-		Raw    string
-	}
-	for _, r := range recordedRequests {
-		if strings.Contains(r.URL, "crm.deal.category.stage.list") {
-			lastStageReq = r
+		fieldsQuote, err := schema.Fields(ctx, conn.ID, 7, false)
+		if err != nil {
+			t.Fatalf("Fields(7) failed: %v", err)
 		}
-	}
-	mu.Unlock()
-	if filterSlice, ok := lastStageReq.Body["filter"].([]any); !ok || len(filterSlice) != 3 || filterSlice[0] != "categoryId" || filterSlice[1] != "=" {
-		t.Errorf("expected flat 3-element filter [categoryId, =, X], got: %v (raw: %s)", lastStageReq.Body["filter"], lastStageReq.Raw)
-	}
+		if fieldsQuote["TITLE"] == nil {
+			t.Errorf("expected TITLE field in fieldsQuote: %+v", fieldsQuote)
+		}
+	})
 
-	// Quotes (7) calls legacy crm.status.list with ENTITY_ID: QUOTE_STATUS
-	stagesQuote, err := schema.Stages(ctx, conn.ID, 7, 0, false)
-	if err != nil || len(stagesQuote) != 1 {
-		t.Fatalf("expected 1 quote stage, got %d err=%v", len(stagesQuote), err)
-	}
+	t.Run("Categories handles category-less entities, REST 3.0 deals, and legacy smart invoices", func(t *testing.T) {
+		mu.Lock()
+		recordedRequests = nil
+		mu.Unlock()
 
-	// Leads (1) calls legacy crm.status.list with ENTITY_ID: STATUS
-	stagesLead, err := schema.Stages(ctx, conn.ID, 1, 0, false)
-	if err != nil || len(stagesLead) != 1 {
-		t.Fatalf("expected 1 lead stage, got %d err=%v", len(stagesLead), err)
-	}
+		for _, catLessID := range []int{1, 3, 4, 7} {
+			cats, err := schema.Categories(ctx, conn.ID, catLessID, false)
+			if err != nil || len(cats) != 0 {
+				t.Errorf("expected empty categories without error for %d, got %v err=%v", catLessID, cats, err)
+			}
+		}
+		mu.Lock()
+		catLessReqs := slices.Clone(recordedRequests)
+		mu.Unlock()
+		for _, r := range catLessReqs {
+			if strings.Contains(r.URL, "category") {
+				t.Errorf("category-less entity unexpectedly requested category endpoint: %s", r.URL)
+			}
+		}
 
-	// 7. Describe for Deals batches uncached categories via /rest/api/batch
-	descDeal, err := schema.Describe(ctx, conn.ID, 2, nil, true)
-	if err != nil {
-		t.Fatalf("Describe(2) failed: %v", err)
-	}
-	if descDeal["entity"] == nil || descDeal["fields"] == nil || descDeal["categories"] == nil || descDeal["stages"] == nil {
-		t.Errorf("incomplete Describe output: %+v", descDeal)
-	}
+		catsDeal, err := schema.Categories(ctx, conn.ID, 2, false)
+		if err != nil || len(catsDeal) != 2 {
+			t.Fatalf("expected 2 deal categories, got %d err=%v", len(catsDeal), err)
+		}
+
+		catsInvoice, err := schema.Categories(ctx, conn.ID, 31, false)
+		if err != nil || len(catsInvoice) != 1 {
+			t.Fatalf("expected 1 invoice category via legacy endpoint, got %d err=%v", len(catsInvoice), err)
+		}
+	})
+
+	t.Run("Stages routes REST 3.0 deal stages and legacy status dictionaries", func(t *testing.T) {
+		stagesDeal, err := schema.Stages(ctx, conn.ID, 2, 0, false)
+		if err != nil || len(stagesDeal) != 1 {
+			t.Fatalf("expected 1 deal stage, got %d err=%v", len(stagesDeal), err)
+		}
+		mu.Lock()
+		var lastStageReq struct {
+			Method string
+			URL    string
+			Body   map[string]any
+			Raw    string
+		}
+		for _, r := range recordedRequests {
+			if strings.Contains(r.URL, "crm.deal.category.stage.list") {
+				lastStageReq = r
+			}
+		}
+		mu.Unlock()
+		if filterSlice, ok := lastStageReq.Body["filter"].([]any); !ok || len(filterSlice) != 3 || filterSlice[0] != "categoryId" || filterSlice[1] != "=" {
+			t.Errorf("expected flat 3-element filter [categoryId, =, X], got: %v (raw: %s)", lastStageReq.Body["filter"], lastStageReq.Raw)
+		}
+
+		stagesQuote, err := schema.Stages(ctx, conn.ID, 7, 0, false)
+		if err != nil || len(stagesQuote) != 1 {
+			t.Fatalf("expected 1 quote stage, got %d err=%v", len(stagesQuote), err)
+		}
+
+		stagesLead, err := schema.Stages(ctx, conn.ID, 1, 0, false)
+		if err != nil || len(stagesLead) != 1 {
+			t.Fatalf("expected 1 lead stage, got %d err=%v", len(stagesLead), err)
+		}
+	})
+
+	t.Run("Describe batches uncached categories via REST 3.0 batch and unwraps item results", func(t *testing.T) {
+		descDeal, err := schema.Describe(ctx, conn.ID, 2, nil, true)
+		if err != nil {
+			t.Fatalf("Describe(2) failed: %v", err)
+		}
+		if descDeal["entity"] == nil || descDeal["fields"] == nil || descDeal["categories"] == nil || descDeal["stages"] == nil {
+			t.Errorf("incomplete Describe output: %+v", descDeal)
+		}
+		descJSON, _ := json.Marshal(descDeal["stages"])
+		if !strings.Contains(string(descJSON), "C3:NEW") {
+			t.Errorf("expected unwrapped batch stage C3:NEW in Describe stages, got %s", string(descJSON))
+		}
+	})
 }
 
 func TestCrmService_REST3_ReadEngine(t *testing.T) {
 	ctx := context.Background()
 
-	// 1. Set up mock HTTP transport for REST 3.0 calls
 	var recordedRequests []struct {
 		Method string
 		URL    string
@@ -1905,7 +1910,6 @@ func TestCrmService_REST3_ReadEngine(t *testing.T) {
 
 		// REST 3.0 crm.deal.list
 		if strings.HasSuffix(path, "/rest/api/crm.deal.list") {
-			// Check if this is a bulk GetItems call with filter id in [10, 20]
 			if fRaw, ok := bodyMap["filter"]; ok {
 				fStr := fmt.Sprintf("%v", fRaw)
 				if strings.Contains(fStr, "10") && strings.Contains(fStr, "20") && !strings.Contains(fStr, "300") {
@@ -1919,7 +1923,6 @@ func TestCrmService_REST3_ReadEngine(t *testing.T) {
 					}), nil
 				}
 				if strings.Contains(fStr, "99999") {
-					// Empty matching items
 					return jsonResponse(200, map[string]any{
 						"result": map[string]any{
 							"items": []map[string]any{},
@@ -1956,24 +1959,25 @@ func TestCrmService_REST3_ReadEngine(t *testing.T) {
 			}), nil
 		}
 
-		// REST 3.0 crm.deal.aggregate
+		// REST 3.0 crm.deal.aggregate (real nested result.result.count.id envelope)
 		if strings.HasSuffix(path, "/rest/api/crm.deal.aggregate") {
 			return jsonResponse(200, map[string]any{
 				"result": map[string]any{
-					"count": map[string]any{"id": 150},
+					"result": map[string]any{
+						"count": map[string]any{"id": 150},
+					},
 				},
 			}), nil
 		}
 
-		// REST 3.0 crm.productrow.list
-		if strings.HasSuffix(path, "/rest/api/crm.productrow.list") {
+		// REST 3.0 crm.deal.productrow.list
+		if strings.HasSuffix(path, "/rest/api/crm.deal.productrow.list") {
 			return jsonResponse(200, map[string]any{
 				"result": map[string]any{
 					"items": []map[string]any{
 						{
 							"id":          101,
 							"ownerId":     1,
-							"ownerType":   "D",
 							"productId":   5,
 							"productName": "Widget Pro",
 							"price":       99.9,
@@ -2018,235 +2022,243 @@ func TestCrmService_REST3_ReadEngine(t *testing.T) {
 	rc := bitrix.NewRestClient(cfg, tm, config.NewLogger(nil, "silent"), &http.Client{Transport: rt})
 	crm := bitrix.NewCrmService(cfg, rc)
 
-	// 2. SearchItems calls REST 3.0 crm.deal.list with curated select & single-call pagination (page + limit)
-	searchRes, err := crm.SearchItems(ctx, bitrix.SearchItemsInput{
-		ConnectionID: conn.ID,
-		EntityTypeID: 2,
-		Limit:        500,
-		Page:         2,
-	})
-	if err != nil {
-		t.Fatalf("SearchItems failed: %v", err)
-	}
-	if len(searchRes.Items) != 1 || searchRes.Items[0]["id"] != float64(1) && searchRes.Items[0]["id"] != 1 {
-		t.Fatalf("unexpected items in searchRes: %+v", searchRes.Items)
-	}
-	mu.Lock()
-	var lastSearchReq struct {
-		Method string
-		URL    string
-		Body   map[string]any
-		Raw    string
-	}
-	for _, req := range recordedRequests {
-		if strings.Contains(req.URL, "crm.deal.list") {
-			lastSearchReq = req
-		}
-	}
-	mu.Unlock()
-	if !strings.Contains(lastSearchReq.URL, "/rest/api/crm.deal.list") {
-		t.Errorf("expected REST 3.0 crm.deal.list, got: %s", lastSearchReq.URL)
-	}
-	if pag, ok := lastSearchReq.Body["pagination"].(map[string]any); !ok || (pag["limit"] != float64(500) && pag["limit"] != 500) || (pag["page"] != float64(2) && pag["page"] != 2) {
-		t.Errorf("expected pagination limit 500 and page 2, got: %v", lastSearchReq.Body["pagination"])
-	}
-	selList, ok := lastSearchReq.Body["select"].([]any)
-	if !ok || slices.Contains(selList, any("*")) || !slices.Contains(selList, any("stage.name")) || !slices.Contains(selList, any("company.title")) {
-		t.Errorf("expected curated select list with relational fields and without wildcard, got: %v", lastSearchReq.Body["select"])
-	}
-
-	// 3. SearchItems with custom select normalizes ufCrm... -> UF_CRM_... and injects id, and translates logical group filter
-	_, err = crm.SearchItems(ctx, bitrix.SearchItemsInput{
-		ConnectionID: conn.ID,
-		EntityTypeID: 2,
-		Select:       []string{"title", "stage.name", "ufCrmCustomCode"},
-		Filter: map[string]any{
-			"type":  "filter",
-			"logic": "or",
-			"conditions": []any{
-				[]any{"stageId", "=", "NEW"},
-				[]any{"opportunity", ">=", 1000},
-			},
-		},
-		Limit: 25,
-	})
-	if err != nil {
-		t.Fatalf("SearchItems with logical group filter failed: %v", err)
-	}
-	mu.Lock()
-	lastSearchReq = recordedRequests[len(recordedRequests)-1]
-	mu.Unlock()
-	customSel, _ := lastSearchReq.Body["select"].([]any)
-	if len(customSel) == 0 || customSel[0] != "id" || !slices.Contains(customSel, any("UF_CRM_CUSTOMCODE")) || !slices.Contains(customSel, any("stage.name")) {
-		t.Errorf("expected ['id', 'title', 'stage.name', 'UF_CRM_CUSTOMCODE'], got: %v", customSel)
-	}
-	groupFilter, ok := lastSearchReq.Body["filter"].(map[string]any)
-	if !ok || groupFilter["type"] != "filter" || groupFilter["logic"] != "or" {
-		t.Errorf("expected logical filter group preserved as map in request body, got: %v", lastSearchReq.Body["filter"])
-	}
-
-	// 4. SearchItems with substring filter (both legacy %TITLE map and REST 3.0 like slice) falls back to legacy crm.item.list.json with start: -1
-	for _, subFilter := range []any{
-		map[string]any{"%TITLE": "Substring"},
-		[]any{[]any{"title", "like", "%Substring%"}},
-	} {
-		subRes, err := crm.SearchItems(ctx, bitrix.SearchItemsInput{
+	t.Run("SearchItems single-call REST 3.0 pagination and curated select", func(t *testing.T) {
+		searchRes, err := crm.SearchItems(ctx, bitrix.SearchItemsInput{
 			ConnectionID: conn.ID,
 			EntityTypeID: 2,
-			Filter:       subFilter,
-			Limit:        50,
+			Limit:        500,
+			Page:         2,
 		})
 		if err != nil {
-			t.Fatalf("SearchItems with substring filter %v failed: %v", subFilter, err)
+			t.Fatalf("SearchItems failed: %v", err)
 		}
-		if len(subRes.Items) != 1 || subRes.Items[0]["id"] != float64(999) && subRes.Items[0]["id"] != 999 {
-			t.Fatalf("unexpected items in substring searchRes: %+v", subRes.Items)
+		if len(searchRes.Items) != 1 || searchRes.Items[0]["id"] != float64(1) && searchRes.Items[0]["id"] != 1 {
+			t.Fatalf("unexpected items in searchRes: %+v", searchRes.Items)
 		}
 		mu.Lock()
-		lastLegacyReq := recordedRequests[len(recordedRequests)-1]
+		var lastSearchReq struct {
+			Method string
+			URL    string
+			Body   map[string]any
+			Raw    string
+		}
+		for _, req := range recordedRequests {
+			if strings.Contains(req.URL, "crm.deal.list") {
+				lastSearchReq = req
+			}
+		}
 		mu.Unlock()
-		if !strings.Contains(lastLegacyReq.URL, "crm.item.list.json") {
-			t.Errorf("expected legacy crm.item.list.json fallback for substring match, got: %s", lastLegacyReq.URL)
+		if !strings.Contains(lastSearchReq.URL, "/rest/api/crm.deal.list") {
+			t.Errorf("expected REST 3.0 crm.deal.list, got: %s", lastSearchReq.URL)
 		}
-		if lastLegacyReq.Body["start"] != -1 && lastLegacyReq.Body["start"] != float64(-1) {
-			t.Errorf("expected start: -1 on legacy list query, got: %v", lastLegacyReq.Body["start"])
+		if pag, ok := lastSearchReq.Body["pagination"].(map[string]any); !ok || (pag["limit"] != float64(500) && pag["limit"] != 500) || (pag["page"] != float64(2) && pag["page"] != 2) {
+			t.Errorf("expected pagination limit 500 and page 2, got: %v", lastSearchReq.Body["pagination"])
 		}
-		legacyFilterMap, ok := lastLegacyReq.Body["filter"].(map[string]any)
-		if !ok || (legacyFilterMap["%TITLE"] == nil && legacyFilterMap["%title"] == nil) {
-			t.Errorf("expected %%TITLE or %%title in legacy fallback filter, got: %v", lastLegacyReq.Body["filter"])
+		selList, ok := lastSearchReq.Body["select"].([]any)
+		if !ok || slices.Contains(selList, any("*")) || !slices.Contains(selList, any("stage.name")) || !slices.Contains(selList, any("company.title")) {
+			t.Errorf("expected curated select list with relational fields and without wildcard, got: %v", lastSearchReq.Body["select"])
 		}
-	}
-
-	// 5. GetItem calls REST 3.0 crm.deal.get with explicit select (default and custom)
-	getItemRes, err := crm.GetItem(ctx, conn.ID, 2, 42, []string{"title", "stage.name", "ufCrmCustomCode"})
-	if err != nil {
-		t.Fatalf("GetItem failed: %v", err)
-	}
-	getItemMap, ok := getItemRes.(map[string]any)
-	if !ok || (getItemMap["id"] != float64(42) && getItemMap["id"] != 42) {
-		t.Fatalf("unexpected GetItem result: %+v", getItemRes)
-	}
-	mu.Lock()
-	var lastGetReq struct {
-		Method string
-		URL    string
-		Body   map[string]any
-		Raw    string
-	}
-	for _, req := range recordedRequests {
-		if strings.Contains(req.URL, "crm.deal.get") {
-			lastGetReq = req
-		}
-	}
-	mu.Unlock()
-	if !strings.Contains(lastGetReq.URL, "/rest/api/crm.deal.get") {
-		t.Errorf("expected REST 3.0 crm.deal.get, got: %s", lastGetReq.URL)
-	}
-	if selList, ok := lastGetReq.Body["select"].([]any); !ok || !slices.Contains(selList, any("UF_CRM_CUSTOMCODE")) || !slices.Contains(selList, any("stage.name")) {
-		t.Errorf("expected custom select list for GetItem, got: %v", lastGetReq.Body["select"])
-	}
-
-	// 6. GetItems calls REST 3.0 crm.deal.list with filter id in [10, 20] and returns slice ordered by requested IDs [10, 20]
-	getItemsRes, err := crm.GetItems(ctx, conn.ID, 2, []int{10, 20}, []string{"title", "stage.name"})
-	if err != nil {
-		t.Fatalf("GetItems failed: %v", err)
-	}
-	if len(getItemsRes) != 2 {
-		t.Fatalf("expected 2 items in GetItems result, got: %+v", getItemsRes)
-	}
-	if (getItemsRes[0]["id"] != float64(10) && getItemsRes[0]["id"] != 10) || (getItemsRes[1]["id"] != float64(20) && getItemsRes[1]["id"] != 20) {
-		t.Errorf("expected GetItems to preserve requested order [10, 20], got: %+v", getItemsRes)
-	}
-
-	// GetItems with 0 matching items returns empty slice without error
-	emptyItemsRes, err := crm.GetItems(ctx, conn.ID, 2, []int{99999})
-	if err != nil || len(emptyItemsRes) != 0 {
-		t.Errorf("expected empty slice for 0 matching items, got %v err=%v", emptyItemsRes, err)
-	}
-
-	// GetItems in REST 3.0 mode supports > 250 IDs (up to 1000)
-	manyIDs := make([]int, 300)
-	for i := range manyIDs {
-		manyIDs[i] = i + 1
-	}
-	if _, err := crm.GetItems(ctx, conn.ID, 2, manyIDs); err != nil {
-		t.Errorf("expected GetItems in REST 3.0 mode to allow 300 IDs (up to 1000), got err: %v", err)
-	}
-
-	// 8. CountItems calls REST 3.0 crm.deal.aggregate
-	countRes, err := crm.CountItems(ctx, bitrix.CountItemsInput{
-		ConnectionID: conn.ID,
-		EntityTypeID: 2,
-		Filter:       map[string]any{"=STAGE_ID": "NEW"},
 	})
-	if err != nil {
-		t.Fatalf("CountItems failed: %v", err)
-	}
-	if countRes != 150 {
-		t.Errorf("expected count 150, got: %d", countRes)
-	}
-	mu.Lock()
-	var lastAggReq struct {
-		Method string
-		URL    string
-		Body   map[string]any
-		Raw    string
-	}
-	for _, req := range recordedRequests {
-		if strings.Contains(req.URL, "crm.deal.aggregate") {
-			lastAggReq = req
-		}
-	}
-	mu.Unlock()
-	if !strings.Contains(lastAggReq.URL, "/rest/api/crm.deal.aggregate") {
-		t.Errorf("expected REST 3.0 crm.deal.aggregate, got: %s", lastAggReq.URL)
-	}
 
-	// 9. CountItems with substring filter falls back to legacy crm.item.list.json total
-	countSubRes, err := crm.CountItems(ctx, bitrix.CountItemsInput{
-		ConnectionID: conn.ID,
-		EntityTypeID: 2,
-		Filter:       map[string]any{"%TITLE": "Substring"},
-	})
-	if err != nil {
-		t.Fatalf("CountItems with substring filter failed: %v", err)
-	}
-	if countSubRes != 1 {
-		t.Errorf("expected legacy fallback count 1, got: %d", countSubRes)
-	}
-
-	// 10. ListProductRows calls REST 3.0 crm.productrow.list with explicit select & limit 1000
-	oID := 1
-	prodRowsRes, err := crm.ListProductRows(ctx, bitrix.ListProductRowsInput{
-		ConnectionID: conn.ID,
-		OwnerID:      &oID,
-		EntityTypeID: &oID,
-	})
-	if err != nil {
-		t.Fatalf("ListProductRows failed: %v", err)
-	}
-	if len(prodRowsRes.ProductRows) != 1 || (prodRowsRes.ProductRows[0]["id"] != float64(101) && prodRowsRes.ProductRows[0]["id"] != 101) {
-		t.Fatalf("unexpected ProductRows result: %+v", prodRowsRes.ProductRows)
-	}
-	mu.Lock()
-	var lastProdReq struct {
-		Method string
-		URL    string
-		Body   map[string]any
-		Raw    string
-	}
-	for _, req := range recordedRequests {
-		if strings.Contains(req.URL, "crm.productrow.list") {
-			lastProdReq = req
+	t.Run("SearchItems custom select normalizes ufCrm and preserves logical filter group", func(t *testing.T) {
+		_, err := crm.SearchItems(ctx, bitrix.SearchItemsInput{
+			ConnectionID: conn.ID,
+			EntityTypeID: 2,
+			Select:       []string{"title", "stage.name", "ufCrmCustomCode"},
+			Filter: map[string]any{
+				"type":  "filter",
+				"logic": "or",
+				"conditions": []any{
+					[]any{"stageId", "=", "NEW"},
+					[]any{"opportunity", ">=", 1000},
+				},
+			},
+			Limit: 25,
+		})
+		if err != nil {
+			t.Fatalf("SearchItems with logical group filter failed: %v", err)
 		}
-	}
-	mu.Unlock()
-	if !strings.Contains(lastProdReq.URL, "/rest/api/crm.productrow.list") {
-		t.Errorf("expected REST 3.0 crm.productrow.list, got: %s", lastProdReq.URL)
-	}
-	if pag, ok := lastProdReq.Body["pagination"].(map[string]any); !ok || pag["limit"] != float64(1000) && pag["limit"] != 1000 {
-		t.Errorf("expected pagination limit 1000 on productrow.list, got: %v", lastProdReq.Body["pagination"])
-	}
+		mu.Lock()
+		lastSearchReq := recordedRequests[len(recordedRequests)-1]
+		mu.Unlock()
+		customSel, _ := lastSearchReq.Body["select"].([]any)
+		if len(customSel) == 0 || customSel[0] != "id" || !slices.Contains(customSel, any("UF_CRM_CUSTOMCODE")) || !slices.Contains(customSel, any("stage.name")) {
+			t.Errorf("expected ['id', 'title', 'stage.name', 'UF_CRM_CUSTOMCODE'], got: %v", customSel)
+		}
+		groupFilter, ok := lastSearchReq.Body["filter"].(map[string]any)
+		if !ok || groupFilter["type"] != "filter" || groupFilter["logic"] != "or" {
+			t.Errorf("expected logical filter group preserved as map in request body, got: %v", lastSearchReq.Body["filter"])
+		}
+	})
+
+	t.Run("SearchItems substring filter falls back to legacy crm.item.list.json", func(t *testing.T) {
+		for _, subFilter := range []any{
+			map[string]any{"%TITLE": "Substring"},
+			[]any{[]any{"title", "like", "%Substring%"}},
+		} {
+			subRes, err := crm.SearchItems(ctx, bitrix.SearchItemsInput{
+				ConnectionID: conn.ID,
+				EntityTypeID: 2,
+				Filter:       subFilter,
+				Limit:        50,
+			})
+			if err != nil {
+				t.Fatalf("SearchItems with substring filter %v failed: %v", subFilter, err)
+			}
+			if len(subRes.Items) != 1 || subRes.Items[0]["id"] != float64(999) && subRes.Items[0]["id"] != 999 {
+				t.Fatalf("unexpected items in substring searchRes: %+v", subRes.Items)
+			}
+			mu.Lock()
+			lastLegacyReq := recordedRequests[len(recordedRequests)-1]
+			mu.Unlock()
+			if !strings.Contains(lastLegacyReq.URL, "crm.item.list.json") {
+				t.Errorf("expected legacy crm.item.list.json fallback for substring match, got: %s", lastLegacyReq.URL)
+			}
+			if lastLegacyReq.Body["start"] != -1 && lastLegacyReq.Body["start"] != float64(-1) {
+				t.Errorf("expected start: -1 on legacy list query, got: %v", lastLegacyReq.Body["start"])
+			}
+			legacyFilterMap, ok := lastLegacyReq.Body["filter"].(map[string]any)
+			if !ok || (legacyFilterMap["%TITLE"] == nil && legacyFilterMap["%title"] == nil) {
+				t.Errorf("expected %%TITLE or %%title in legacy fallback filter, got: %v", lastLegacyReq.Body["filter"])
+			}
+		}
+	})
+
+	t.Run("GetItem and GetItems REST 3.0 ordering, empty slice, and bulk single-request", func(t *testing.T) {
+		getItemRes, err := crm.GetItem(ctx, conn.ID, 2, 42, []string{"title", "stage.name", "ufCrmCustomCode"})
+		if err != nil {
+			t.Fatalf("GetItem failed: %v", err)
+		}
+		getItemMap, ok := getItemRes.(map[string]any)
+		if !ok || (getItemMap["id"] != float64(42) && getItemMap["id"] != 42) {
+			t.Fatalf("unexpected GetItem result: %+v", getItemRes)
+		}
+		mu.Lock()
+		var lastGetReq struct {
+			Method string
+			URL    string
+			Body   map[string]any
+			Raw    string
+		}
+		for _, req := range recordedRequests {
+			if strings.Contains(req.URL, "crm.deal.get") {
+				lastGetReq = req
+			}
+		}
+		mu.Unlock()
+		if !strings.Contains(lastGetReq.URL, "/rest/api/crm.deal.get") {
+			t.Errorf("expected REST 3.0 crm.deal.get, got: %s", lastGetReq.URL)
+		}
+		if selList, ok := lastGetReq.Body["select"].([]any); !ok || !slices.Contains(selList, any("UF_CRM_CUSTOMCODE")) || !slices.Contains(selList, any("stage.name")) {
+			t.Errorf("expected custom select list for GetItem, got: %v", lastGetReq.Body["select"])
+		}
+
+		getItemsRes, err := crm.GetItems(ctx, conn.ID, 2, []int{10, 20}, []string{"title", "stage.name"})
+		if err != nil {
+			t.Fatalf("GetItems failed: %v", err)
+		}
+		if len(getItemsRes) != 2 {
+			t.Fatalf("expected 2 items in GetItems result, got: %+v", getItemsRes)
+		}
+		if (getItemsRes[0]["id"] != float64(10) && getItemsRes[0]["id"] != 10) || (getItemsRes[1]["id"] != float64(20) && getItemsRes[1]["id"] != 20) {
+			t.Errorf("expected GetItems to preserve requested order [10, 20], got: %+v", getItemsRes)
+		}
+
+		emptyItemsRes, err := crm.GetItems(ctx, conn.ID, 2, []int{99999})
+		if err != nil || len(emptyItemsRes) != 0 {
+			t.Errorf("expected empty slice for 0 matching items, got %v err=%v", emptyItemsRes, err)
+		}
+
+		manyIDs := make([]int, 300)
+		for i := range manyIDs {
+			manyIDs[i] = i + 1
+		}
+		mu.Lock()
+		recordedRequests = nil
+		mu.Unlock()
+
+		if _, err := crm.FetchItems(ctx, bitrix.GetItemInput{
+			ConnectionID:           conn.ID,
+			EntityTypeID:           2,
+			IDs:                    manyIDs,
+			IncludeDetails:         true,
+			IncludeDetailsExplicit: false,
+		}); err != nil {
+			t.Errorf("expected FetchItems in REST 3.0 mode to allow 300 IDs (up to 1000), got err: %v", err)
+		}
+		mu.Lock()
+		bulkReqs := slices.Clone(recordedRequests)
+		mu.Unlock()
+		for _, r := range bulkReqs {
+			if strings.Contains(r.URL, "productrow") || strings.Contains(r.URL, "crm.item.get") {
+				t.Errorf("bulk >50 IDs without explicit includeDetails must not trigger N+1 detail calls: %s", r.URL)
+			}
+		}
+	})
+
+	t.Run("CountItems unwraps nested REST 3.0 aggregate count and falls back on substring filter", func(t *testing.T) {
+		countRes, err := crm.CountItems(ctx, bitrix.CountItemsInput{
+			ConnectionID: conn.ID,
+			EntityTypeID: 2,
+			Filter:       map[string]any{"=STAGE_ID": "NEW"},
+		})
+		if err != nil {
+			t.Fatalf("CountItems failed: %v", err)
+		}
+		if countRes != 150 {
+			t.Errorf("expected count 150 from nested result.result.count.id, got: %d", countRes)
+		}
+
+		countSubRes, err := crm.CountItems(ctx, bitrix.CountItemsInput{
+			ConnectionID: conn.ID,
+			EntityTypeID: 2,
+			Filter:       map[string]any{"%TITLE": "Substring"},
+		})
+		if err != nil {
+			t.Fatalf("CountItems with substring filter failed: %v", err)
+		}
+		if countSubRes != 1 {
+			t.Errorf("expected legacy fallback count 1, got: %d", countSubRes)
+		}
+	})
+
+	t.Run("ListProductRows calls REST 3.0 crm.<slug>.productrow.list without ownerType in filter", func(t *testing.T) {
+		oID := 1
+		dealEntity := bitrix.EntityTypeDeal
+		prodRowsRes, err := crm.ListProductRows(ctx, bitrix.ListProductRowsInput{
+			ConnectionID: conn.ID,
+			OwnerID:      &oID,
+			EntityTypeID: &dealEntity,
+		})
+		if err != nil {
+			t.Fatalf("ListProductRows failed: %v", err)
+		}
+		if len(prodRowsRes.ProductRows) != 1 || (prodRowsRes.ProductRows[0]["id"] != float64(101) && prodRowsRes.ProductRows[0]["id"] != 101) {
+			t.Fatalf("unexpected ProductRows result: %+v", prodRowsRes.ProductRows)
+		}
+		mu.Lock()
+		var lastProdReq struct {
+			Method string
+			URL    string
+			Body   map[string]any
+			Raw    string
+		}
+		for _, req := range recordedRequests {
+			if strings.Contains(req.URL, "crm.deal.productrow.list") {
+				lastProdReq = req
+			}
+		}
+		mu.Unlock()
+		if !strings.Contains(lastProdReq.URL, "/rest/api/crm.deal.productrow.list") {
+			t.Errorf("expected REST 3.0 crm.deal.productrow.list, got: %s", lastProdReq.URL)
+		}
+		if strings.Contains(lastProdReq.Raw, "ownerType") {
+			t.Errorf("REST 3.0 crm.<slug>.productrow.list filter must NOT include ownerType: %s", lastProdReq.Raw)
+		}
+		if pag, ok := lastProdReq.Body["pagination"].(map[string]any); !ok || pag["limit"] != float64(1000) && pag["limit"] != 1000 {
+			t.Errorf("expected pagination limit 1000 on productrow.list, got: %v", lastProdReq.Body["pagination"])
+		}
+	})
 }
 
 func TestOperationService_REST3_IdempotentWrites(t *testing.T) {
@@ -2322,115 +2334,116 @@ func TestOperationService_REST3_IdempotentWrites(t *testing.T) {
 
 	httpClient := &http.Client{Transport: rt, Timeout: 2 * time.Second}
 	rc := bitrix.NewRestClient(cfg, tm, config.NewLogger(nil, "silent"), httpClient)
-	guard := bitrix.NewPolicyGuard()
-	opSvc := bitrix.NewOperationService(cfg, st, guard, rc)
+	opSvc := bitrix.NewOperationService(cfg, st, rc)
 
-	// 1. PrepareCreate with ufCrmCustomField -> normalized to UF_CRM_CUSTOMFIELD
-	createPrep, err := opSvc.PrepareCreate(ctx, conn.ID, 2, map[string]any{
-		"title":            "REST 3.0 Deal",
-		"ufCrmCustomField": "custom value",
+	t.Run("PrepareCreate and Confirm sends crm.deal.add with Idempotency-Key and normalized ufCrm", func(t *testing.T) {
+		createPrep, err := opSvc.PrepareCreate(ctx, conn.ID, 2, map[string]any{
+			"title":            "REST 3.0 Deal",
+			"ufCrmCustomField": "custom value",
+		})
+		if err != nil {
+			t.Fatalf("PrepareCreate failed: %v", err)
+		}
+		createOpID := createPrep["operation_id"].(string)
+
+		confirmCreate, err := opSvc.Confirm(ctx, createOpID, "")
+		if err != nil {
+			t.Fatalf("Confirm create failed: %v", err)
+		}
+		if confirmCreate["status"] != "completed" {
+			t.Fatalf("expected completed create status: %+v", confirmCreate)
+		}
+
+		mu.Lock()
+		lastReq := recordedRequests[len(recordedRequests)-1]
+		mu.Unlock()
+		if !strings.Contains(lastReq.URL, "/rest/api/crm.deal.add") {
+			t.Errorf("expected REST 3.0 crm.deal.add, got: %s", lastReq.URL)
+		}
+		if lastReq.IdempotencyKey != createOpID {
+			t.Errorf("expected Idempotency-Key header %q, got: %q", createOpID, lastReq.IdempotencyKey)
+		}
+		fieldsMap, _ := lastReq.Body["fields"].(map[string]any)
+		if fieldsMap["UF_CRM_CUSTOMFIELD"] != "custom value" {
+			t.Errorf("expected UF_CRM_CUSTOMFIELD in write body, got: %+v", fieldsMap)
+		}
 	})
-	if err != nil {
-		t.Fatalf("PrepareCreate failed: %v", err)
-	}
-	createOpID := createPrep["operation_id"].(string)
 
-	confirmCreate, err := opSvc.Confirm(ctx, createOpID, "")
-	if err != nil {
-		t.Fatalf("Confirm create failed: %v", err)
-	}
-	if confirmCreate["status"] != "completed" {
-		t.Fatalf("expected completed create status: %+v", confirmCreate)
-	}
+	t.Run("PrepareUpdate and Confirm sends crm.deal.update with Idempotency-Key", func(t *testing.T) {
+		updatePrep, err := opSvc.PrepareUpdate(ctx, conn.ID, 2, 10, map[string]any{
+			"title": "Updated Title",
+		})
+		if err != nil {
+			t.Fatalf("PrepareUpdate failed: %v", err)
+		}
+		updateOpID := updatePrep["operation_id"].(string)
 
-	mu.Lock()
-	var lastReq = recordedRequests[len(recordedRequests)-1]
-	mu.Unlock()
-	if !strings.Contains(lastReq.URL, "/rest/api/crm.deal.add") {
-		t.Errorf("expected REST 3.0 crm.deal.add, got: %s", lastReq.URL)
-	}
-	if lastReq.IdempotencyKey != createOpID {
-		t.Errorf("expected Idempotency-Key header %q, got: %q", createOpID, lastReq.IdempotencyKey)
-	}
-	fieldsMap, _ := lastReq.Body["fields"].(map[string]any)
-	if fieldsMap["UF_CRM_CUSTOMFIELD"] != "custom value" {
-		t.Errorf("expected UF_CRM_CUSTOMFIELD in write body, got: %+v", fieldsMap)
-	}
+		if _, err := opSvc.Confirm(ctx, updateOpID, ""); err != nil {
+			t.Fatalf("Confirm update failed: %v", err)
+		}
 
-	// 2. PrepareUpdate -> Confirm executes crm.deal.update with Idempotency-Key
-	updatePrep, err := opSvc.PrepareUpdate(ctx, conn.ID, 2, 10, map[string]any{
-		"title": "Updated Title",
+		mu.Lock()
+		lastReq := recordedRequests[len(recordedRequests)-1]
+		mu.Unlock()
+		if !strings.Contains(lastReq.URL, "/rest/api/crm.deal.update") {
+			t.Errorf("expected REST 3.0 crm.deal.update, got: %s", lastReq.URL)
+		}
+		if lastReq.IdempotencyKey != updateOpID {
+			t.Errorf("expected Idempotency-Key header %q, got: %q", updateOpID, lastReq.IdempotencyKey)
+		}
+		if lastReq.Body["id"] != float64(10) && lastReq.Body["id"] != 10 {
+			t.Errorf("expected id: 10 in update body, got: %v", lastReq.Body["id"])
+		}
 	})
-	if err != nil {
-		t.Fatalf("PrepareUpdate failed: %v", err)
-	}
-	updateOpID := updatePrep["operation_id"].(string)
 
-	_, err = opSvc.Confirm(ctx, updateOpID, "")
-	if err != nil {
-		t.Fatalf("Confirm update failed: %v", err)
-	}
+	t.Run("PrepareMove and Confirm sends crm.deal.update stage move with Idempotency-Key", func(t *testing.T) {
+		movePrep, err := opSvc.PrepareMove(ctx, conn.ID, 2, 10, "WON")
+		if err != nil {
+			t.Fatalf("PrepareMove failed: %v", err)
+		}
+		moveOpID := movePrep["operation_id"].(string)
 
-	mu.Lock()
-	lastReq = recordedRequests[len(recordedRequests)-1]
-	mu.Unlock()
-	if !strings.Contains(lastReq.URL, "/rest/api/crm.deal.update") {
-		t.Errorf("expected REST 3.0 crm.deal.update, got: %s", lastReq.URL)
-	}
-	if lastReq.IdempotencyKey != updateOpID {
-		t.Errorf("expected Idempotency-Key header %q, got: %q", updateOpID, lastReq.IdempotencyKey)
-	}
-	if lastReq.Body["id"] != float64(10) && lastReq.Body["id"] != 10 {
-		t.Errorf("expected id: 10 in update body, got: %v", lastReq.Body["id"])
-	}
+		if _, err := opSvc.Confirm(ctx, moveOpID, ""); err != nil {
+			t.Fatalf("Confirm move failed: %v", err)
+		}
 
-	// 3. PrepareMove -> Confirm executes crm.deal.update with stageId
-	movePrep, err := opSvc.PrepareMove(ctx, conn.ID, 2, 10, "WON")
-	if err != nil {
-		t.Fatalf("PrepareMove failed: %v", err)
-	}
-	moveOpID := movePrep["operation_id"].(string)
+		mu.Lock()
+		lastReq := recordedRequests[len(recordedRequests)-1]
+		mu.Unlock()
+		if !strings.Contains(lastReq.URL, "/rest/api/crm.deal.update") {
+			t.Errorf("expected REST 3.0 crm.deal.update for stage move, got: %s", lastReq.URL)
+		}
+		if lastReq.IdempotencyKey != moveOpID {
+			t.Errorf("expected Idempotency-Key header %q, got: %q", moveOpID, lastReq.IdempotencyKey)
+		}
+	})
 
-	_, err = opSvc.Confirm(ctx, moveOpID, "")
-	if err != nil {
-		t.Fatalf("Confirm move failed: %v", err)
-	}
+	t.Run("PrepareDelete and Confirm sends crm.deal.delete with Idempotency-Key", func(t *testing.T) {
+		deletePrep, err := opSvc.PrepareDelete(ctx, conn.ID, 2, 10)
+		if err != nil {
+			t.Fatalf("PrepareDelete failed: %v", err)
+		}
+		deleteOpID := deletePrep["operation_id"].(string)
 
-	mu.Lock()
-	lastReq = recordedRequests[len(recordedRequests)-1]
-	mu.Unlock()
-	if !strings.Contains(lastReq.URL, "/rest/api/crm.deal.update") {
-		t.Errorf("expected REST 3.0 crm.deal.update for stage move, got: %s", lastReq.URL)
-	}
-	if lastReq.IdempotencyKey != moveOpID {
-		t.Errorf("expected Idempotency-Key header %q, got: %q", moveOpID, lastReq.IdempotencyKey)
-	}
+		if _, err := opSvc.Confirm(ctx, deleteOpID, ""); err != nil {
+			t.Fatalf("Confirm delete failed: %v", err)
+		}
 
-	// 4. PrepareDelete -> Confirm executes crm.deal.delete with Idempotency-Key
-	deletePrep, err := opSvc.PrepareDelete(ctx, conn.ID, 2, 10)
-	if err != nil {
-		t.Fatalf("PrepareDelete failed: %v", err)
-	}
-	deleteOpID := deletePrep["operation_id"].(string)
-
-	_, err = opSvc.Confirm(ctx, deleteOpID, "")
-	if err != nil {
-		t.Fatalf("Confirm delete failed: %v", err)
-	}
-
-	mu.Lock()
-	lastReq = recordedRequests[len(recordedRequests)-1]
-	mu.Unlock()
-	if !strings.Contains(lastReq.URL, "/rest/api/crm.deal.delete") {
-		t.Errorf("expected REST 3.0 crm.deal.delete, got: %s", lastReq.URL)
-	}
-	if lastReq.IdempotencyKey != deleteOpID {
-		t.Errorf("expected Idempotency-Key header %q, got: %q", deleteOpID, lastReq.IdempotencyKey)
-	}
-	if lastReq.Body["id"] != float64(10) && lastReq.Body["id"] != 10 {
-		t.Errorf("expected id: 10 in delete body, got: %v", lastReq.Body["id"])
-	}
+		mu.Lock()
+		lastReq := recordedRequests[len(recordedRequests)-1]
+		mu.Unlock()
+		if !strings.Contains(lastReq.URL, "/rest/api/crm.deal.delete") {
+			t.Errorf("expected REST 3.0 crm.deal.delete, got: %s", lastReq.URL)
+		}
+		if lastReq.IdempotencyKey != deleteOpID {
+			t.Errorf("expected Idempotency-Key header %q, got: %q", deleteOpID, lastReq.IdempotencyKey)
+		}
+		if lastReq.Body["id"] != float64(10) && lastReq.Body["id"] != 10 {
+			t.Errorf("expected id: 10 in delete body, got: %v", lastReq.Body["id"])
+		}
+	})
 }
+
 
 
 

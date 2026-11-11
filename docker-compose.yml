@@ -2,10 +2,13 @@ services:
   app:
     build: .
     restart: unless-stopped
+    mem_limit: 256m
+    cpus: 1.0
+    pids_limit: 128
     environment:
       HOST: 0.0.0.0
       PORT: 3000
-      APP_URL: ${APP_URL:?Set APP_URL to the public HTTPS URL}
+      APP_URL: ${APP_URL:-}
       DATABASE_PATH: ${DATABASE_PATH:-/app/data/bitrix24-mcp.sqlite}
       BITRIX_CLIENT_ID: ${BITRIX_CLIENT_ID:-}
       BITRIX_CLIENT_SECRET: ${BITRIX_CLIENT_SECRET:-}

@@ -8,10 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"net/http"
 	"net/url"
-	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -20,8 +18,6 @@ import (
 	"github.com/SeRGei93/b24-mcp/internal/config"
 	"github.com/SeRGei93/b24-mcp/internal/store"
 )
-
-var hostedBitrix24Pattern = regexp.MustCompile(`(?i)^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+bitrix24\.(?:com|ru|de|eu|ua|by|kz|pl|fr|es|it|br|in|cn|vn|tr|jp|uk|mx|co|id|uz|az|am|ge|kg|lv|lt|ee|com\.br|co\.uk|com\.tr|com\.mx|com\.ua)$`)
 
 type PortalEndpoint struct {
 	Domain   string
@@ -68,51 +64,8 @@ func (e *ContinuationError) Unwrap() error {
 	return e.Cause
 }
 
-func parsePortalHost(input string) (string, error) {
-	trimmed := strings.ToLower(strings.TrimSpace(input))
-	if trimmed == "" {
-		return "", config.NewAppError("Invalid Bitrix24 portal domain", "INVALID_PORTAL_DOMAIN", 400)
-	}
-	rawURL := trimmed
-	if !strings.Contains(trimmed, "://") {
-		rawURL = "https://" + trimmed
-	}
-	parsed, err := url.Parse(rawURL)
-	if err != nil || parsed.Host == "" {
-		return "", config.NewAppError("Invalid Bitrix24 portal domain", "INVALID_PORTAL_DOMAIN", 400)
-	}
-	if parsed.Scheme != "https" ||
-		parsed.User != nil ||
-		parsed.Port() != "" ||
-		(parsed.Path != "" && parsed.Path != "/") ||
-		parsed.RawQuery != "" ||
-		parsed.Fragment != "" {
-		return "", config.NewAppError("Portal must be an HTTPS Bitrix24 domain without a path, port, query, or credentials", "INVALID_PORTAL_DOMAIN", 400)
-	}
-	host := strings.TrimSuffix(parsed.Hostname(), ".")
-	if net.ParseIP(host) != nil || host == "localhost" {
-		return "", config.NewAppError("IP addresses and localhost are not valid Bitrix24 portal domains", "INVALID_PORTAL_DOMAIN", 400)
-	}
-	return host, nil
-}
-
 func NormalizePortalDomain(input string, allowedPortalDomains []string) (string, error) {
-	host, err := parsePortalHost(input)
-	if err != nil {
-		return "", err
-	}
-	if len(allowedPortalDomains) > 0 {
-		for _, allowed := range allowedPortalDomains {
-			if allowedHost, err := parsePortalHost(allowed); err == nil && allowedHost == host {
-				return host, nil
-			}
-		}
-		return "", config.NewAppError("Only hosted or explicitly configured Bitrix24 portal domains are allowed", "INVALID_PORTAL_DOMAIN", 400)
-	}
-	if !hostedBitrix24Pattern.MatchString(host) {
-		return "", config.NewAppError("Only hosted or explicitly configured Bitrix24 portal domains are allowed", "INVALID_PORTAL_DOMAIN", 400)
-	}
-	return host, nil
+	return config.NormalizePortalDomain(input, allowedPortalDomains)
 }
 
 func ValidateClientEndpoint(value, expectedDomain string, allowedPortalDomains []string) (PortalEndpoint, error) {
@@ -411,7 +364,7 @@ func (s *OAuthService) normalizeInstallationPayload(root map[string]any) map[str
 	}
 	var normalizedDomain string
 	if ds, ok := rawDomain.(string); ok && strings.TrimSpace(ds) != "" {
-		if parsedHost, err := parsePortalHost(ds); err == nil {
+		if parsedHost, err := config.ParsePortalHost(ds); err == nil {
 			normalizedDomain = parsedHost
 		} else {
 			normalizedDomain = ds
@@ -597,6 +550,25 @@ func NewTokenManager(st *store.Store, oauth *OAuthService, logger *config.Logger
 		logger:   logger,
 		inflight: make(map[string]*inflightRefresh),
 	}
+}
+
+func (tm *TokenManager) GetCachedAPIVersion(ctx context.Context, connectionID string, ttlSeconds int) (config.APIVersion, bool) {
+	if tm == nil || tm.store == nil {
+		return "", false
+	}
+	var cachedVersion config.APIVersion
+	found, err := tm.store.GetSchemaCache(ctx, connectionID, "api_version", ttlSeconds, &cachedVersion)
+	if err != nil || !found {
+		return "", false
+	}
+	return cachedVersion, true
+}
+
+func (tm *TokenManager) CacheAPIVersion(ctx context.Context, connectionID string, version config.APIVersion) {
+	if tm == nil || tm.store == nil {
+		return
+	}
+	_ = tm.store.SetSchemaCache(ctx, connectionID, "api_version", version)
 }
 
 func isTokenReusable(conn *store.Connection, forceRefresh bool, staleAccessToken string) bool {

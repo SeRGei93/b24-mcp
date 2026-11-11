@@ -127,15 +127,6 @@ type AccessInfo struct {
 	LegacyStaticToken bool
 }
 
-func isLoopbackHost(host string) bool {
-	switch strings.ToLower(host) {
-	case "localhost", "127.0.0.1", "::1", "[::1]":
-		return true
-	default:
-		return false
-	}
-}
-
 func normPath(p string) string {
 	if p == "" {
 		return "/"
@@ -152,7 +143,7 @@ func RedirectURIMatches(requested, registered string) bool {
 	if err1 != nil || err2 != nil || reqURL.Scheme == "" || regURL.Scheme == "" || reqURL.Host == "" || regURL.Host == "" {
 		return false
 	}
-	if !isLoopbackHost(reqURL.Hostname()) || !isLoopbackHost(regURL.Hostname()) {
+	if !config.IsLoopbackHost(reqURL.Hostname()) || !config.IsLoopbackHost(regURL.Hostname()) {
 		return false
 	}
 	return reqURL.Scheme == regURL.Scheme &&
@@ -172,7 +163,7 @@ func IsSafeOAuthRedirectURI(value string) bool {
 	if u.Scheme == "https" {
 		return true
 	}
-	return u.Scheme == "http" && isLoopbackHost(u.Hostname())
+	return u.Scheme == "http" && config.IsLoopbackHost(u.Hostname())
 }
 
 type OAuthService struct {
@@ -185,6 +176,17 @@ type OAuthService struct {
 
 func NewOAuthService(cfg *config.Config, st *store.Store) *OAuthService {
 	issuer := strings.TrimRight(cfg.AppURL, "/")
+	if issuer == "" {
+		host := "localhost"
+		if cfg != nil && cfg.Host == "127.0.0.1" {
+			host = "127.0.0.1"
+		}
+		port := 3000
+		if cfg != nil && cfg.Port > 0 {
+			port = cfg.Port
+		}
+		issuer = fmt.Sprintf("http://%s:%d", host, port)
+	}
 	return &OAuthService{
 		cfg:                          cfg,
 		store:                        st,

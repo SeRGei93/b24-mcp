@@ -42,7 +42,7 @@
 | `BITRIX_CLIENT_ID` | **Да**\* | — | Идентификатор (`client_id` / `CODE`) OAuth-приложения Битрикс24 (\*не требуется при наличии `BITRIX_WEBHOOK_URL`). |
 | `BITRIX_CLIENT_SECRET` | **Да**\* | — | Секретный ключ (`client_secret`) OAuth-приложения Битрикс24 (\*не требуется при наличии `BITRIX_WEBHOOK_URL`). |
 | `BITRIX_OAUTH_URL` | Нет | `https://oauth.bitrix.info/oauth/token` | Базовый URL OAuth-сервера авторизации токенов Битрикс24 (также поддерживает `https://oauth.bitrix24.tech/oauth/token`). |
-| `BITRIX_API_VERSION` | Нет | `auto` | Версия протокола REST: `auto` (REST 3.0 с прозрачным фоллбэком на Legacy REST v2 при 404 / `ERROR_METHOD_NOT_FOUND`), `v3` (только REST 3.0) или `v2` (только Legacy REST). |
+| `BITRIX_API_VERSION` | Нет | `auto` | Версия протокола REST: `auto` (REST 3.0 с прозрачным фоллбэком на Legacy REST v2 при 404 / `ERROR_METHOD_NOT_FOUND`), `v3` (только REST 3.0), `v2` или `legacy` (только Legacy REST). |
 | `BITRIX_PORTAL_DOMAIN` | Нет | — | Домен портала Битрикс24 (например, `company.bitrix24.ru` или кастомный домен коробочной версии). |
 
 ### Роль `BITRIX_PORTAL_DOMAIN`
@@ -76,7 +76,7 @@
 | `MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS` | `3600` (1 час) | Время жизни `access_token`, выдаваемого MCP-клиенту эндпоинтом `/token`. |
 | `MCP_OAUTH_REFRESH_TOKEN_TTL_SECONDS` | `2592000` (30 дней) | Время жизни `refresh_token` MCP-клиента (при каждом обмене происходит ротация). |
 | `SCHEMA_CACHE_TTL_SECONDS` | `900` (15 мин) | Время актуальности кэша схемы Битрикс24 (типы сущностей, поля, воронки, стадии) в таблице `schema_cache`. |
-| `PENDING_OPERATION_TTL_SECONDS` | `600` (10 мин) | Время, в течение которого подготовленная операция записи (`create_item`, `update_item`, `move_item_stage`) может быть подтверждена через `bitrix_confirm_operation`. |
+| `PENDING_OPERATION_TTL_SECONDS` | `600` (10 мин) | Время, в течение которого подготовленная операция записи (`create_item`, `update_item`, `move_item_stage`, `delete_item`) может быть подтверждена через `bitrix_confirm_operation`. |
 
 ---
 

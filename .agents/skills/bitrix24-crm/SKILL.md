@@ -90,11 +90,9 @@ Instead of making extra `bitrix_get_item` or `bitrix_list_users` calls to resolv
 
 ### Bulk Fetch by IDs & Complete Order Details
 - When fetching multiple known records, call `bitrix_get_item` once with `ids: [101, 102, 103]` (supports up to 1,000 IDs in REST 3.0 and preserves the requested ID order) instead of calling `bitrix_get_item` in a loop.
-- By default (`includeDetails: true`), both `bitrix_get_item` and `bitrix_search_items` automatically enrich order/CRM items in a single batch call with:
-  - `productRows` (`crm.item.productrow.list` with `=ownerType` and `=ownerId`),
-  - `payments` (`crm.item.payment.list` — actual payment status `paid: "Y"/"N"`, `datePaid`, `sum`, `paySystemName`),
-  - `deliveries` (`crm.item.delivery.list` — shipment status `deducted: "Y"/"N"`, `priceDelivery`, `deliveryName`),
-  - all custom `ufCrm_*` fields and linked `contact` details (`name`, `lastName`, `fm` phones/emails).
+- By default:
+  - `bitrix_get_item` (`includeDetails: true`) automatically enriches order/CRM items with `productRows` (REST 3.0 `crm.<slug>.productrow.list` with fallback to `crm.item.productrow.list`), `payments` (`crm.item.payment.list` — actual payment status `paid: "Y"/"N"`, `datePaid`, `sum`, `paySystemName`), `deliveries` (`crm.item.delivery.list` — shipment status `deducted: "Y"/"N"`, `priceDelivery`, `deliveryName`), custom `ufCrm_*` fields, and linked `contact` details (`name`, `lastName`, `fm` phones/emails).
+  - `bitrix_search_items` (`includeDetails: false`, `includeProductRows: false`) runs as a fast single-request REST 3.0 search (up to 1,000 items); pass `includeDetails: true` or `includeProductRows: true` explicitly when line items, payment statuses, or shipment details are needed in search results.
 
 ---
 

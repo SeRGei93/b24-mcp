@@ -92,6 +92,20 @@ func TestMCPServer_ListConnectionsAndIsolation(t *testing.T) {
 		if tool.Name == "bitrix_list_connections" {
 			foundList = true
 		}
+		if tool.Name == "bitrix_search_items" || tool.Name == "bitrix_count_items" {
+			schemaBytes, err := json.Marshal(tool.InputSchema)
+			if err != nil {
+				t.Fatalf("failed to marshal InputSchema for %s: %v", tool.Name, err)
+			}
+			var schemaMap map[string]any
+			_ = json.Unmarshal(schemaBytes, &schemaMap)
+			props, _ := schemaMap["properties"].(map[string]any)
+			filterSchema, _ := props["filter"].(map[string]any)
+			anyOf, ok := filterSchema["anyOf"].([]any)
+			if !ok || len(anyOf) != 2 {
+				t.Errorf("expected filter property on %s to declare anyOf [object, array], got %+v", tool.Name, filterSchema)
+			}
+		}
 	}
 	if !foundList {
 		t.Fatalf("expected bitrix_list_connections tool to be registered")
@@ -255,6 +269,12 @@ func TestMcpOAuthService_LoopbackAndPKCEAndRotation(t *testing.T) {
 	}); err == nil {
 		t.Fatalf("expected mismatched PKCE verifier to be rejected")
 	}
+
+	// 4. Fallback IssuerURL when APP_URL is empty (webhook local mode)
+	localSvc := mcp.NewOAuthService(&config.Config{Host: "127.0.0.1", Port: 3456}, st)
+	if localSvc.IssuerURL != "http://127.0.0.1:3456" || localSvc.ResourceURL != "http://127.0.0.1:3456/mcp" {
+		t.Errorf("expected loopback IssuerURL fallback when APP_URL is empty, got issuer=%q resource=%q", localSvc.IssuerURL, localSvc.ResourceURL)
+	}
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -349,8 +369,7 @@ func TestMCPServer_AllToolsExecution(t *testing.T) {
 	rc := bitrix.NewRestClient(cfg, tokens, nil, httpClient)
 	schema := bitrix.NewSchemaDiscovery(cfg, st, rc)
 	crmSvc := bitrix.NewCrmService(cfg, rc)
-	guard := bitrix.NewPolicyGuard()
-	ops := bitrix.NewOperationService(cfg, st, guard, rc)
+	ops := bitrix.NewOperationService(cfg, st, rc)
 
 	srv := mcp.NewServer(st, schema, crmSvc, ops, "")
 	inProc, err := client.NewInProcessClient(srv)
@@ -528,11 +547,11 @@ func TestMCPServer_SchemaDiscoveryTools_QuoteAndDictionaries(t *testing.T) {
 				},
 			}), nil
 		}
-		if strings.HasSuffix(path, "/rest/api/crm.quote.fields") {
+		if strings.HasSuffix(path, "/rest/api/crm.quote.field.list") {
 			return jsonResponse(200, map[string]any{
 				"result": map[string]any{
-					"fields": map[string]any{
-						"TITLE": map[string]any{"type": "string", "title": "Quote Title"},
+					"items": []map[string]any{
+						{"name": "TITLE", "type": "string", "title": "Quote Title"},
 					},
 				},
 			}), nil
@@ -589,8 +608,7 @@ func TestMCPServer_SchemaDiscoveryTools_QuoteAndDictionaries(t *testing.T) {
 	rc := bitrix.NewRestClient(cfg, tokens, nil, httpClient)
 	schema := bitrix.NewSchemaDiscovery(cfg, st, rc)
 	crmSvc := bitrix.NewCrmService(cfg, rc)
-	guard := bitrix.NewPolicyGuard()
-	ops := bitrix.NewOperationService(cfg, st, guard, rc)
+	ops := bitrix.NewOperationService(cfg, st, rc)
 
 	srv := mcp.NewServer(st, schema, crmSvc, ops, "")
 	inProc, err := client.NewInProcessClient(srv)
@@ -765,15 +783,17 @@ func TestMCPServer_ReadEngineTools_REST3(t *testing.T) {
 		if strings.HasSuffix(path, "/rest/api/crm.deal.aggregate") {
 			return jsonResponse(200, map[string]any{
 				"result": map[string]any{
-					"count": map[string]any{"id": 42},
+					"result": map[string]any{
+						"count": map[string]any{"id": 42},
+					},
 				},
 			}), nil
 		}
-		if strings.HasSuffix(path, "/rest/api/crm.productrow.list") || strings.HasSuffix(path, "crm.item.productrow.list.json") {
+		if strings.HasSuffix(path, "/rest/api/crm.deal.productrow.list") || strings.HasSuffix(path, "crm.item.productrow.list.json") {
 			return jsonResponse(200, map[string]any{
 				"result": map[string]any{
-					"productRows": []map[string]any{
-						{"id": 901, "ownerId": 1, "ownerType": "D", "productName": "Cloud Hosting", "price": 49.99, "quantity": 1},
+					"items": []map[string]any{
+						{"id": 901, "ownerId": 1, "productName": "Cloud Hosting", "price": 49.99, "quantity": 1},
 					},
 				},
 			}), nil
@@ -867,8 +887,7 @@ func TestMCPServer_ReadEngineTools_REST3(t *testing.T) {
 	rc := bitrix.NewRestClient(cfg, tokens, nil, httpClient)
 	schema := bitrix.NewSchemaDiscovery(cfg, st, rc)
 	crmSvc := bitrix.NewCrmService(cfg, rc)
-	guard := bitrix.NewPolicyGuard()
-	ops := bitrix.NewOperationService(cfg, st, guard, rc)
+	ops := bitrix.NewOperationService(cfg, st, rc)
 
 	srv := mcp.NewServer(st, schema, crmSvc, ops, "")
 	inProc, err := client.NewInProcessClient(srv)
@@ -907,11 +926,33 @@ func TestMCPServer_ReadEngineTools_REST3(t *testing.T) {
 	if !strings.Contains(searchText, "MCP Deal 1") {
 		t.Errorf("expected MCP Deal 1 in search response: %s", searchText)
 	}
+	if strings.Contains(searchText, "Cloud Hosting") {
+		t.Errorf("expected single-request search by default without secondary batch enrichment: %s", searchText)
+	}
 	if pag, ok := lastListBody["pagination"].(map[string]any); !ok || (pag["page"] != float64(2) && pag["page"] != 2) {
 		t.Errorf("expected page: 2 in outbound search pagination, got: %v", lastListBody["pagination"])
 	}
 	if fSlice, ok := lastListBody["filter"].([]any); !ok || len(fSlice) != 1 {
 		t.Errorf("expected REST 3.0 expression slice filter forwarded, got: %v", lastListBody["filter"])
+	}
+
+	// 1b. bitrix_search_items with includeDetails: true enriches returned items
+	searchEnrichedRes, err := inProc.CallTool(ctx, mcpproto.CallToolRequest{
+		Params: mcpproto.CallToolParams{
+			Name: "bitrix_search_items",
+			Arguments: map[string]any{
+				"connectionId":   conn.ID,
+				"entityTypeId":   2,
+				"includeDetails": true,
+				"limit":          10,
+			},
+		},
+	})
+	if err != nil || searchEnrichedRes.IsError {
+		t.Fatalf("bitrix_search_items enriched failed: %v, res: %+v", err, searchEnrichedRes)
+	}
+	if !strings.Contains(searchEnrichedRes.Content[0].(mcpproto.TextContent).Text, "Cloud Hosting") {
+		t.Errorf("expected Cloud Hosting when includeDetails: true is set: %s", searchEnrichedRes.Content[0].(mcpproto.TextContent).Text)
 	}
 
 	// 2. bitrix_get_item (single with custom select)

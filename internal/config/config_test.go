@@ -273,8 +273,19 @@ func TestLoad_WebhookOAuthAndAPIVersion(t *testing.T) {
 	if cCfg.BitrixOAuthURL != "https://oauth.bitrix24.tech/oauth/token" {
 		t.Errorf("expected custom OAuth URL, got %q", cCfg.BitrixOAuthURL)
 	}
-	if cCfg.BitrixAPIVersion != "v3" {
+	if cCfg.BitrixAPIVersion != config.APIVersionV3 {
 		t.Errorf("expected API version 'v3', got %q", cCfg.BitrixAPIVersion)
+	}
+
+	// 3b. BITRIX_API_VERSION='legacy' alias normalizes to v2
+	legacyEnv := baseEnv("https://mcp.example.com")
+	legacyEnv["BITRIX_API_VERSION"] = "legacy"
+	lCfg, err := config.Load(legacyEnv)
+	if err != nil {
+		t.Fatalf("unexpected error on legacy API version: %v", err)
+	}
+	if lCfg.BitrixAPIVersion != config.APIVersionV2 {
+		t.Errorf("expected API version 'v2' for legacy alias, got %q", lCfg.BitrixAPIVersion)
 	}
 
 	// 4. Invalid API version rejected
@@ -284,12 +295,14 @@ func TestLoad_WebhookOAuthAndAPIVersion(t *testing.T) {
 		t.Errorf("expected BITRIX_API_VERSION validation error, got: %v", err)
 	}
 
-	// 5. Invalid Webhook URLs
+	// 5. Invalid Webhook URLs (including SSRF / spoofed domains)
 	badWebhooks := []string{
-		"http://insecure.example.com/rest/1/code",         // insecure non-loopback
-		"https://portal.bitrix24.com/other/1/code",        // missing /rest/
-		"https://portal.bitrix24.com/rest/notdigits/code", // user id not digits
-		"https://portal.bitrix24.com/rest/1",              // missing webhook code
+		"http://insecure.example.com/rest/1/code",          // insecure non-loopback
+		"https://portal.bitrix24.com/other/1/code",         // missing /rest/
+		"https://portal.bitrix24.com/rest/notdigits/code",  // user id not digits
+		"https://portal.bitrix24.com/rest/1",               // missing webhook code
+		"https://bitrix24.attacker.com/rest/1/secret-code", // spoofed domain without BITRIX_PORTAL_DOMAIN
+		"https://evil.example.com/rest/1/secret-code",      // arbitrary host SSRF
 	}
 	for _, badWH := range badWebhooks {
 		env := map[string]string{
@@ -301,6 +314,22 @@ func TestLoad_WebhookOAuthAndAPIVersion(t *testing.T) {
 		if _, err := config.Load(env); err == nil || !strings.Contains(err.Error(), "BITRIX_WEBHOOK_URL") {
 			t.Errorf("expected BITRIX_WEBHOOK_URL error for %q, got: %v", badWH, err)
 		}
+	}
+
+	// 5b. On-Premise webhook allowed when matching BITRIX_PORTAL_DOMAIN, rejected on mismatch
+	onPremEnv := map[string]string{
+		"DATABASE_PATH":        ":memory:",
+		"BITRIX_PORTAL_DOMAIN": "roast24.by",
+		"BITRIX_WEBHOOK_URL":   "https://roast24.by/rest/7/onprem-secret/",
+		"MCP_AUTH_TOKEN":       strings.Repeat("a", 32),
+		"TOKEN_ENCRYPTION_KEY": base["TOKEN_ENCRYPTION_KEY"],
+	}
+	if _, err := config.Load(onPremEnv); err != nil {
+		t.Fatalf("expected valid On-Premise webhook with matching BITRIX_PORTAL_DOMAIN: %v", err)
+	}
+	onPremEnv["BITRIX_PORTAL_DOMAIN"] = "other-portal.by"
+	if _, err := config.Load(onPremEnv); err == nil || !strings.Contains(err.Error(), "BITRIX_WEBHOOK_URL") {
+		t.Errorf("expected BITRIX_WEBHOOK_URL mismatch error, got: %v", err)
 	}
 
 	// 6. Webhook URL parser helper

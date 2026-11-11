@@ -13,20 +13,17 @@ import (
 type OperationService struct {
 	cfg    *config.Config
 	store  *store.Store
-	guard  *PolicyGuard
 	client *RestClient
 }
 
 func NewOperationService(
 	cfg *config.Config,
 	st *store.Store,
-	guard *PolicyGuard,
 	client *RestClient,
 ) *OperationService {
 	return &OperationService{
 		cfg:    cfg,
 		store:  st,
-		guard:  guard,
 		client: client,
 	}
 }
@@ -142,6 +139,47 @@ func (s *OperationService) failOperation(ctx context.Context, claimed *store.Pen
 	return callErr
 }
 
+type operationDispatch struct {
+	action     string
+	v3Params   map[string]any
+	v2Params   map[string]any
+	rawMethod  string
+	rawPayload map[string]any
+}
+
+func buildOperationDispatch(claimed *store.PendingOperation) operationDispatch {
+	entityTypeID := ToInt(claimed.Params["entityTypeId"])
+	id := ToInt(claimed.Params["id"])
+	rawFields, _ := claimed.Params["fields"].(map[string]any)
+	normFields := normalizeFieldsMap(rawFields)
+
+	switch claimed.OperationType {
+	case store.OpCreateItem:
+		return operationDispatch{
+			action:   "add",
+			v3Params: map[string]any{"fields": normFields},
+			v2Params: map[string]any{"entityTypeId": entityTypeID, "fields": normFields},
+		}
+	case store.OpUpdateItem, store.OpMoveItemStage:
+		return operationDispatch{
+			action:   "update",
+			v3Params: map[string]any{"id": id, "fields": normFields},
+			v2Params: map[string]any{"entityTypeId": entityTypeID, "id": id, "fields": normFields},
+		}
+	case store.OpDeleteItem:
+		return operationDispatch{
+			action:   "delete",
+			v3Params: map[string]any{"id": id},
+			v2Params: map[string]any{"entityTypeId": entityTypeID, "id": id},
+		}
+	default:
+		return operationDispatch{
+			rawMethod:  claimed.Method,
+			rawPayload: claimed.Params,
+		}
+	}
+}
+
 func (s *OperationService) Confirm(
 	ctx context.Context,
 	operationID string,
@@ -158,7 +196,7 @@ func (s *OperationService) Confirm(
 	if err != nil {
 		return nil, err
 	}
-	if err := s.guard.Assert(conn, CapabilityWrite, true); err != nil {
+	if err := AssertCanExecuteWrite(conn, true); err != nil {
 		return nil, err
 	}
 
@@ -171,63 +209,34 @@ func (s *OperationService) Confirm(
 	}
 
 	entityTypeID := ToInt(claimed.Params["entityTypeId"])
-	id := ToInt(claimed.Params["id"])
-	rawFields, _ := claimed.Params["fields"].(map[string]any)
-	normFields := normalizeFieldsMap(rawFields)
-
 	slug, slugErr := entitySlug(entityTypeID)
+	dispatch := buildOperationDispatch(claimed)
+
 	var (
 		resp       *BitrixResponse
 		callErr    error
 		usedMethod string
 	)
 
-	if !s.client.IsV2Mode(ctx, claimed.ConnectionID) && slugErr == nil {
-		var method string
-		var reqBody map[string]any
-		switch claimed.OperationType {
-		case store.OpCreateItem:
-			method = fmt.Sprintf("crm.%s.add", slug)
-			reqBody = map[string]any{"fields": normFields}
-		case store.OpUpdateItem, store.OpMoveItemStage:
-			method = fmt.Sprintf("crm.%s.update", slug)
-			reqBody = map[string]any{"id": id, "fields": normFields}
-		case store.OpDeleteItem:
-			method = fmt.Sprintf("crm.%s.delete", slug)
-			reqBody = map[string]any{"id": id}
-		}
-
-		if method != "" {
-			usedMethod = method
-			resp, callErr = s.client.Call(ctx, claimed.ConnectionID, method, reqBody, WithIdempotencyKey(claimed.ID))
-			if callErr != nil {
-				if s.client.ShouldFallbackToV2(callErr) {
-					resp = nil
-				} else {
-					return nil, s.failOperation(ctx, claimed, method, callErr)
-				}
+	if dispatch.action != "" && !s.client.IsV2Mode(ctx, claimed.ConnectionID) && slugErr == nil {
+		usedMethod = fmt.Sprintf("crm.%s.%s", slug, dispatch.action)
+		resp, callErr = s.client.Call(ctx, claimed.ConnectionID, usedMethod, dispatch.v3Params, WithIdempotencyKey(claimed.ID))
+		if callErr != nil {
+			if s.client.ShouldFallbackToV2(callErr) {
+				resp = nil
+			} else {
+				return nil, s.failOperation(ctx, claimed, usedMethod, callErr)
 			}
 		}
 	}
 
 	if resp == nil {
-		var legacyMethod string
-		var legacyParams map[string]any
-		switch claimed.OperationType {
-		case store.OpCreateItem:
-			legacyMethod = "crm.item.add"
-			legacyParams = map[string]any{"entityTypeId": entityTypeID, "fields": normFields}
-		case store.OpUpdateItem, store.OpMoveItemStage:
-			legacyMethod = "crm.item.update"
-			legacyParams = map[string]any{"entityTypeId": entityTypeID, "id": id, "fields": normFields}
-		case store.OpDeleteItem:
-			legacyMethod = "crm.item.delete"
-			legacyParams = map[string]any{"entityTypeId": entityTypeID, "id": id}
-		default:
-			legacyMethod = claimed.Method
-			legacyParams = claimed.Params
+		legacyMethod := dispatch.rawMethod
+		legacyParams := dispatch.rawPayload
+		if dispatch.action != "" {
+			legacyMethod = "crm.item." + dispatch.action
+			legacyParams = dispatch.v2Params
 		}
-
 		usedMethod = legacyMethod
 		resp, callErr = s.client.Call(ctx, claimed.ConnectionID, legacyMethod, legacyParams, WithIdempotencyKey(claimed.ID))
 		if callErr != nil {
@@ -296,7 +305,7 @@ func (s *OperationService) assertPrepare(ctx context.Context, connectionID strin
 	if err != nil {
 		return err
 	}
-	return s.guard.AssertCanPrepareWrite(conn)
+	return AssertCanPrepareWrite(conn)
 }
 
 func (s *OperationService) assertOperationAccess(connectionID, authorizedConnectionID string) error {
